@@ -1,6 +1,6 @@
 ---
 name: long-task-control
-description: Standardize task control, checkpointing, and status reporting for long-running or multi-stage work. Use when a task will take minutes to hours, involves polling/waiting/handoffs, produces intermediate outputs, or depends on external job systems such as RunningHub, long video generation, render queues, uploads, downloads, transcoding, or multi-segment stitching. Apply it to keep updates factual, checkpoint-based, and easy to verify.
+description: Standardize task control, checkpointing, and status reporting for long-running or multi-stage work. Use when task characteristics indicate non-trivial execution control is needed: the work is likely to take more than one visible turn, includes waiting/polling/background execution, has multiple checkpoints or handoffs, depends on external or asynchronous job systems, produces intermediate artifacts before the final deliverable, or can become blocked and requires proactive status reporting. Do not rely on enumerating task categories; trigger from execution traits. When triggered, first emit the required activation message that explicitly tells the user this task is being executed with the long-task-control skill and how progress will be reported.
 ---
 
 # Long Task Control
@@ -9,13 +9,51 @@ Keep long tasks boring, traceable, and easy to audit. Break work into checkpoint
 
 ## Core rules
 
-1. Create a task record before starting meaningful work.
-2. Split the task into numbered checkpoints with clear completion evidence.
-3. Report only facts you can verify right now.
-4. Prefer identifiers over narratives: task id, job id, PID, file path, URL, timestamp, exit state.
-5. If something is blocked, report the exact blocker, what was tried, and the next needed action.
-6. When complete, hand off outputs, validation result, and any still-running/background items.
-7. Do not claim progress based on hope, estimates, or hidden reasoning.
+1. Decide whether to activate this skill based on task characteristics, not a memorized list of task types.
+2. Once activated, emit the mandatory activation message before starting meaningful execution updates.
+3. Create a task record before starting meaningful work.
+4. Split the task into numbered checkpoints with clear completion evidence.
+5. Report only facts you can verify right now.
+6. Prefer identifiers over narratives: task id, job id, PID, file path, URL, timestamp, exit state.
+7. If something is blocked, report the exact blocker, what was tried, and the next needed action.
+8. When complete, hand off outputs, validation result, and any still-running/background items.
+9. Do not claim progress based on hope, estimates, or hidden reasoning.
+
+## Long-task detection checklist
+
+Activate this skill when the task shows one or more of these execution traits:
+
+- it will likely take more than one visible response turn to finish cleanly
+- it requires waiting, polling, sleep/retry cycles, or background execution
+- it has multiple dependent stages where later steps rely on earlier outputs
+- it produces intermediate artifacts before the final deliverable
+- it depends on remote, queued, asynchronous, or externally managed jobs
+- it has a meaningful chance of becoming blocked on approval, credentials, upstream systems, retries, or missing outputs
+- it benefits from explicit handoff because the requester must later inspect, download, review, or continue from produced artifacts
+
+Strong activation signals:
+
+- you already know you will need progress updates rather than a single final answer
+- you need durable handles such as job ids, PIDs, output paths, URLs, timestamps, or exit codes to keep the task auditable
+- silent waiting would make the user lose visibility into the true state of the work
+
+Do not decide by saying "this is a video task" or "this is a RunningHub task". Decide by asking whether the execution itself is long, staged, asynchronous, stateful, or blocker-prone.
+
+## Mandatory activation message
+
+When this skill is activated, the first user-visible message for the task must clearly state that the task is being executed with the `long-task-control` skill and how updates will work.
+
+Use this standard activation message template before the task record:
+
+```text
+ACTIVATED
+- skill: long-task-control
+- announcement: 目前這個 task 會採用 long-task-control SKILL 執行
+- reporting: 我會用 checkpoint / blocker / completed 這類可驗證狀態回報進度；有新事實才更新，不用模糊的「還在跑」敘述
+- next: 接著建立 task record，開始第一個可驗證步驟
+```
+
+You may add one short task-specific sentence after the template, but do not omit the explicit announcement that `long-task-control` is active.
 
 ## Start-of-task procedure
 
@@ -228,10 +266,12 @@ If validation fails, report `BLOCKED` or a failed checkpoint instead of `COMPLET
 
 ## Minimal operating pattern
 
-1. Start task record.
-2. Submit or launch work.
-3. Emit checkpoint when a verifiable state changes.
-4. If waiting, report the live handle (job id / PID) instead of filler text.
-5. If blocked, escalate immediately with facts.
-6. Validate outputs.
-7. Deliver with `COMPLETED` handoff.
+1. Detect whether task traits require long-task-control.
+2. Emit the mandatory activation message.
+3. Start task record.
+4. Submit or launch work.
+5. Emit checkpoint when a verifiable state changes.
+6. If waiting, report the live handle (job id / PID) instead of filler text.
+7. If blocked, escalate immediately with facts.
+8. Validate outputs.
+9. Deliver with `COMPLETED` handoff.
