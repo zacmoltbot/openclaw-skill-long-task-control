@@ -259,9 +259,23 @@ Before saying a task is done, verify at least one of:
 
 If validation fails, report `BLOCKED` or a failed checkpoint instead of `COMPLETED`.
 
+## Failure examples and anti-patterns
+
+Common compliance failures:
+
+- starting work without the mandatory activation message
+- saying the task is in progress without a `task_id`
+- going silent halfway through a live long task
+- reporting plans as if they were completed progress
+- mixing stale evidence from an old task into a new request
+- staying silent even though a checkpoint completed and no blocker exists
+
+For concrete wrong-vs-correct examples, read `references/failure-examples.md`.
+
 ## Use the bundled resources
 
 - Read `references/multi-stage-runbook.md` when you need a fuller SOP for planning, polling, retries, and handoff.
+- Read `references/failure-examples.md` when you need explicit non-compliant examples and corrected reporting patterns.
 - Run `scripts/checkpoint_report.py` to generate consistent checkpoint/update blocks without rewriting the format each time.
 
 ## Minimal operating pattern

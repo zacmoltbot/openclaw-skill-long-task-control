@@ -1,0 +1,233 @@
+# Failure Examples and Anti-patterns
+
+Use this reference when you need concrete examples of what **not** to do with `long-task-control`.
+
+Each anti-pattern below shows:
+
+- why the behavior is non-compliant
+- a **wrong example**
+- a **correct example** using the skill's reporting contract
+
+## 1) Missing activation message
+
+### Why this is wrong
+
+If the skill is active, the first user-visible message must explicitly say that `long-task-control` is being used. Skipping this hides the execution mode change and makes later structured updates feel arbitrary.
+
+### Wrong example
+
+```text
+我先幫你跑這個，等等回來更新。
+```
+
+### Correct example
+
+```text
+ACTIVATED
+- skill: long-task-control
+- announcement: 目前這個 task 會採用 long-task-control SKILL 執行
+- reporting: 我會用 checkpoint / blocker / completed 這類可驗證狀態回報進度；有新事實才更新，不用模糊的「還在跑」敘述
+- next: 接著建立 task record，開始第一個可驗證步驟
+```
+
+## 2) Claiming work is in progress without a task id
+
+### Why this is wrong
+
+Saying "I'm working on it" without a `task_id` makes the task non-auditable. The requester cannot tell which workflow, artifact set, or checkpoint series you are referring to.
+
+### Wrong example
+
+```text
+CHECKPOINT
+- state: running
+- verified facts:
+  - render started
+- next: keep going
+```
+
+### Correct example
+
+```text
+TASK START
+- task_id: video-20260411-a
+- goal: 產出可交付的 stitched video
+- workflow:
+  1. submit segment renders
+  2. collect outputs
+  3. stitch final video
+  4. validate final file
+- expected artifacts:
+  - /tmp/video-20260411-a/final.mp4
+- first action: submit seg01 render request
+```
+
+## 3) Going silent halfway through a long task
+
+### Why this is wrong
+
+If the task is still waiting on a real handle such as a job id or PID, the user should not be left guessing whether the task stalled, failed, or was abandoned.
+
+### Wrong example
+
+```text
+CHECKPOINT
+- task_id: rh-20260411-001
+- checkpoint: 1/4 submitted
+- state: done
+- verified facts:
+  - remote_job_id: rh_123
+- next: poll status
+```
+
+...then no further update for a long period, despite the job still running.
+
+### Correct example
+
+```text
+CHECKPOINT
+- task_id: rh-20260411-001
+- workflow_type: remote-job
+- stage: polling
+- verified facts:
+  - provider: RunningHub
+  - remote_job_id: rh_123
+  - latest_status: running
+  - last_checked_at: 2026-04-11T00:30:00+08:00
+- next: poll again after the current wait interval
+```
+
+## 4) Reporting the plan as if it were progress
+
+### Why this is wrong
+
+A plan is not a completed checkpoint. Do not present intended future actions as evidence that work has already advanced.
+
+### Wrong example
+
+```text
+CHECKPOINT
+- task_id: longtask-20260411-a
+- checkpoint: 2/4 validate output
+- state: running
+- verified facts:
+  - 之後會用 ffprobe 驗證
+  - 接著會下載檔案
+- next: continue
+```
+
+### Correct example
+
+```text
+CHECKPOINT
+- task_id: longtask-20260411-a
+- checkpoint: 2/4 download output
+- state: done
+- verified facts:
+  - output_file=/tmp/longtask-20260411-a/final.mp4
+  - size_bytes=104857600
+- outputs:
+  - /tmp/longtask-20260411-a/final.mp4
+- next: run ffprobe validation
+```
+
+## 5) Mixing old progress with a new topic or new request
+
+### Why this is wrong
+
+Do not reuse stale status from an earlier task, earlier run, or different deliverable. Each distinct request needs its own fresh `task_id` and evidence trail.
+
+### Wrong example
+
+```text
+CHECKPOINT
+- task_id: video-20260410-a
+- checkpoint: 3/4 stitch final video
+- state: done
+- verified facts:
+  - final.mp4 already exists
+- next: deliver the newly requested subtitle-burned version
+```
+
+This is wrong because the evidence belongs to the old plain video task, not the new subtitle-burned deliverable.
+
+### Correct example
+
+```text
+TASK START
+- task_id: video-20260411-subtitle-a
+- goal: 產出燒錄字幕的新版本 final_subbed.mp4
+- workflow:
+  1. prepare subtitle file
+  2. run subtitle burn-in
+  3. validate new output
+- expected artifacts:
+  - /tmp/video-20260411-subtitle-a/final_subbed.mp4
+- first action: confirm subtitle input path and start ffmpeg burn-in
+```
+
+## 6) Staying silent even though there is no blocker
+
+### Why this is wrong
+
+"Not blocked" does not justify silence. If meaningful state changed, report that state change. The user should not need to ask whether a checkpoint finished.
+
+### Wrong example
+
+```text
+(Agent notices the download finished and validation passed, but says nothing until much later.)
+```
+
+### Correct example
+
+```text
+CHECKPOINT
+- task_id: pkg-20260411-a
+- checkpoint: 3/4 validate package
+- state: done
+- verified facts:
+  - output_file=/tmp/pkg-20260411-a/build.zip
+  - size_bytes=2843312
+  - sha256=abc123...
+  - validation=unzip -t passed
+- outputs:
+  - /tmp/pkg-20260411-a/build.zip
+- next: publish completion handoff
+```
+
+## 7) Saying “still working” with no evidence
+
+### Why this is wrong
+
+A filler update is not a checkpoint. A valid status update needs a concrete state transition or at least current verifiable handles.
+
+### Wrong example
+
+```text
+還在跑，等我一下。
+```
+
+### Correct example
+
+```text
+CHECKPOINT
+- task_id: transcode-20260411-a
+- workflow_type: local-process
+- stage: transcoding
+- verified facts:
+  - pid: 8421
+  - output_file: /tmp/transcode-20260411-a/final.mp4
+  - last_observed_state: process running
+- next: wait for process exit, then validate output
+```
+
+## Quick review checklist
+
+Before sending any progress update, ask:
+
+- Did I already send the activation message?
+- Does this update include the correct `task_id`?
+- Am I reporting a verified state change instead of a plan?
+- Am I accidentally reusing evidence from an older task?
+- If work is still ongoing, did I include the current handle or output evidence?
+- If a checkpoint finished, did I report it instead of staying silent?

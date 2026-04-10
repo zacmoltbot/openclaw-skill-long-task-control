@@ -134,6 +134,21 @@ ACTIVATED
 
 這段訊息的重點不是形式，而是**先告知使用者執行模式已切換**，避免使用者不知道後面為什麼會看到結構化 checkpoint 更新。
 
+## 明確違規例子（failure examples / anti-patterns）
+
+這個 repo 現在也把「**哪些做法算違規**」明確寫出來，不只講原則，也提供 **錯誤示範 vs 正確示範**。
+
+目前覆蓋的典型失敗模式包含：
+
+- 沒有先發 activation message 就直接開始做
+- 沒有 `task_id` 卻宣稱任務已在進行
+- 任務做到一半失聯，不再回報可驗證狀態
+- 把計畫、打算、下一步，誤報成已經發生的進度
+- 把舊任務的證據混進新題材 / 新 deliverable
+- 明明沒有 blocker、甚至已有新進度，卻仍然沉默
+
+這些例子收錄在 `references/failure-examples.md`，目的不是增加格式負擔，而是讓 skill 使用者能快速對照：**什麼叫不合規、什麼才是可交接的正確回報**。
+
 ## 適用場景
 
 ### RunningHub / 其他 remote async job
@@ -230,6 +245,7 @@ COMPLETED
 ├── README.md
 ├── SKILL.md
 ├── references/
+│   ├── failure-examples.md
 │   └── multi-stage-runbook.md
 └── scripts/
     └── checkpoint_report.py
@@ -237,6 +253,7 @@ COMPLETED
 
 - `SKILL.md`：skill 主說明與固定格式
 - `references/multi-stage-runbook.md`：更完整的多階段任務 SOP
+- `references/failure-examples.md`：常見違規例子與「錯誤示範 vs 正確示範」
 - `scripts/checkpoint_report.py`：用 CLI 快速產生一致格式的狀態區塊
 
 ## 腳本範例
