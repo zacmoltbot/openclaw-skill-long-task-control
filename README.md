@@ -43,6 +43,10 @@ monitor cron 應主動提醒 main agent 繼續做，直到任務進入 terminal 
   - 提供 monitor 專用的 supervision-only 更新入口，不允許覆寫 task truth
 - `scripts/demo_monitor_flow.py`
   - 用 temp ledger 跑可測的 E2E demo：stale -> OWNER_RECONCILE -> owner reply -> resume execution / BLOCKED_ESCALATE / STOP_AND_DELETE
+- `scripts/monitor_cron.py`
+  - pseudo cron wrapper：建立/列出/移除 monitor registration，並可執行單次 monitor tick；若遇到 `BLOCKED_ESCALATE` 或 `STOP_AND_DELETE` 會做 terminal cleanup
+- `scripts/shampoo_sample_e2e.py`
+  - 以『30s 洗髮精廣告』sample 跑完整 E2E：activation -> ledger init -> monitor cron install -> checkpoint -> stale/nudge -> owner reconcile -> completed -> cron cleanup
 - `scripts/checkpoint_report.py`
   - 產出 user-visible status block
 
@@ -282,6 +286,24 @@ python3 scripts/demo_monitor_flow.py
 - `owner-reply --reply B` 會寫 `BLOCKED` truth，下一次 monitor 走 `BLOCKED_ESCALATE`
 - `owner-reply --reply C` 會寫 `COMPLETED` + validation，下一次 monitor 走 `STOP_AND_DELETE`
 - monitor 仍只會改 supervision metadata，不會偷偷改 task truth
+
+### 30s 洗髮精廣告 sample E2E
+
+```bash
+python3 scripts/shampoo_sample_e2e.py
+```
+
+這個 sample 現在是 repo 內的唯一驗收路徑，會實測證明：
+
+- activation message 已定稿並可輸出
+- `task_ledger.py init` 真的建立 ledger task
+- `monitor_cron.py install` 真的建立 monitor cron registration
+- checkpoint 真的更新 `current_checkpoint` / `last_checkpoint_at`
+- 第一次 stale 會進入 `NUDGE_MAIN_AGENT`
+- 持續 stale 會進入 `OWNER_RECONCILE`
+- owner reply `E` 會把任務拉回 resume-required path，而不是只記 note
+- owner reply `C` + validation 會把任務收成 `COMPLETED`
+- terminal monitor tick 會產生 `STOP_AND_DELETE`，並真的刪掉 cron registration
 
 ## Suggested cron pattern
 

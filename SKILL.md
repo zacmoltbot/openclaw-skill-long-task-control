@@ -345,6 +345,8 @@ If validation fails, report `BLOCKED` or a failed checkpoint instead of `COMPLET
 - `scripts/compliance_check.py`: scan for baseline rule violations
 - `scripts/monitor_nudge.py`: evaluate the low-cost execution-nudge state machine and optionally write supervision metadata only
 - `scripts/demo_monitor_flow.py`: run a temp-ledger E2E demo for stale -> owner reconcile -> owner reply -> resume / blocked escalate / stop-delete flows
+- `scripts/monitor_cron.py`: create/remove pseudo cron registrations and execute one monitor tick with terminal self-cleanup wiring
+- `scripts/shampoo_sample_e2e.py`: run the required 30s shampoo sample E2E flow: activation -> ledger init -> monitor cron install -> checkpoint -> stale/nudge -> owner reconcile -> completed -> cron cleanup
 
 ## Minimal operating pattern
 
