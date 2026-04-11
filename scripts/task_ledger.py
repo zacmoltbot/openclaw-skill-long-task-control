@@ -41,6 +41,10 @@ SUPERVISION_ALLOWED_KEYS = {
     "owner_query_at",
     "owner_response_at",
     "owner_response_kind",
+    "reconcile_count",
+    "last_reconcile_at",
+    "last_resume_request_at",
+    "recovery_attempt_count",
 }
 
 
@@ -170,6 +174,10 @@ def cmd_init(args):
             "owner_query_at": None,
             "owner_response_at": None,
             "owner_response_kind": None,
+            "reconcile_count": 0,
+            "last_reconcile_at": None,
+            "last_resume_request_at": None,
+            "recovery_attempt_count": 0,
             "last_escalated_at": None,
             "blocked_escalate_after_sec": args.blocked_escalate_after_sec or max(args.timeout_sec, args.expected_interval_sec),
             "cron_state": "ACTIVE",
@@ -278,6 +286,7 @@ def cmd_owner_reply(args):
         task["status"] = "RUNNING"
         task["blocker"] = None
         task.setdefault("heartbeat", {})["watchdog_state"] = "OK"
+        monitoring["recovery_attempt_count"] = int(monitoring.get("recovery_attempt_count", 0) or 0) + 1
         summary = args.summary or "Owner confirmed work was in progress but ledger updates were missing"
         append_checkpoint(task, kind="CHECKPOINT", summary=summary, facts=facts)
         if args.current_checkpoint:
@@ -320,13 +329,15 @@ def cmd_owner_reply(args):
     elif reply_kind == "D_NO_REPLY":
         task.setdefault("heartbeat", {})["watchdog_state"] = "OWNER_RECONCILE"
         monitoring["last_action_state"] = "OWNER_RECONCILE"
-        task["notes"].append(args.note or "Owner did not reply; seek external evidence before changing task truth")
-        if args.next_action:
-            task["next_action"] = args.next_action
+        monitoring["recovery_attempt_count"] = int(monitoring.get("recovery_attempt_count", 0) or 0) + 1
+        task["notes"].append(args.note or "Owner did not reply; seek external evidence, try safe rebuild/resume, and avoid changing task truth without proof")
+        task["next_action"] = args.next_action or task.get("next_action") or "Seek external evidence or rebuild/restart the stuck step safely, then publish a real checkpoint or BLOCKED truth"
     elif reply_kind == "E_FORGOT_OR_NOT_DOING":
         task["status"] = "RUNNING"
         task["blocker"] = None
         task.setdefault("heartbeat", {})["watchdog_state"] = "NUDGE_MAIN_AGENT"
+        monitoring["recovery_attempt_count"] = int(monitoring.get("recovery_attempt_count", 0) or 0) + 1
+        monitoring["last_resume_request_at"] = responded_at
         summary = args.summary or "Owner admitted the task was forgotten/not being done; resume execution is required now"
         facts.setdefault("resume_required", "true")
         append_checkpoint(task, kind="CHECKPOINT", summary=summary, facts=facts)

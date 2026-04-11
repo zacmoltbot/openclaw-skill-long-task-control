@@ -74,7 +74,7 @@ def main():
         make_stale(ledger, task_id, nudge_count=0)
         preview_1 = run_json("python3", str(OPS), "--ledger", str(ledger), "preview-tick", task_id)
         assert preview_1["state"] == "NUDGE_MAIN_AGENT"
-        assert "請 main agent 立刻回來續行" in preview_1["notification"]
+        assert "先自救" in preview_1["notification"]
         assert preview_1["remove_monitor"] is False
 
         make_stale(ledger, task_id, nudge_count=2)

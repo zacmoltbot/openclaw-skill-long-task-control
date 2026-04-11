@@ -38,6 +38,10 @@ monitor 允許更新的欄位只限於 supervision metadata：
 - `monitoring.nudge_count`
 - `monitoring.last_nudge_at`
 - `monitoring.last_escalated_at`
+- `monitoring.reconcile_count`
+- `monitoring.last_reconcile_at`
+- `monitoring.last_resume_request_at`
+- `monitoring.recovery_attempt_count`
 - `monitoring.last_action_at`
 - `monitoring.last_action_state`
 - `monitoring.last_action_reason`
@@ -149,10 +153,10 @@ owner next step：
 
 ### `BLOCKED_ESCALATE`
 
-適用：
+適用（偏晚、終局）：
 
 - ledger 已 `status=BLOCKED`
-- 或 owner reconciliation 已確認 task 需要外部輸入/批准/修復
+- 或 owner reconciliation 已確認 task 需要外部輸入/批准/修復，且 resume / rebuild-safe-step / reconcile / 補做 已經嘗試過或明確不可能
 
 payload contract：
 

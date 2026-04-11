@@ -40,6 +40,10 @@ SUPERVISION_ALLOWED_PATHS = {
     "monitoring.owner_query_at",
     "monitoring.owner_response_at",
     "monitoring.owner_response_kind",
+    "monitoring.reconcile_count",
+    "monitoring.last_reconcile_at",
+    "monitoring.last_resume_request_at",
+    "monitoring.recovery_attempt_count",
 }
 
 
@@ -108,14 +112,25 @@ def build_action_payload(task, chosen, now_iso_value):
             "channel": channel,
             "title": f"Execution nudge for {task_id}",
             "message": (
-                f"Task {task_id} has stale progress. Resume execution, post a real checkpoint, or write terminal truth "
-                f"(COMPLETED/FAILED/BLOCKED). Next action on ledger: {next_action}."
+                f"Task {task_id} has stale progress. First try the recovery path: resume execution, rebuild/restart the stuck step if safe, "
+                f"or reconcile missing ledger truth. Only escalate to BLOCKED after you confirm it cannot self-recover. "
+                f"Next action on ledger: {next_action}."
             ),
             "facts": {
                 "task_id": task_id,
                 "status": task.get("status"),
                 "reason": chosen["reason"],
                 "next_action": next_action,
+                "preferred_recovery": [
+                    "resume_execution",
+                    "rebuild_or_restart_safe_step",
+                    "reconcile_missing_checkpoint_or_terminal_truth",
+                ],
+                "escalate_only_when": [
+                    "system_problem_persists",
+                    "required_resource_missing_and_not_self_recoverable",
+                    "multiple_interventions_still_no_progress",
+                ],
             },
             "monitor_contract": "monitor_only_updates_supervision_metadata",
             "created_at": now_iso_value,
@@ -128,8 +143,8 @@ def build_action_payload(task, chosen, now_iso_value):
             "title": f"Owner reconciliation for {task_id}",
             "message": (
                 f"Task {task_id} still has stale progress after prior nudges. Query the owner now and reconcile task truth. "
-                f"If the owner forgot to update the ledger, add the missing checkpoint. If blocked, escalate. If completed, write COMPLETED with validation. "
-                f"If the owner admits the work was forgotten/not being done, immediately resume execution or require the owner to resume now."
+                f"Prioritize pushing the task forward: backfill missed checkpoints, resume/rebuild the stuck step if safe, or close it with terminal truth. "
+                f"Only choose blocked escalation if the task cannot safely self-recover."
             ),
             "facts": {
                 "task_id": task_id,
@@ -138,9 +153,9 @@ def build_action_payload(task, chosen, now_iso_value):
                 "next_action": next_action,
                 "branches": {
                     "A_IN_PROGRESS_FORGOT_LEDGER": "append missed checkpoint(s), refresh next_action, keep RUNNING",
-                    "B_BLOCKED": "write blocker truth and escalate via BLOCKED_ESCALATE",
+                    "B_BLOCKED": "write blocker truth only after self-recovery is ruled out, then escalate via BLOCKED_ESCALATE",
                     "C_COMPLETED": "write COMPLETED plus validation evidence",
-                    "D_NO_REPLY": "seek external evidence before changing task truth",
+                    "D_NO_REPLY": "seek external evidence, retry recovery, or rebuild/restart safely before changing task truth",
                     "E_FORGOT_OR_NOT_DOING": "do not only log it; immediately push resume execution / 補做 path"
                 }
             },
@@ -199,8 +214,11 @@ def apply_supervision_update(task, report, now_iso_value):
     if report["state"] == "NUDGE_MAIN_AGENT" and report["action"] == "send_execution_nudge":
         monitoring["nudge_count"] = int(monitoring.get("nudge_count", 0) or 0) + 1
         monitoring["last_nudge_at"] = now_iso_value
+        monitoring["last_resume_request_at"] = now_iso_value
     elif report["state"] == "OWNER_RECONCILE":
         monitoring["owner_query_at"] = now_iso_value
+        monitoring["last_reconcile_at"] = now_iso_value
+        monitoring["reconcile_count"] = int(monitoring.get("reconcile_count", 0) or 0) + 1
     elif report["state"] == "BLOCKED_ESCALATE":
         monitoring["last_escalated_at"] = now_iso_value
         monitoring["cron_state"] = "DELETE_REQUESTED"

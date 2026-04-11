@@ -119,7 +119,7 @@ def cron_prompt(ledger_path: Path, task_id: str, requester_channel: str, session
    - STOP_AND_DELETE：不要再提醒；直接 exec：python3 {ROOT / 'scripts' / 'openclaw_ops.py'} --ledger {ledger_path} remove-monitor {task_id}
 4) 如果有發 Discord 訊息，文字必須簡短、fact-based、不可重述整個任務歷史。
 5) remove-monitor 要視為 idempotent cleanup；若 job 已不存在但 ledger 成功標成 DELETED，也算 cron_removed=yes，不要因此把整個 run 判成 error。
-6) 這個 cron job 綁定的 main session key 是 `{session_key}`；提醒文案要明確寫「請 main agent 繼續做 / reconcile / 收尾」。
+6) 這個 cron job 綁定的 main session key 是 `{session_key}`；提醒文案要明確寫「請 main agent 繼續做 / reconcile / 收尾」，並優先要求 resume / rebuild-safe-step / 補 checkpoint；只有真的無法自救時才 blocker escalation。
 
 輸出限制：最後只輸出一小段 JSON summary，包含 task_id、state、notified、cron_removed、delivery。"""
 
@@ -137,7 +137,7 @@ def format_notification(task, report):
             f"state={state}",
             f"reason={report['reason']}",
             f"next_action={next_action}",
-            "請 main agent 立刻回來續行、補 checkpoint，或明確標記 COMPLETED / FAILED / BLOCKED。",
+            "請 main agent 先自救：resume / rebuild-safe-step / reconcile 缺漏 checkpoint；真的推不動才標記 BLOCKED。",
         ])
     if state == "OWNER_RECONCILE":
         branches = facts.get("branches") or {}
@@ -146,7 +146,7 @@ def format_notification(task, report):
             f"task_id={task_id}",
             f"state={state}",
             f"reason={report['reason']}",
-            "請 main agent 立即 reconcile owner truth：",
+            "請 main agent 立即 reconcile owner truth，優先把任務往完成推：",
         ]
         for key in ["A_IN_PROGRESS_FORGOT_LEDGER", "B_BLOCKED", "C_COMPLETED", "D_NO_REPLY", "E_FORGOT_OR_NOT_DOING"]:
             if key in branches:

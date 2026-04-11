@@ -195,7 +195,7 @@ Expected owner-reconciliation branches:
 
 ### `BLOCKED_ESCALATE`
 
-Use when the task is already `BLOCKED`, or when evidence shows the task cannot continue safely without external input/approval/fix. Escalate with blocker facts instead of repeatedly nudging.
+Use later, not early. Enter this state only when the task is already `BLOCKED`, or when evidence shows the task cannot continue safely without external input/approval/fix **after** the recovery path was tried or ruled out. Recovery path means: resume execution, rebuild/restart the stuck step if safe, reconcile missing ledger truth, or require the main agent to補做. Escalate with blocker facts instead of repeatedly nudging.
 
 ### `STOP_AND_DELETE`
 
@@ -219,11 +219,14 @@ Use `HEARTBEAT_DUE`, `NUDGE_MAIN_AGENT`, or `OWNER_RECONCILE` when:
 
 ### Mark or treat as `BLOCKED`
 
-Escalate toward `BLOCKED` when:
+Escalate toward `BLOCKED` only after the task has been actively pushed as far as it can go. Before that, prefer self-recovery / owner-remediation paths such as resume, rebuild-safe-step, reconcile missed checkpoints, or requiring the main agent to actually continue execution.
+
+Move to `BLOCKED` when:
 
 - the task needs approval, credentials, user input, upstream recovery, or a missing dependency
-- retry is unsafe or meaningless without outside action
+- retry/rebuild/resume is unsafe or meaningless without outside action
 - the blocker is known and can be described precisely
+- repeated nudges / reconcile / remediation attempts still produce no safe progress
 
 ### Mark or treat as `FAILED`
 
@@ -363,6 +366,7 @@ If validation fails, report `BLOCKED` or a failed checkpoint instead of `COMPLET
 - `scripts/monitor_cron.py`: create/remove pseudo cron registrations and execute one monitor tick with terminal self-cleanup wiring
 - `scripts/openclaw_native_e2e.py`: run an OpenClaw-style E2E smoke test with real cron create/remove plus stale -> reconcile -> completed cleanup validation
 - `scripts/generic_long_task_e2e.py`: run a task-agnostic E2E proving bootstrap -> updates -> stale nudge -> reconcile -> completed -> cleanup without task-specific patches
+- `scripts/user_centered_monitor_e2e.py`: run two required user-centered scenarios: (A) transient/self-recoverable stall -> resume/rebuild/reconcile without blocked escalation; (B) true unrecoverable blocker -> BLOCKED_ESCALATE plus immediate cron cleanup
 - `scripts/shampoo_sample_e2e.py`: run the required 30s shampoo sample E2E flow via the same bootstrap entrypoint: activation -> ledger init -> monitor cron install -> checkpoint -> stale/nudge -> owner reconcile -> completed -> cron cleanup
 
 ## OpenClaw-native activation and monitor lifecycle
