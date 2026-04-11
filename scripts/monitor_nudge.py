@@ -98,6 +98,7 @@ def evaluate_task(task, now):
         })
 
     if status == "BLOCKED":
+        # BLOCKED is terminal for execution-nudge purposes: escalate once, then delete the cron.
         blocked_reason = (blocker or {}).get("reason") or "task marked BLOCKED"
         if last_progress_age is not None and last_progress_age >= blocked_escalate_after_sec:
             candidates.append({

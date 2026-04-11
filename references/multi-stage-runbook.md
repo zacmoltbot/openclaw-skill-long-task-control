@@ -85,7 +85,7 @@ Recommended behavior:
 2. avoid big-model analysis for healthy tasks
 3. if only heartbeat is due, send a cheap reminder
 4. if progress is stale, warn once and prepare to nudge
-5. if stale progress persists, nudge the main agent to do one of:
+5. if stale progress persists, keep nudging the main agent until the task is resumed or explicitly closed; each nudge should ask it to do one of:
    - resume execution
    - emit a real checkpoint
    - mark `BLOCKED`

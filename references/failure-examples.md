@@ -149,8 +149,6 @@ CHECKPOINT
 - next: deliver the newly requested subtitle-burned version
 ```
 
-This is wrong because the evidence belongs to the old plain video task, not the new subtitle-burned deliverable.
-
 ### Correct example
 
 ```text
@@ -256,9 +254,77 @@ python3 scripts/task_ledger.py \
 
 Then continue with visible `TASK START` / `CHECKPOINT` updates.
 
+## 9) Cron detects stale progress but never nudges the main agent
+
+### Why this is wrong
+
+If the monitor only records that something is stale, but never pushes the owner agent to resume or close the loop, it fails its purpose as an execution nudge.
+
+### Wrong example
+
+```text
+monitor result: STALE_PROGRESS
+monitor result: STALE_PROGRESS
+monitor result: STALE_PROGRESS
+```
+
+...with no reminder, no escalation, and no terminal closure.
+
+### Correct example
+
+```text
+monitor result: NUDGE_MAIN_AGENT
+reason: no new checkpoint for 2400s; main agent should resume, post checkpoint, or mark BLOCKED/FAILED
+action: send_execution_nudge
+```
+
+## 10) Cron keeps running after terminal status
+
+### Why this is wrong
+
+A terminal task does not need perpetual monitoring. Keeping the cron alive wastes cost and creates noisy false reminders.
+
+### Wrong example
+
+```text
+status=COMPLETED
+monitor result: HEARTBEAT_DUE
+```
+
+### Correct example
+
+```text
+status=COMPLETED
+monitor result: STOP_AND_DELETE
+action: delete_monitor_cron
+```
+
+## 11) Treating blocked tasks as ordinary reminders
+
+### Why this is wrong
+
+Once a task is truly blocked, the right move is blocker escalation, not more generic nudges.
+
+### Wrong example
+
+```text
+status=BLOCKED
+monitor result: NUDGE_MAIN_AGENT
+action: ask agent to keep going
+```
+
+### Correct example
+
+```text
+status=BLOCKED
+monitor result: BLOCKED_ESCALATE
+reason: waiting for user approval to access private repo
+action: send_blocked_escalation_then_delete_cron
+```
+
 ## Quick review checklist
 
-Before sending any progress update, ask:
+Before sending any progress update or monitor decision, ask:
 
 - Did I already send the activation message?
 - Does this update include the correct `task_id`?
@@ -266,3 +332,5 @@ Before sending any progress update, ask:
 - Am I accidentally reusing evidence from an older task?
 - If work is still ongoing, did I include the current handle or output evidence?
 - If a checkpoint finished, did I report it instead of staying silent?
+- If progress is stale, am I nudging the main agent instead of passively repeating `STALE_PROGRESS`?
+- If the task is terminal, did I stop/delete the monitor?

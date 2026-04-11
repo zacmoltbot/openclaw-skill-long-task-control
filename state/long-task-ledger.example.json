@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updated_at": "2026-04-11T14:30:00+08:00",
+  "updated_at": "2026-04-11T15:20:00+08:00",
   "tasks": [
     {
       "task_id": "repo-upgrade-20260411-a",
@@ -56,7 +56,15 @@
         "timeout_sec": 1800,
         "last_progress_at": "2026-04-11T14:20:00+08:00",
         "last_heartbeat_at": "2026-04-11T14:25:00+08:00",
-        "watchdog_state": "OK"
+        "watchdog_state": "STALE_PROGRESS"
+      },
+      "monitoring": {
+        "nudge_after_sec": 1800,
+        "blocked_escalate_after_sec": 1800,
+        "renotify_interval_sec": 900,
+        "last_nudge_at": null,
+        "last_escalated_at": null,
+        "cron_owner": "long-task-monitor"
       },
       "validation": [],
       "blocker": null,
@@ -64,16 +72,9 @@
         "references/task-ledger-spec.md"
       ],
       "next_action": "Implement helper scripts",
-      "notes": [],
-      "monitoring": {
-        "nudge_after_sec": 1800,
-        "renotify_interval_sec": 900,
-        "max_nudges": 3,
-        "escalate_after_nudges": 2,
-        "nudge_count": 1,
-        "last_nudge_at": "2026-04-11T14:35:00+08:00",
-        "blocked_escalate_after_sec": 1800
-      }
+      "notes": [
+        "Example active task that should eventually trigger an execution nudge if no new checkpoint appears"
+      ]
     },
     {
       "task_id": "render-20260411-b",
@@ -131,7 +132,15 @@
         "timeout_sec": 1800,
         "last_progress_at": "2026-04-11T10:40:00+08:00",
         "last_heartbeat_at": "2026-04-11T10:45:00+08:00",
-        "watchdog_state": "BLOCKED_SILENT"
+        "watchdog_state": "BLOCKED_ESCALATE"
+      },
+      "monitoring": {
+        "nudge_after_sec": 1800,
+        "blocked_escalate_after_sec": 600,
+        "renotify_interval_sec": 900,
+        "last_nudge_at": null,
+        "last_escalated_at": "2026-04-11T10:50:00+08:00",
+        "cron_owner": "long-task-monitor"
       },
       "validation": [],
       "blocker": {
@@ -146,17 +155,85 @@
       ],
       "next_action": "Wait for rerun decision",
       "notes": [
-        "Example blocked task for watchdog/compliance demos"
+        "Example blocked task: send blocker escalation once, then delete monitor cron"
+      ]
+    },
+    {
+      "task_id": "pkg-20260411-c",
+      "skill": "long-task-control",
+      "goal": "Build and validate release package",
+      "status": "COMPLETED",
+      "channel": "discord",
+      "owner": "coding_agent",
+      "activation": {
+        "announced": true,
+        "announced_at": "2026-04-11T12:00:00+08:00",
+        "message_ref": "discord:msg:999111"
+      },
+      "workflow": [
+        {
+          "id": "build",
+          "title": "Build release archive",
+          "state": "DONE"
+        },
+        {
+          "id": "validate",
+          "title": "Validate archive",
+          "state": "DONE"
+        },
+        {
+          "id": "handoff",
+          "title": "Deliver package",
+          "state": "DONE"
+        }
       ],
+      "current_checkpoint": "handoff",
+      "checkpoints": [
+        {
+          "at": "2026-04-11T12:10:00+08:00",
+          "kind": "CHECKPOINT",
+          "summary": "Archive built",
+          "facts": {
+            "output_file": "/tmp/pkg-20260411-c/build.zip"
+          }
+        },
+        {
+          "at": "2026-04-11T12:18:00+08:00",
+          "kind": "COMPLETED",
+          "summary": "Package delivered",
+          "facts": {
+            "sha256": "abc123",
+            "validation": "unzip -t passed"
+          }
+        }
+      ],
+      "last_checkpoint_at": "2026-04-11T12:18:00+08:00",
+      "heartbeat": {
+        "expected_interval_sec": 600,
+        "timeout_sec": 1800,
+        "last_progress_at": "2026-04-11T12:18:00+08:00",
+        "last_heartbeat_at": "2026-04-11T12:18:00+08:00",
+        "watchdog_state": "STOP_AND_DELETE"
+      },
       "monitoring": {
         "nudge_after_sec": 1800,
-        "renotify_interval_sec": 600,
-        "max_nudges": 3,
-        "escalate_after_nudges": 2,
-        "nudge_count": 2,
-        "last_nudge_at": "2026-04-11T10:20:00+08:00",
-        "blocked_escalate_after_sec": 1200
-      }
+        "blocked_escalate_after_sec": 600,
+        "renotify_interval_sec": 900,
+        "last_nudge_at": null,
+        "last_escalated_at": null,
+        "cron_owner": "long-task-monitor"
+      },
+      "validation": [
+        "unzip -t /tmp/pkg-20260411-c/build.zip passed"
+      ],
+      "blocker": null,
+      "artifacts": [
+        "/tmp/pkg-20260411-c/build.zip"
+      ],
+      "next_action": "None",
+      "notes": [
+        "Example completed task: monitor cron should self-delete"
+      ]
     }
   ]
 }

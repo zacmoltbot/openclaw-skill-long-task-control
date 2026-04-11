@@ -139,7 +139,7 @@ It exists to answer one cheap question repeatedly:
 
 > Is this task still truly progressing, or did the main agent stop moving without closing the loop?
 
-Use the monitor cron to do low-cost pre-gate checks against ledger timestamps and state, then choose one of these state-machine outcomes:
+Use the monitor cron to do low-cost pre-gate checks against ledger timestamps and state, then choose one of these state-machine outcomes. The cron's success condition is not merely "no errors found"; it should keep nudging until the task is explicitly closed as `COMPLETED`, `FAILED`, or `BLOCKED`:
 
 - `OK`
 - `HEARTBEAT_DUE`

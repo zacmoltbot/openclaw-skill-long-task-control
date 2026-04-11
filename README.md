@@ -228,8 +228,10 @@ python3 scripts/compliance_check.py \
 建議順序：
 
 1. `monitor_nudge.py` 做最便宜的 pre-gate
-2. 只有需要 deeper audit 時，再跑其他 checker
-3. task terminal 後，刪 monitor cron
+2. 若只是 `HEARTBEAT_DUE`，發最小提醒即可
+3. 若進入 `NUDGE_MAIN_AGENT`，提醒 owner agent 繼續做、補 checkpoint、或明確寫成 `COMPLETED` / `FAILED` / `BLOCKED`
+4. 只有需要 deeper audit 時，再跑其他 checker
+5. task terminal 後，刪 monitor cron
 
 ## Files
 
