@@ -1,0 +1,144 @@
+{
+  "version": 1,
+  "updated_at": "2026-04-11T14:30:00+08:00",
+  "tasks": [
+    {
+      "task_id": "repo-upgrade-20260411-a",
+      "skill": "long-task-control",
+      "goal": "Upgrade repo to semi-enforced task control system",
+      "status": "RUNNING",
+      "channel": "discord",
+      "owner": "coding_agent",
+      "activation": {
+        "announced": true,
+        "announced_at": "2026-04-11T14:00:00+08:00",
+        "message_ref": "discord:msg:123456"
+      },
+      "workflow": [
+        {
+          "id": "inspect",
+          "title": "Inspect repo/workdir/status",
+          "state": "DONE"
+        },
+        {
+          "id": "implement",
+          "title": "Implement ledger + watchdog tools",
+          "state": "RUNNING"
+        },
+        {
+          "id": "docs",
+          "title": "Update README and SKILL",
+          "state": "PENDING"
+        }
+      ],
+      "current_checkpoint": "implement",
+      "checkpoints": [
+        {
+          "at": "2026-04-11T14:05:00+08:00",
+          "kind": "STARTED",
+          "summary": "Repo inspection started",
+          "facts": {
+            "branch": "main"
+          }
+        },
+        {
+          "at": "2026-04-11T14:20:00+08:00",
+          "kind": "CHECKPOINT",
+          "summary": "Designed task ledger schema",
+          "facts": {
+            "reference_file": "references/task-ledger-spec.md"
+          }
+        }
+      ],
+      "last_checkpoint_at": "2026-04-11T14:20:00+08:00",
+      "heartbeat": {
+        "expected_interval_sec": 900,
+        "timeout_sec": 1800,
+        "last_progress_at": "2026-04-11T14:20:00+08:00",
+        "last_heartbeat_at": "2026-04-11T14:25:00+08:00",
+        "watchdog_state": "OK"
+      },
+      "validation": [],
+      "blocker": null,
+      "artifacts": [
+        "references/task-ledger-spec.md"
+      ],
+      "next_action": "Implement helper scripts",
+      "notes": []
+    },
+    {
+      "task_id": "render-20260411-b",
+      "skill": "long-task-control",
+      "goal": "Render 3-segment video and stitch final output",
+      "status": "BLOCKED",
+      "channel": "discord",
+      "owner": "coding_agent",
+      "activation": {
+        "announced": true,
+        "announced_at": "2026-04-11T09:00:00+08:00",
+        "message_ref": "discord:msg:654321"
+      },
+      "workflow": [
+        {
+          "id": "submit",
+          "title": "Submit segment jobs",
+          "state": "DONE"
+        },
+        {
+          "id": "collect",
+          "title": "Collect segment outputs",
+          "state": "BLOCKED"
+        },
+        {
+          "id": "stitch",
+          "title": "Stitch final video",
+          "state": "PENDING"
+        }
+      ],
+      "current_checkpoint": "collect",
+      "checkpoints": [
+        {
+          "at": "2026-04-11T09:10:00+08:00",
+          "kind": "CHECKPOINT",
+          "summary": "Submitted remote jobs",
+          "facts": {
+            "seg01_job_id": "rh_001",
+            "seg02_job_id": "rh_002",
+            "seg03_job_id": "rh_003"
+          }
+        },
+        {
+          "at": "2026-04-11T10:40:00+08:00",
+          "kind": "BLOCKED",
+          "summary": "Segment 3 failed upstream",
+          "facts": {
+            "seg03_status": "failed"
+          }
+        }
+      ],
+      "last_checkpoint_at": "2026-04-11T10:40:00+08:00",
+      "heartbeat": {
+        "expected_interval_sec": 600,
+        "timeout_sec": 1800,
+        "last_progress_at": "2026-04-11T10:40:00+08:00",
+        "last_heartbeat_at": "2026-04-11T10:45:00+08:00",
+        "watchdog_state": "BLOCKED_SILENT"
+      },
+      "validation": [],
+      "blocker": {
+        "reason": "seg03 upstream job failed",
+        "need": [
+          "Decide whether to rerun seg03"
+        ],
+        "safe_next_step": "Rerun seg03, then resume stitch"
+      },
+      "artifacts": [
+        "/tmp/render-20260411-b/seg01.mp4"
+      ],
+      "next_action": "Wait for rerun decision",
+      "notes": [
+        "Example blocked task for watchdog/compliance demos"
+      ]
+    }
+  ]
+}

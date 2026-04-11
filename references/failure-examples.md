@@ -221,6 +221,41 @@ CHECKPOINT
 - next: wait for process exit, then validate output
 ```
 
+## 8) Running task exists only in chat, not in ledger
+
+### Why this is wrong
+
+If the upgraded skill is using semi-enforced task control, a long-running task should have durable state. Without a ledger entry, watchdog and compliance tooling cannot observe the task.
+
+### Wrong example
+
+```text
+ACTIVATED
+- skill: long-task-control
+...
+
+CHECKPOINT
+- task_id: repo-upgrade-20260411-a
+- state: running
+- verified facts:
+  - branch=main
+```
+
+But there is no matching ledger task for `repo-upgrade-20260411-a`.
+
+### Correct example
+
+```bash
+python3 scripts/task_ledger.py \
+  --ledger state/long-task-ledger.json \
+  init repo-upgrade-20260411-a \
+  --goal "Upgrade repo to semi-enforced task control" \
+  --activation-announced \
+  --next-action "Inspect repo status"
+```
+
+Then continue with visible `TASK START` / `CHECKPOINT` updates.
+
 ## Quick review checklist
 
 Before sending any progress update, ask:

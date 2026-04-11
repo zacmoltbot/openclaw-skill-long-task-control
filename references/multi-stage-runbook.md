@@ -37,6 +37,14 @@ Record whichever handle exists first:
 - output directory
 - generated log file
 
+Also create/update the durable ledger entry so the task exists outside chat text:
+
+- `task_id`
+- current checkpoint
+- `last_checkpoint_at`
+- heartbeat timing
+- blocker state if any
+
 If the task may take a while, send a `STARTED` update right after submission/start, not after it finishes.
 
 ### 4. Poll and wait sanely
