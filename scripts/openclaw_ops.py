@@ -387,6 +387,27 @@ def cmd_render_prompt(args):
     print(cron_prompt(args.ledger, args.task_id, requester_channel, session_key))
 
 
+def _run_cron_add_with_retry(add_cmd, ledger_path, task_id, disabled):
+    """Run 'openclaw cron add', retry once after 3-5s on failure, update ledger on final failure."""
+    import time, random
+    shell_cmd = " ".join(shlex.quote(part) for part in add_cmd)
+    proc = run(shell_cmd, shell=True, check=False)
+    if proc.returncode != 0:
+        # first attempt failed — wait 3-5s then retry
+        wait_sec = random.uniform(3.0, 5.0)
+        time.sleep(wait_sec)
+        proc = run(shell_cmd, shell=True, check=False)
+        if proc.returncode != 0:
+            # retry also failed — mark ledger as INSTALL_FAILED
+            ledger = load_ledger(ledger_path)
+            task = find_task(ledger, task_id)
+            task.setdefault("monitoring", {})["cron_state"] = "INSTALL_FAILED"
+            task.setdefault("monitoring", {})["cron_install_error"] = f"exit={proc.returncode}; stderr={proc.stderr[:500]}"
+            save_ledger(ledger_path, ledger)
+            raise SystemExit(f"openclaw cron add failed even after retry (exit={proc.returncode})\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}")
+    return parse_json_from_mixed_output(proc.stdout)
+
+
 def cmd_activate_task(args):
     task_note = args.task_note or args.goal
     init_stdout, _ = run_init_task(args)
@@ -449,11 +470,7 @@ def cmd_activate_task(args):
             "message": prompt,
         }
     else:
-        shell_cmd = " ".join(shlex.quote(part) for part in add_cmd)
-        proc = run(shell_cmd, shell=True, check=False)
-        if proc.returncode != 0:
-            raise SystemExit(f"openclaw cron add failed (exit={proc.returncode})\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}")
-        payload = parse_json_from_mixed_output(proc.stdout)
+        payload = _run_cron_add_with_retry(add_cmd, args.ledger, args.task_id, install_ns.disabled)
 
     update_monitor_metadata(
         task,
@@ -525,11 +542,7 @@ def cmd_install_monitor(args):
             "message": prompt,
         }
     else:
-        shell_cmd = " ".join(shlex.quote(part) for part in add_cmd)
-        proc = run(shell_cmd, shell=True, check=False)
-        if proc.returncode != 0:
-            raise SystemExit(f"openclaw cron add failed (exit={proc.returncode})\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}")
-        payload = parse_json_from_mixed_output(proc.stdout)
+        payload = _run_cron_add_with_retry(add_cmd, args.ledger, args.task_id, args.disabled)
 
     update_monitor_metadata(
         task,
