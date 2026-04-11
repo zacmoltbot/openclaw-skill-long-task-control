@@ -16,6 +16,13 @@ STATE_PRIORITY = [
     "HEARTBEAT_DUE",
     "OK",
 ]
+# Per-step, per-failure-type retry tracking
+FAILURE_TYPES = {
+    "TIMEOUT": "TIMEOUT",          # no checkpoint within timeout_sec
+    "EXECUTION_ERROR": "EXECUTION_ERROR",  # command/API returned error
+    "EXTERNAL_WAIT": "EXTERNAL_WAIT",      # external system (RunningHub etc.) returned failure/wait_exceeded
+}
+MAX_RETRY_COUNT = 3  # same failure type on same step 3x → BLOCKED_ESCALATE
 DEFAULTS = {
     "nudge_after_sec": None,
     "renotify_interval_sec": None,
@@ -44,6 +51,7 @@ SUPERVISION_ALLOWED_PATHS = {
     "monitoring.last_reconcile_at",
     "monitoring.last_resume_request_at",
     "monitoring.recovery_attempt_count",
+    "monitoring.retry_count",
 }
 
 
@@ -69,6 +77,111 @@ def first_non_null(*values):
         if value is not None:
             return value
     return None
+
+
+# ─── Retry-count helpers ────────────────────────────────────────────────────
+
+def retry_key(step_id, failure_type):
+    return f"{step_id}:{failure_type}"
+
+
+def get_retry_count(monitoring, step_id, failure_type):
+    """Return current retry count for a step+type combo, 0 if absent."""
+    counts = monitoring.get("retry_count", {})
+    return int(counts.get(retry_key(step_id, failure_type), 0))
+
+
+def increment_retry(monitoring, step_id, failure_type):
+    """Increment and persist retry count for a step+type combo."""
+    counts = monitoring.setdefault("retry_count", {})
+    key = retry_key(step_id, failure_type)
+    counts[key] = counts.get(key, 0) + 1
+    return counts[key]
+
+
+def reset_retry(monitoring, step_id, failure_type):
+    """Clear retry count on successful forward progress."""
+    counts = monitoring.get("retry_count", {})
+    key = retry_key(step_id, failure_type)
+    if key in counts:
+        del counts[key]
+
+
+def clear_all_retries_for_step(monitoring, step_id):
+    """Clear all retry counters for a step when it advances successfully."""
+    counts = monitoring.get("retry_count", {})
+    for key in list(counts.keys()):
+        if key.startswith(f"{step_id}:"):
+            del counts[key]
+
+
+# ─── Smart stale detection helpers ───────────────────────────────────────────
+
+def has_pending_external_return(task):
+    """
+    Return True when the task is waiting on an external async return
+    (RunningHub API queue/pending, remote job still running, etc.)
+    and therefore should NOT be flagged STALE_PROGRESS.
+
+    Detection strategy (any one sufficient):
+    1. recent checkpoint facts contain a remote job id (runninghub_job_id,
+       remote_job_id, rh_job_id, job_id) AND latest status is
+       'queued'/'running'/'pending'/'submitted'
+    2. notes mention 'waiting'/'pending'/'queued'/'poll' AND a job id exists
+    3. action_log contains a recent EXTERNAL_WAIT entry
+    """
+    # Primary: check checkpoints for active remote job
+    checkpoints = task.get("checkpoints", [])
+    for cp in checkpoints[-3:]:
+        facts = cp.get("facts", {})
+        for job_key in ["runninghub_job_id", "remote_job_id", "rh_job_id", "job_id"]:
+            if job_key in facts:
+                status = (facts.get("latest_status") or facts.get("status") or "").lower()
+                if status in ("queued", "running", "pending", "submitted"):
+                    return True
+
+    # Secondary: notes mention waiting + have job id
+    notes = task.get("notes", [])
+    has_waiting_note = any(
+        any(kw in (n.lower() if isinstance(n, str) else "") for kw in ["waiting", "pending", "queued", "poll"])
+        for n in notes[-3:]
+    )
+    if has_waiting_note:
+        for cp in checkpoints[-3:]:
+            facts = cp.get("facts", {})
+            if any(k in facts for k in ["runninghub_job_id", "remote_job_id", "rh_job_id", "job_id"]):
+                return True
+
+    # Tertiary: action_log EXTERNAL_WAIT entry within last hour
+    monitoring = task.get("monitoring", {})
+    action_log = monitoring.get("action_log", [])
+    now = datetime.now().astimezone()
+    for entry in action_log[-5:]:
+        entry_at = parse_ts(entry.get("at"))
+        if entry_at and (now - entry_at).total_seconds() < 3600:
+            if entry.get("failure_type") in FAILURE_TYPES.values():
+                return True
+
+    return False
+
+
+def is_progress_updating(task, now):
+    """
+    Return True when progress_at was updated recently (within expected_interval).
+    Agent is actively working; no stale nudge needed.
+    """
+    hb = task.get("heartbeat", {})
+    last_progress_at = first_non_null(hb.get("last_progress_at"), task.get("last_checkpoint_at"))
+    if not last_progress_at:
+        return False
+    age = age_seconds(now, last_progress_at)
+    if age is None:
+        return False
+    expected_interval = hb.get("expected_interval_sec", 900)
+    # Progress updating means last update within 2x expected interval
+    return age <= expected_interval * 2
+    ranked = {name: idx for idx, name in enumerate(STATE_PRIORITY)}
+    return sorted(candidates, key=lambda item: ranked[item["state"]])[0]
 
 
 def choose_state(candidates):
@@ -163,20 +276,47 @@ def build_action_payload(task, chosen, now_iso_value):
             "created_at": now_iso_value,
         }
     if state == "BLOCKED_ESCALATE":
+        blk = blocker or {}
+        current_step = task.get("current_checkpoint", "unknown")
+        retry_count = task.get("monitoring", {}).get("retry_count", {})
+        # Collect recent action log for "what was tried"
+        action_log = task.get("monitoring", {}).get("action_log", [])
+        recent_attempts = [
+            {"at": e.get("at"), "state": e.get("state"), "reason": e.get("reason")}
+            for e in action_log[-5:]
+        ]
         return {
             "kind": "BLOCKED_ESCALATE",
             "deliver_to": owner,
             "channel": channel,
-            "title": f"Blocked escalation for {task_id}",
+            "title": f"⚠️ Blocked escalation for {task_id}",
             "message": (
-                f"Task {task_id} is blocked. Escalate blocker facts, then stop/delete the monitor cron. "
-                f"Owner must decide and update task truth."
+                f"Task {task_id} is blocked and has exhausted self-recovery.\n\n"
+                f"📌 Stuck step: {current_step}\n"
+                f"🔁 Retry history: {dict(retry_count)}\n"
+                f"❌ Blocker: {blk.get('reason') or chosen['reason']}\n"
+                f"   Need: {'; '.join(blk.get('need') or ['human decision required'])}\n"
+                f"   Safe next step: {blk.get('safe_next_step') or 'depends on unblock decision'}\n\n"
+                f"Monitor cron will STOP now (no more空燒). "
+                f"Owner must resolve the blocker and update task truth."
             ),
             "facts": {
                 "task_id": task_id,
                 "status": task.get("status"),
+                "current_checkpoint": current_step,
                 "reason": chosen["reason"],
-                "blocker": blocker,
+                "blocker": {
+                    "reason": blk.get("reason"),
+                    "need": blk.get("need", []),
+                    "safe_next_step": blk.get("safe_next_step"),
+                },
+                "retry_count": retry_count,
+                "recent_attempts": recent_attempts,
+                "recommended_next_steps": [
+                    f"Resolve blocker for step '{current_step}'",
+                    "Update task truth (BLOCKED / FAILED / COMPLETED)",
+                    "If unblocked: resume from safe_next_step and post fresh checkpoint",
+                ],
             },
             "monitor_contract": "monitor_only_updates_supervision_metadata",
             "created_at": now_iso_value,
@@ -211,6 +351,10 @@ def apply_supervision_update(task, report, now_iso_value):
     monitoring["last_action_kind"] = report["action"]
     monitoring["last_action_payload"] = report.get("action_payload")
 
+    # Persist retry_count dict so it survives across ticks
+    if "retry_count" in report:
+        monitoring["retry_count"] = report["retry_count"]
+
     if report["state"] == "NUDGE_MAIN_AGENT" and report["action"] == "send_execution_nudge":
         monitoring["nudge_count"] = int(monitoring.get("nudge_count", 0) or 0) + 1
         monitoring["last_nudge_at"] = now_iso_value
@@ -221,6 +365,7 @@ def apply_supervision_update(task, report, now_iso_value):
         monitoring["reconcile_count"] = int(monitoring.get("reconcile_count", 0) or 0) + 1
     elif report["state"] == "BLOCKED_ESCALATE":
         monitoring["last_escalated_at"] = now_iso_value
+        # Stop monitor cron immediately on BLOCKED_ESCALATE — no more空燒
         monitoring["cron_state"] = "DELETE_REQUESTED"
     elif report["state"] == "STOP_AND_DELETE":
         monitoring["cron_state"] = "DELETE_REQUESTED"
@@ -274,6 +419,7 @@ def evaluate_task(task, now):
     blocker = task.get("blocker")
     activation = task.get("activation", {})
     monitoring = monitoring_config(task)
+    current_step = task.get("current_checkpoint", "unknown")
 
     expected_interval = hb.get("expected_interval_sec", 900)
     timeout_sec = hb.get("timeout_sec", 1800)
@@ -295,6 +441,14 @@ def evaluate_task(task, now):
         monitoring.get("renotify_interval_sec", expected_interval) or expected_interval
     )
 
+    # ── Smart stale detection guards ──────────────────────────────────────
+    # Skip stale/progress nudges when:
+    # (a) progress_at is still updating → agent is working
+    # (b) external return is pending (RunningHub queue/pending) → not stuck, just waiting
+    progress_is_fresh = is_progress_updating(task, now)
+    pending_external = has_pending_external_return(task)
+    is_waiting_external = pending_external or progress_is_fresh
+
     should_renotify = last_nudge_age is None or last_nudge_age >= renotify_interval_sec
     candidates = []
 
@@ -313,18 +467,34 @@ def evaluate_task(task, now):
                 "reason": f"{blocked_reason}; escalation already sent, monitor cron should self-delete",
                 "action": "delete_monitor_cron",
             })
-        elif last_progress_age is not None and last_progress_age >= blocked_escalate_after_sec:
-            candidates.append({
-                "state": "BLOCKED_ESCALATE",
-                "reason": f"{blocked_reason}; blocked for {last_progress_age}s",
-                "action": "send_blocked_escalation_then_delete_cron",
-            })
         else:
-            candidates.append({
-                "state": "BLOCKED_ESCALATE",
-                "reason": f"{blocked_reason}; blocked tasks should escalate once, then stop monitor cron",
-                "action": "send_blocked_escalation_then_delete_cron",
-            })
+            # ── Retry-count check: same step + TIMEOUT failure 3x → BLOCKED_ESCALATE ──
+            timeout_count = get_retry_count(monitoring, current_step, FAILURE_TYPES["TIMEOUT"])
+            exec_count = get_retry_count(monitoring, current_step, FAILURE_TYPES["EXECUTION_ERROR"])
+            ext_count = get_retry_count(monitoring, current_step, FAILURE_TYPES["EXTERNAL_WAIT"])
+            max_retry = max(timeout_count, exec_count, ext_count)
+            if max_retry >= MAX_RETRY_COUNT:
+                candidates.append({
+                    "state": "BLOCKED_ESCALATE",
+                    "reason": (
+                        f"{blocked_reason}; retry limit reached on step '{current_step}' "
+                        f"(timeouts={timeout_count}, exec_errors={exec_count}, ext_waits={ext_count}, limit={MAX_RETRY_COUNT}); "
+                        f"escalating to requester and stopping monitor cron"
+                    ),
+                    "action": "send_blocked_escalation_then_delete_cron",
+                })
+            elif last_progress_age is not None and last_progress_age >= blocked_escalate_after_sec:
+                candidates.append({
+                    "state": "BLOCKED_ESCALATE",
+                    "reason": f"{blocked_reason}; blocked for {last_progress_age}s",
+                    "action": "send_blocked_escalation_then_delete_cron",
+                })
+            else:
+                candidates.append({
+                    "state": "BLOCKED_ESCALATE",
+                    "reason": f"{blocked_reason}; blocked tasks should escalate once, then stop monitor cron",
+                    "action": "send_blocked_escalation_then_delete_cron",
+                })
 
     if status in ACTIVE_STATUSES and not activation.get("announced"):
         candidates.append({
@@ -333,22 +503,56 @@ def evaluate_task(task, now):
             "action": "remind_main_agent_to_activate_and_resume",
         })
 
+    # ── Smart stale: skip STALE_PROGRESS when progress is fresh or external return pending ──
     if status in ACTIVE_STATUSES and last_progress_age is not None and last_progress_age > timeout_sec:
-        candidates.append({
-            "state": "STALE_PROGRESS",
-            "reason": f"no new checkpoint for {last_progress_age}s (> timeout_sec={timeout_sec})",
-            "action": "flag_stale_progress_pre_gate",
-        })
+        if is_waiting_external:
+            candidates.append({
+                "state": "OK",
+                "reason": (
+                    f"no checkpoint for {last_progress_age}s (> timeout_sec={timeout_sec}) "
+                    f"but progress is updating / external return pending; skipping stale nudge"
+                ),
+                "action": "noop_external_wait",
+            })
+        else:
+            # Increment retry count for TIMEOUT failure type
+            new_count = increment_retry(monitoring, current_step, FAILURE_TYPES["TIMEOUT"])
+            if new_count >= MAX_RETRY_COUNT:
+                candidates.append({
+                    "state": "BLOCKED_ESCALATE",
+                    "reason": (
+                        f"no checkpoint for {last_progress_age}s (> timeout_sec={timeout_sec}) on step '{current_step}'; "
+                        f"TIMEOUT retry {new_count}/{MAX_RETRY_COUNT} → escalating to BLOCKED"
+                    ),
+                    "action": "send_blocked_escalation_then_delete_cron",
+                })
+            else:
+                candidates.append({
+                    "state": "STALE_PROGRESS",
+                    "reason": f"no new checkpoint for {last_progress_age}s (> timeout_sec={timeout_sec}); TIMEOUT retry {new_count}/{MAX_RETRY_COUNT}",
+                    "action": "flag_stale_progress_pre_gate",
+                })
 
+    # ── Smart stale: skip HEARTBEAT_DUE when external return pending OR progress updating ──
     if status in ACTIVE_STATUSES and last_heartbeat_age is not None and last_heartbeat_age > expected_interval:
-        candidates.append({
-            "state": "HEARTBEAT_DUE",
-            "reason": f"no heartbeat for {last_heartbeat_age}s (> expected_interval_sec={expected_interval})",
-            "action": "send_lightweight_supervision_reminder",
-        })
+        if pending_external or progress_is_fresh:
+            candidates.append({
+                "state": "OK",
+                "reason": f"heartbeat due {last_heartbeat_age}s ago but external return pending; not nudging",
+                "action": "noop_external_wait",
+            })
+        else:
+            candidates.append({
+                "state": "HEARTBEAT_DUE",
+                "reason": f"no heartbeat for {last_heartbeat_age}s (> expected_interval_sec={expected_interval})",
+                "action": "send_lightweight_supervision_reminder",
+            })
 
     if status in ACTIVE_STATUSES and last_progress_age is not None and last_progress_age > nudge_after_sec:
-        if nudge_count >= max_nudges:
+        if is_waiting_external and not (last_progress_age > timeout_sec):
+            # Already handled above; skip duplicate nudge
+            pass
+        elif nudge_count >= max_nudges:
             candidates.append({
                 "state": "OWNER_RECONCILE",
                 "reason": (
@@ -375,6 +579,9 @@ def evaluate_task(task, now):
             })
 
     if not candidates:
+        # On OK: clear all retry counters since task is making forward progress
+        if status in ACTIVE_STATUSES:
+            clear_all_retries_for_step(monitoring, current_step)
         candidates.append({
             "state": "OK",
             "reason": "heartbeat/progress within thresholds",
@@ -397,6 +604,8 @@ def evaluate_task(task, now):
         "max_nudges": max_nudges,
         "next_action": task.get("next_action"),
         "blocker": blocker,
+        "current_step": current_step,
+        "retry_count": dict(monitoring.get("retry_count", {})),
     }
 
 

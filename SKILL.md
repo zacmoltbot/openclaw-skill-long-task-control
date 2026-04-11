@@ -173,9 +173,31 @@ Use when heartbeat and progress are fresh enough. No reminder needed.
 
 Use when supervision metadata is stale, but the task is still plausibly healthy. This is a lightweight reminder only: update heartbeat, confirm the task is still under watch, and avoid unnecessary large-model work.
 
+**Smart stale detection:** If the task has a pending external return (RunningHub queue/pending/running) or `progress_at` is still updating, do **not** emit `HEARTBEAT_DUE` — the task is waiting, not stalled.
+
 ### `STALE_PROGRESS`
 
 Use when there has been no real checkpoint for too long. This is a pre-gate warning state, not yet a failure verdict. The monitor should surface that execution looks stalled.
+
+**Smart stale detection:** If `progress_at` is updating or an external async return is pending (RunningHub job still queued/running), skip `STALE_PROGRESS` entirely — the agent is working or waiting legitimately.
+
+### Retry-count tracking
+
+The monitor tracks per-step, per-failure-type retry counts in `monitoring.retry_count`:
+
+```json
+"retry_count": {
+  "implement:TIMEOUT": 2,
+  "collect:EXTERNAL_WAIT": 3
+}
+```
+
+Failure types:
+- `TIMEOUT`: no checkpoint within `timeout_sec`
+- `EXECUTION_ERROR`: command/API returned a non-zero exit or error status
+- `EXTERNAL_WAIT`: external system (RunningHub, remote queue) returned failure or wait-exceeded
+
+**Rule:** Same step + same failure type 3 times → immediate `BLOCKED_ESCALATE` (no wall-clock wait). Retry counters reset when the step advances successfully (new checkpoint with `last_checkpoint_at` updated).
 
 ### `NUDGE_MAIN_AGENT`
 
@@ -196,6 +218,12 @@ Expected owner-reconciliation branches:
 ### `BLOCKED_ESCALATE`
 
 Use later, not early. Enter this state only when the task is already `BLOCKED`, or when evidence shows the task cannot continue safely without external input/approval/fix **after** the recovery path was tried or ruled out. Recovery path means: resume execution, rebuild/restart the stuck step if safe, reconcile missing ledger truth, or require the main agent to補做. Escalate with blocker facts instead of repeatedly nudging.
+
+**Retry-count path (new):** If the same step fails the same way 3 times (per `retry_count`), monitor escalates immediately — no wall-clock wait required.
+
+**Enhanced notification:** The `BLOCKED_ESCALATE` message must include in one shot: (1) which step is stuck, (2) retry history, (3) what was tried, (4) why it is now deemed unrecoverable, (5) recommended next steps for the requester.
+
+**Immediate cron stop:** On `BLOCKED_ESCALATE`, the monitor sets `monitoring.cron_state=DELETE_REQUESTED` and stops — no more空燒. The cron removes itself immediately after delivering the escalation.
 
 ### `STOP_AND_DELETE`
 
@@ -373,7 +401,7 @@ If validation fails, report `BLOCKED` or a failed checkpoint instead of `COMPLET
 
 When using this skill inside OpenClaw, follow this exact flow:
 
-1. Prefer the one-shot bootstrap entrypoint: `python3 scripts/openclaw_ops.py --ledger state/long-task-ledger.json bootstrap-task <task_id> ...`.
+1. Prefer the one-shot bootstrap entrypoint: `python3 scripts/openclaw_ops.py --ledger state/long-task-ledger.json bootstrap-task <task_id> ...`. Default monitor check interval is **5 minutes** (previously 10 minutes).
 2. That bootstrap should be treated as the default lifecycle entry: it returns the activation block, the `TASK START` block, initializes the ledger, and installs a **real OpenClaw cron monitor** in one operation.
 3. Keep writing owner-truth checkpoints with `python3 scripts/openclaw_ops.py --ledger state/long-task-ledger.json record-update <STARTED|CHECKPOINT|BLOCKED|COMPLETED> ...` plus `task_ledger.py owner-reply` when reconcile input arrives.
 4. Let the cron agent run the generated monitor prompt: it calls `monitor_nudge.py`, then uses `message.send` only for `NUDGE_MAIN_AGENT`, `OWNER_RECONCILE`, and `BLOCKED_ESCALATE`.

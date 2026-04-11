@@ -45,6 +45,7 @@ SUPERVISION_ALLOWED_KEYS = {
     "last_reconcile_at",
     "last_resume_request_at",
     "recovery_attempt_count",
+    "retry_count",
 }
 
 
@@ -181,6 +182,7 @@ def cmd_init(args):
             "last_escalated_at": None,
             "blocked_escalate_after_sec": args.blocked_escalate_after_sec or max(args.timeout_sec, args.expected_interval_sec),
             "cron_state": "ACTIVE",
+            "retry_count": {},  # {"step_id:failure_type": count} — 3 of same → BLOCKED_ESCALATE
         },
         "validation": [],
         "blocker": None,

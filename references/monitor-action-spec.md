@@ -183,13 +183,14 @@ payload contract：
 monitor side effects：
 
 - `monitoring.last_escalated_at = now`
-- `monitoring.cron_state = DELETE_REQUESTED`
+- `monitoring.cron_state = DELETE_REQUESTED`（立即停止 cron，no more空燒）
 - `heartbeat.watchdog_state = BLOCKED_ESCALATE`
 - append `monitoring.action_log[]`
+- **新增：** `monitoring.retry_count[step_id:failure_type]` 在每次 STALE/BLOCKED 評估時遞增；同一 step + 同一 failure type 累計 3 次 → 立即 BLOCKED_ESCALATE，不需要再等牆時鐘
 
 owner next step：
 
-- 對 requester / human / owner channel 發 blocker escalation
+- 對 requester / human / owner channel 發 blocker escalation，**一次交代清楚**：哪個 step 卡住、retry 次數（retry_count）、嘗試了什麼、為什麼現在判定失敗、建議下一步
 - 補齊需要的人類決策
 - 若 blocker 消除，再由 owner 決定是否重啟 task / 新增 checkpoint
 
@@ -245,6 +246,7 @@ owner / scheduler next step：
 
 - task 已明確 `BLOCKED`
 - 或 owner reconciliation 已經確認 continuation 需要外部決策 / approval / input / fix
+- **【新】** retry-count 機制：同一個 step 同一 failure type 失敗 3 次 → 立即 BLOCKED_ESCALATE（不等牆時鐘 60 分鐘）
 
 ## 4. 何時刪 cron
 
@@ -270,6 +272,10 @@ owner / scheduler next step：
 - supervision-only ledger writes
 - `action_payload` 產生
 - `DELETE_REQUESTED` marker
+- **【新】** retry-count tracking：`monitoring.retry_count` dict，per-step per-failure-type，3 次同樣失敗 → immediate BLOCKED_ESCALATE
+- **【新】** smart stale detection：外部 task 回傳 pending（RunningHub queue/pending）或 progress_at 仍在更新中 → 不觸發 STALE_PROGRESS / HEARTBEAT_DUE
+- **【新】** 5 分鐘 monitoring interval（從 10 分鐘改為 5 分鐘）
+- **【新】** BLOCKED_ESCALATE notification 一次交代清楚：step / retry 次數 / 嘗試了什麼 / 為什麼失敗 / 建議下一步
 - demo E2E test 驗證 stale -> owner query -> owner reply -> resume / blocked / completed routing
 
 ## 6. Owner reply ingestion
@@ -305,9 +311,9 @@ python3 scripts/task_ledger.py --ledger state/long-task-ledger.json owner-reply 
 
 ### 尚未實作
 
-- 真實對 Discord / message bus 送提醒
-- 真實安裝 / 刪除 crontab entry
+- 真實對 Discord / message bus 送提醒（目前由 cron agent 调用 message.send 處理）
+- 真實安裝 / 刪除 crontab entry（透過 openclaw cron add/rm 處理）
 - 多 owner routing / retry queue
-- cross-process locking
+- cross-process locking（retry_count 目前存在 ledger supervision metadata 中，跨 cron tick 持久化）
 
-所以目前狀態是：**repo 內已可測 end-to-end wiring（含 owner reply ingestion / auto-routing）；外部通知與系統 cron deletion 仍保留為 integration layer。**
+所以目前狀態是：**repo 內已可測 end-to-end wiring（含 retry-count tracking / smart stale / owner reply ingestion / auto-routing）；外部通知與系統 cron deletion 仍保留為 integration layer。**

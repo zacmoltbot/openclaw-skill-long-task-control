@@ -107,19 +107,26 @@ def default_monitor_name(task_id: str):
 
 
 def cron_prompt(ledger_path: Path, task_id: str, requester_channel: str, session_key: str):
-    return f"""你是 OpenClaw 的 long-task-control monitor agent。你的唯一職責：讀取 task ledger，對 task `{task_id}` 執行一次低成本 monitor tick，必要時主動提醒 main agent 繼續做，並在 terminal 狀態時移除自己的 cron job。
+    return f"""你是 OpenClaw 的 long-task-control monitor agent（check interval: 5分鐘）。你的唯一職責：讀取 task ledger，對 task `{task_id}` 執行一次低成本 monitor tick，必要時主動提醒 main agent 繼續做，並在 terminal 狀態或 BLOCKED_ESCALATE 時立即移除自己的 cron job。
+
+⚠️ Smart stale detection 規則（重要）：
+- 若 `progress_at` 仍在更新中（is_progress_updating=true）或外部 task 回傳正在 pending（RunningHub API queue/pending/running），不要判定 STALE_PROGRESS 或 HEARTBEAT_DUE。
+- 只有「沒有 progress」且「沒有 pending external return」時才 nudge。
 
 嚴格步驟：
 1) exec：python3 {ROOT / 'scripts' / 'openclaw_ops.py'} --ledger {ledger_path} preview-tick {task_id}
 2) 解析 JSON，只使用該命令回傳的 state / notify / notification / remove_monitor / reason。
 3) 依 state 分流：
-   - OK / HEARTBEAT_DUE / STALE_PROGRESS：不要發 Discord；輸出 1 行 summary 即可。
-   - NUDGE_MAIN_AGENT / OWNER_RECONCILE / BLOCKED_ESCALATE：只有在 notify=true 時才用 message.send 發到 Discord channel `{requester_channel}`，內容直接使用 notification；若 message.send 回傳失敗但訊息其實已出現在 channel，視為 delivered=true，summary 要註明 delivery=best_effort，不要把整個 cron run 判成 execution truth error。
-   - BLOCKED_ESCALATE：送完提醒後 exec：python3 {ROOT / 'scripts' / 'openclaw_ops.py'} --ledger {ledger_path} remove-monitor {task_id}
-   - STOP_AND_DELETE：不要再提醒；直接 exec：python3 {ROOT / 'scripts' / 'openclaw_ops.py'} --ledger {ledger_path} remove-monitor {task_id}
-4) 如果有發 Discord 訊息，文字必須簡短、fact-based、不可重述整個任務歷史。
-5) remove-monitor 要視為 idempotent cleanup；若 job 已不存在但 ledger 成功標成 DELETED，也算 cron_removed=yes，不要因此把整個 run 判成 error。
-6) 這個 cron job 綁定的 main session key 是 `{session_key}`；提醒文案要明確寫「請 main agent 繼續做 / reconcile / 收尾」，並優先要求 resume / rebuild-safe-step / 補 checkpoint；只有真的無法自救時才 blocker escalation。
+   - OK（含 noop_external_wait）：不要發 Discord；輸出 1 行 summary 即可。
+   - HEARTBEAT_DUE / STALE_PROGRESS：不要發 Discord（這些只是 pre-gate warnings）；輸出 1 行 summary。
+   - NUDGE_MAIN_AGENT / OWNER_RECONCILE：只有在 notify=true 時才用 message.send 發到 Discord channel `{requester_channel}`，內容直接使用 notification；若 message.send 回傳失敗但訊息已出現在 channel，視為 delivered=true，summary 註明 delivery=best_effort。
+   - BLOCKED_ESCALATE：
+     (a) 用 message.send 發到 Discord channel `{requester_channel}`，notification 內容需一次講清楚：哪個 step 卡住、retry 次數、嘗試了什麼、為什麼現在判定失敗、建議下一步。
+     (b) 發完後立即 exec：python3 {ROOT / 'scripts' / 'openclaw_ops.py'} --ledger {ledger_path} remove-monitor {task_id}
+   - STOP_AND_DELETE：不要再發 Discord；直接 exec：python3 {ROOT / 'scripts' / 'openclaw_ops.py'} --ledger {ledger_path} remove-monitor {task_id}
+4) message.send 內容必須簡短、fact-based；BLOCKED_ESCALATE 的 exception：可以稍長但要一次把 blocker 交代清楚，不要分多次補述。
+5) remove-monitor 是 idempotent cleanup；若 job 已不存在但 ledger 成功標成 DELETED，也算 cron_removed=yes。
+6) 這個 cron job 綁定的 main session key 是 `{session_key}`；NUDGE_MAIN_AGENT 文案要明確寫「請 main agent 先自救：resume / rebuild-safe-step / reconcile 缺漏 checkpoint」，只有真的無法自救才等 BLOCKED_ESCALATE。
 
 輸出限制：最後只輸出一小段 JSON summary，包含 task_id、state、notified、cron_removed、delivery。"""
 
@@ -588,6 +595,8 @@ def cmd_preview_tick(args):
         "notify": notify,
         "notification": format_notification(task, report),
         "remove_monitor": report["state"] in {"BLOCKED_ESCALATE", "STOP_AND_DELETE"},
+        "current_step": report.get("current_step"),
+        "retry_count": report.get("retry_count", {}),
     }, ensure_ascii=False, indent=2))
 
 
@@ -633,7 +642,7 @@ def build_parser():
         parser.add_argument("--agent", default=DEFAULT_AGENT)
         parser.add_argument("--session", default="isolated")
         parser.add_argument("--wake", default="now")
-        parser.add_argument("--every", default="10m")
+        parser.add_argument("--every", default="5m")
         parser.add_argument("--cron-expr")
         parser.add_argument("--tz", default=DEFAULT_TIMEZONE)
         parser.add_argument("--timeout-seconds", type=int, default=240)
@@ -654,7 +663,7 @@ def build_parser():
     activate_p.add_argument("--agent", default=DEFAULT_AGENT)
     activate_p.add_argument("--session", default="isolated")
     activate_p.add_argument("--wake", default="now")
-    activate_p.add_argument("--every", default="10m")
+    activate_p.add_argument("--every", default="5m")
     activate_p.add_argument("--cron-expr")
     activate_p.add_argument("--tz", default=DEFAULT_TIMEZONE)
     activate_p.add_argument("--monitor-timeout-seconds", type=int, default=240)
@@ -672,7 +681,7 @@ def build_parser():
     bootstrap_p.add_argument("--agent", default=DEFAULT_AGENT)
     bootstrap_p.add_argument("--session", default="isolated")
     bootstrap_p.add_argument("--wake", default="now")
-    bootstrap_p.add_argument("--every", default="10m")
+    bootstrap_p.add_argument("--every", default="5m")
     bootstrap_p.add_argument("--cron-expr")
     bootstrap_p.add_argument("--tz", default=DEFAULT_TIMEZONE)
     bootstrap_p.add_argument("--monitor-timeout-seconds", type=int, default=240)
