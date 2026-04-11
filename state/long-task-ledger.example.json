@@ -64,7 +64,16 @@
         "references/task-ledger-spec.md"
       ],
       "next_action": "Implement helper scripts",
-      "notes": []
+      "notes": [],
+      "monitoring": {
+        "nudge_after_sec": 1800,
+        "renotify_interval_sec": 900,
+        "max_nudges": 3,
+        "escalate_after_nudges": 2,
+        "nudge_count": 1,
+        "last_nudge_at": "2026-04-11T14:35:00+08:00",
+        "blocked_escalate_after_sec": 1800
+      }
     },
     {
       "task_id": "render-20260411-b",
@@ -138,7 +147,16 @@
       "next_action": "Wait for rerun decision",
       "notes": [
         "Example blocked task for watchdog/compliance demos"
-      ]
+      ],
+      "monitoring": {
+        "nudge_after_sec": 1800,
+        "renotify_interval_sec": 600,
+        "max_nudges": 3,
+        "escalate_after_nudges": 2,
+        "nudge_count": 2,
+        "last_nudge_at": "2026-04-11T10:20:00+08:00",
+        "blocked_escalate_after_sec": 1200
+      }
     }
   ]
 }

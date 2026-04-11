@@ -96,6 +96,15 @@ def cmd_init(args):
             "last_heartbeat_at": now_iso(),
             "watchdog_state": "OK",
         },
+        "monitoring": {
+            "nudge_after_sec": args.nudge_after_sec or args.timeout_sec,
+            "renotify_interval_sec": args.renotify_interval_sec or args.expected_interval_sec,
+            "max_nudges": args.max_nudges,
+            "escalate_after_nudges": args.escalate_after_nudges,
+            "nudge_count": 0,
+            "last_nudge_at": None,
+            "blocked_escalate_after_sec": args.blocked_escalate_after_sec or max(args.timeout_sec, args.expected_interval_sec),
+        },
         "validation": [],
         "blocker": None,
         "artifacts": args.artifact or [],
@@ -195,6 +204,11 @@ def build_parser():
     init_p.add_argument("--next-action", required=True)
     init_p.add_argument("--expected-interval-sec", type=int, default=900)
     init_p.add_argument("--timeout-sec", type=int, default=1800)
+    init_p.add_argument("--nudge-after-sec", type=int)
+    init_p.add_argument("--renotify-interval-sec", type=int)
+    init_p.add_argument("--max-nudges", type=int, default=3)
+    init_p.add_argument("--escalate-after-nudges", type=int, default=2)
+    init_p.add_argument("--blocked-escalate-after-sec", type=int)
     init_p.set_defaults(func=cmd_init)
 
     cp_p = sp.add_parser("checkpoint")

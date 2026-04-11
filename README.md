@@ -2,20 +2,31 @@
 
 `long-task-control` 已從單純 documentation skill，升級成 **semi-enforced task control system**。
 
-它現在不只提供回報格式建議，還補上三個核心能力：
+這次重點不只是 monitor cron 可以抓問題，而是把它明確設計成 **任務續行提醒器 / execution nudge**：
 
-1. **Task ledger**：讓長任務有 durable state，可追蹤 `task_id`、checkpoint、heartbeat、blocker、validation
-2. **Checkpoint timeout + watchdog**：讓「太久沒進展 / 沒回報」可以被提醒、標記、掃描
-3. **Compliance checker**：把常見違規模式變成可檢查規則，而不只是口頭規範
+- 當 task 還沒結束，但 main agent 停住了
+- 當只有 heartbeat、沒有新 checkpoint
+- 當 supervision 斷掉、任務狀態開始模糊
 
-重點不是把 agent 變成重型 workflow engine，而是用最小成本把 long task 從「口頭說有在做」升級成「可觀察、可稽核、可提醒」。
+monitor cron 應主動提醒 main agent 繼續做，直到任務進入 terminal state：
+
+- `COMPLETED`
+- `FAILED`
+- `BLOCKED`
+- `ABANDONED`
+
+其中 `BLOCKED` 不是繼續無限提醒，而是應升級成 blocker escalation，之後 cron 自刪。
 
 ## 這次升級後，repo 提供什麼？
 
 ### 已實作
 
 - `references/task-ledger-spec.md`
-  - 定義 ledger schema、status semantics、checkpoint vs heartbeat、watchdog states
+  - 定義 ledger schema、status semantics、checkpoint vs heartbeat、monitor state machine
+- `references/multi-stage-runbook.md`
+  - 定義 multi-stage task 與 monitor cron 的 operating model
+- `references/failure-examples.md`
+  - 列出 long-task-control 常見違規與 nudge anti-pattern
 - `state/long-task-ledger.example.json`
   - 提供可直接餵給 scripts 的 example ledger
 - `scripts/task_ledger.py`
@@ -24,15 +35,10 @@
   - 掃描 timeout / stale progress / heartbeat due / missing activation
 - `scripts/compliance_check.py`
   - 檢查 activation、task_id、vague progress、blocked silence、completion validation
+- `scripts/monitor_nudge.py`
+  - 用 deterministic rule engine 評估 execution-nudge state，決定提醒 / 升級 / 自刪
 - `scripts/checkpoint_report.py`
-  - 仍保留作為 user-visible status block generator
-
-### 設計規格 / operating model
-
-- semi-enforced enforcement model
-- watchdog / heartbeat / cron 的分工
-- timeout default 建議值
-- blocker escalation 與 stale-progress interpretation
+  - 產出 user-visible status block
 
 ## Why this matters
 
@@ -41,10 +47,11 @@
 - agent 說「還在跑」，但沒有 task handle
 - 任務中途沉默，外界無法判斷是正常等待還是卡死
 - 沒有 activation message，使用者根本不知道已切到 long-task mode
-- 明明應該標 `BLOCKED`，卻沒有 blocker payload
+- 明明應標 `BLOCKED`，卻沒有 blocker payload
 - 宣稱 `COMPLETED`，卻沒有 validation evidence
+- cron 一直跑，但沒有真的提醒 main agent 回來把事做完
 
-這版的目標就是讓上述問題可以被看見、被檢查、被提醒。
+這版的目標就是讓上述問題可以被看見、被檢查、被提醒，並在 terminal state 自動收尾。
 
 ## System model
 
@@ -56,126 +63,173 @@ machine-readable state
   └─ task ledger JSON
       ├─ task_ledger.py
       ├─ checkpoint_timeout.py
-      └─ compliance_check.py
+      ├─ compliance_check.py
+      └─ monitor_nudge.py
 ```
 
-### Reporting layer
+## Monitor cron = execution nudge
 
-給使用者看的仍然是：
+monitor cron 的核心問題不是「有沒有 bug」，而是：
 
-- `ACTIVATED`
-- `TASK START`
-- `CHECKPOINT`
-- `BLOCKED`
-- `COMPLETED`
+> 這個 task 還在真的往前嗎？還是只是沒有被正式結案、main agent 也沒再碰它？
 
-### State layer
+所以 monitor cron 應優先做 **low-cost pre-gate**：
 
-給 agent / maintainer / cron / QA 掃描的是 ledger：
+1. 讀 ledger
+2. 檢查 `status`
+3. 檢查 `last_checkpoint_at` / `last_progress_at`
+4. 檢查 `last_heartbeat_at`
+5. 套用簡單 rule engine
+6. 只在必要時發 reminder / escalation
 
-- `task_id`
-- `status`
-- `workflow`
-- `checkpoints[]`
-- `last_checkpoint_at`
-- `heartbeat.last_progress_at`
-- `heartbeat.last_heartbeat_at`
-- `activation.announced`
-- `blocker`
-- `validation`
+不要每次 cron 都叫大模型重新看一遍整個任務。
 
-## Task ledger concept
+## State machine
 
-Task ledger 是這次升級的核心。
+monitor cron 應輸出以下狀態：
 
-它把 long-task-control 從「訊息格式標準」提升成「有狀態、能掃描、可提醒」的系統。
+### `OK`
+- heartbeat/progress 都新鮮
+- 不需要提醒
 
-### Recommended state file
+### `HEARTBEAT_DUE`
+- 太久沒 heartbeat
+- 但還沒證明 task 卡住
+- 只要輕量提醒 main agent 更新 supervision 即可
 
-```text
-state/long-task-ledger.json
-```
+### `STALE_PROGRESS`
+- 太久沒新 checkpoint
+- 表示 task 可能停住或被遺忘
+- 先標成 pre-gate warning
 
-本 repo 附的是：
+### `NUDGE_MAIN_AGENT`
+- stale progress 持續存在
+- 或 activation 缺失
+- 或 task 明顯需要 main agent 回來繼續做 / 補 checkpoint / 明確標 terminal status
+- 這是 execution nudge 的核心狀態
 
-```text
-state/long-task-ledger.example.json
-```
+### `BLOCKED_ESCALATE`
+- task 已經 `BLOCKED`
+- 或 task 的現況顯示沒有外部決策/輸入就無法續行
+- 這時應送 blocker escalation，不是一直提醒「快做」
 
-### Minimal required fields
+### `STOP_AND_DELETE`
+- task 已 `COMPLETED`
+- task 已 `FAILED`
+- task 已 `ABANDONED`
+- task 已 `BLOCKED` 且 escalation 已送出
+- monitor cron 應停止並刪掉自己
 
-每個 task 至少應有：
+## 什麼情況只是提醒？什麼情況算 blocked/failed？什麼情況自刪 cron？
 
-- `task_id`
-- `goal`
-- `status`
-- `activation.announced`
-- `workflow[]`
-- `current_checkpoint`
-- `last_checkpoint_at`
-- `heartbeat.timeout_sec`
-- `next_action`
+### 只是提醒
 
-完整 schema 見：
+適用：
 
-- `references/task-ledger-spec.md`
+- 沒新 checkpoint，但還沒有明確錯誤
+- 太久沒 heartbeat
+- main agent 看起來只是停住、忘了更新、或沒有把 task 關掉
 
-## Timeout / watchdog design
-
-這版把 timeout 拆成兩種時鐘：
-
-### 1) heartbeat clock
-表示 agent 是否還有持續看管這個 task。
-
-欄位：
-
-- `heartbeat.last_heartbeat_at`
-- `heartbeat.expected_interval_sec`
-
-如果超過 `expected_interval_sec`，watchdog 可標示：
+這時輸出：
 
 - `HEARTBEAT_DUE`
+- `NUDGE_MAIN_AGENT`
 
-### 2) progress clock
-表示 task 是否真的有新進展。
+### 算 `BLOCKED`
 
-欄位：
+適用：
 
-- `last_checkpoint_at`
-- `heartbeat.last_progress_at`
-- `heartbeat.timeout_sec`
+- 缺 approval / credentials / upstream fix / user input / dependency
+- 現在不能安全繼續
+- blocker 可以具體描述
 
-如果只有 heartbeat、太久沒有新 checkpoint，就算 agent 還活著，也應標：
+這時輸出：
 
-- `STALE_PROGRESS`
+- `BLOCKED_ESCALATE`
 
-### 其他 watchdog states
+並在 escalation 後停止 cron。
 
-- `MISSING_ACTIVATION`
-- `BLOCKED_SILENT`
-- `COMPLETED_NO_VALIDATION`
-- `OK`
+### 算 `FAILED`
 
-## Compliance checks currently covered
+適用：
 
-目前 checker 至少會抓以下幾類：
+- 任務已明確失敗
+- 沒有合理自動續行方案
+- 應等待人工重設或重新規劃
 
-1. **沒有 activation message**
-   - active task 但 `activation.announced=false`
-2. **沒有 task id 卻說在做**
-   - active task 缺 `task_id`
-3. **太久沒 checkpoint**
-   - 由 timeout detector 根據 `timeout_sec` 判定
-4. **模糊進度語句**
-   - 例如 `still working` / `還在跑` / `快好了`，但沒有 facts
-5. **應 BLOCKED 卻沉默**
-   - `status=BLOCKED` 但沒有 blocker payload
+低成本 monitor 不應自行「發明失敗」，而應提示 owner agent 將 task 明確標為 `FAILED`。一旦 ledger 寫成 `FAILED`，cron 進入 `STOP_AND_DELETE`。
 
-這些規則目前是 **semi-enforced**：
+### 自刪 cron
 
-- 可在 cron / QA / PR review 中自動掃描
-- 可設 `--fail-on` / `--fail-on-severity` 讓 CI 非零退出
-- 但不直接攔截 agent runtime
+適用：
+
+- `COMPLETED`
+- `FAILED`
+- `ABANDONED`
+- `BLOCKED` escalation 已送出
+- task record 已不存在或不再需要 supervision
+
+## Cost-control principle
+
+依 Edward 的 cost-control 原則，這個 monitor 必須是：
+
+- deterministic
+- cheap
+- pre-gate
+- 最少輸出
+- 只在必要時才觸發更重的提醒或人工介入
+
+也就是：
+
+- **先看 timestamps / status / blocker payload**
+- **不要盲目一直跑大模型**
+- **不要對健康任務反覆產生 verbose summary**
+- **不要讓 cron 在 terminal task 上空轉**
+
+## Example commands
+
+### Evaluate monitor state
+
+```bash
+python3 scripts/monitor_nudge.py \
+  --ledger state/long-task-ledger.example.json
+```
+
+### Only inspect active tasks
+
+```bash
+python3 scripts/monitor_nudge.py \
+  --ledger state/long-task-ledger.example.json \
+  --only-active
+```
+
+### Timeout scan
+
+```bash
+python3 scripts/checkpoint_timeout.py \
+  --ledger state/long-task-ledger.example.json
+```
+
+### Compliance scan
+
+```bash
+python3 scripts/compliance_check.py \
+  --ledger state/long-task-ledger.example.json
+```
+
+## Suggested cron pattern
+
+```bash
+*/10 * * * * cd /repo && python3 scripts/monitor_nudge.py --ledger state/long-task-ledger.json --only-active
+*/30 * * * * cd /repo && python3 scripts/checkpoint_timeout.py --ledger state/long-task-ledger.json
+*/30 * * * * cd /repo && python3 scripts/compliance_check.py --ledger state/long-task-ledger.json
+```
+
+建議順序：
+
+1. `monitor_nudge.py` 做最便宜的 pre-gate
+2. 只有需要 deeper audit 時，再跑其他 checker
+3. task terminal 後，刪 monitor cron
 
 ## Files
 
@@ -191,153 +245,20 @@ state/long-task-ledger.example.json
 │   ├── checkpoint_report.py
 │   ├── checkpoint_timeout.py
 │   ├── compliance_check.py
+│   ├── monitor_nudge.py
 │   └── task_ledger.py
 └── state/
     └── long-task-ledger.example.json
 ```
 
-## Quick start
-
-### 1) Initialize a task in the ledger
-
-```bash
-python3 scripts/task_ledger.py \
-  --ledger state/long-task-ledger.example.json \
-  init repo-upgrade-20260411-a \
-  --goal "Upgrade repo to semi-enforced long-task control" \
-  --channel discord \
-  --owner coding_agent \
-  --activation-announced \
-  --message-ref discord:msg:123456 \
-  --workflow "Inspect repo/workdir/status" \
-  --workflow "Implement ledger + scripts" \
-  --workflow "Update README and SKILL" \
-  --next-action "Start repo inspection"
-```
-
-### 2) Append a checkpoint
-
-```bash
-python3 scripts/task_ledger.py \
-  --ledger state/long-task-ledger.example.json \
-  checkpoint repo-upgrade-20260411-a \
-  --summary "Repo inspection completed" \
-  --status RUNNING \
-  --current-checkpoint step-02 \
-  --fact branch=main \
-  --fact clean_status=true \
-  --next-action "Implement ledger helper scripts"
-```
-
-### 3) Mark blocked
-
-```bash
-python3 scripts/task_ledger.py \
-  --ledger state/long-task-ledger.example.json \
-  block render-20260411-b \
-  --reason "seg03 upstream job failed" \
-  --need "Decide whether to rerun seg03" \
-  --safe-next-step "Rerun seg03 then resume stitch" \
-  --current-checkpoint collect \
-  --next-action "Wait for rerun decision"
-```
-
-### 4) Heartbeat without fake progress
-
-```bash
-python3 scripts/task_ledger.py \
-  --ledger state/long-task-ledger.example.json \
-  heartbeat repo-upgrade-20260411-a \
-  --watchdog-state OK \
-  --note "Still under active supervision; no new checkpoint yet"
-```
-
-### 5) Run timeout detector
-
-```bash
-python3 scripts/checkpoint_timeout.py \
-  --ledger state/long-task-ledger.example.json
-```
-
-Fail CI/cron when stale progress exists:
-
-```bash
-python3 scripts/checkpoint_timeout.py \
-  --ledger state/long-task-ledger.example.json \
-  --fail-on STALE_PROGRESS \
-  --fail-on MISSING_ACTIVATION
-```
-
-### 6) Run compliance checker
-
-```bash
-python3 scripts/compliance_check.py \
-  --ledger state/long-task-ledger.example.json
-```
-
-Fail on warnings or errors:
-
-```bash
-python3 scripts/compliance_check.py \
-  --ledger state/long-task-ledger.example.json \
-  --fail-on-severity warn
-```
-
-## Heartbeat / cron operating pattern
-
-### In-session heartbeat
-
-適合 agent 自己持續看管：
-
-- 每 5-15 分鐘掃 active tasks
-- 若仍在等待但沒有新事實，可只更新 heartbeat
-- 若 checkpoint timeout，立即標記 watchdog state 並提醒
-
-### External cron
-
-適合獨立 scheduler / CI / host cron：
-
-```bash
-*/15 * * * * cd /repo && python3 scripts/checkpoint_timeout.py --ledger state/long-task-ledger.example.json
-*/15 * * * * cd /repo && python3 scripts/compliance_check.py --ledger state/long-task-ledger.example.json
-```
-
-## Relationship to SKILL.md
-
-- `SKILL.md`：給 agent 的 operational contract
-- `README.md`：給 repo 訪客、maintainer、reviewer 看的首頁說明
-- `references/*`：給 implementer 的 deeper design / failure cases
-- `scripts/*`：把規格最小化落地成可執行工具
-
-## Scope boundary
-
-這個 repo 仍然不是完整 workflow orchestrator。
-
-它**有做**：
-
-- task tracking
-- checkpoint/status normalization
-- timeout/watchdog detection
-- compliance scanning
-- example state + helper scripts
-
-它**沒有做**：
-
-- distributed job queue
-- locking / concurrency control
-- event bus
-- auto-remediation engine
-- provider-specific integrations
-
-這是刻意的：先讓 long tasks 有最低限度的可治理性，再決定是否往更重的 orchestration 演進。
-
 ## Summary
 
-這次升級後，`long-task-control` 不再只是「怎麼寫 progress update 比較好」的說明文件，而是：
+這次升級後，`long-task-control` 不再只是「怎麼寫 progress update」的說明，而是：
 
 - 有 **ledger** 可追蹤狀態
-- 有 **watchdog/timeout model** 可抓沉默與停滯
-- 有 **compliance checker** 可抓常見違規
-- 有 **scripts + example state** 可直接落地
+- 有 **monitor cron / execution nudge** 可提醒 main agent 繼續做
+- 有 **state machine** 可區分 reminder / stale / blocked / terminal
+- 有 **low-cost pre-gate** 設計，避免盲目一直燒大模型
+- 有 **self-delete rule**，任務終結就停掉 cron
 
-如果你想把 agent 的長任務執行，從「口頭回報」升級成「semi-enforced operational discipline」，這個 repo 現在已經可以作為最小可行基底。
+如果你要把 agent 的長任務執行，從「口頭回報」升級成「可續行提醒、可稽核、可收尾」的 operational discipline，這個 repo 現在比較完整了。

@@ -1,17 +1,18 @@
 ---
 name: long-task-control
-description: Standardize task control, checkpointing, and status reporting for long-running or multi-stage work. Use when task characteristics indicate non-trivial execution control is needed: the work is likely to take more than one visible turn, includes waiting/polling/background execution, has multiple checkpoints or handoffs, depends on external or asynchronous job systems, produces intermediate artifacts before the final deliverable, or can become blocked and requires proactive status reporting. When triggered, this upgraded version also expects a durable task ledger, checkpoint timeout tracking, and watchdog/compliance visibility. Do not rely on enumerating task categories; trigger from execution traits. When triggered, first emit the required activation message that explicitly tells the user this task is being executed with the long-task-control skill and how progress will be reported.
+description: Standardize task control, checkpointing, and status reporting for long-running or multi-stage work. Use when task characteristics indicate non-trivial execution control is needed: the work is likely to take more than one visible turn, includes waiting/polling/background execution, has multiple checkpoints or handoffs, depends on external or asynchronous job systems, produces intermediate artifacts before the final deliverable, or can become blocked and requires proactive status reporting. When triggered, this upgraded version expects a durable task ledger plus a low-cost monitor cron that acts as an execution nudge: if the main agent stops moving, no new checkpoint appears, or supervision goes stale, the monitor should remind the main agent to continue until the task reaches COMPLETED, FAILED, or BLOCKED.
 ---
 
 # Long Task Control
 
 Keep long tasks boring, traceable, and easy to audit.
 
-This skill is now a **semi-enforced task control system**, not just a formatting guide. The contract has three layers:
+This skill is now a **semi-enforced task control system**, not just a formatting guide. The contract has four layers:
 
 1. **User-visible reporting**: activation → task start → checkpoint → blocked → completed
 2. **Durable state**: task ledger with `task_id`, workflow, timestamps, blocker, validation, heartbeat
-3. **Machine checks**: timeout detector + compliance checker
+3. **Low-cost monitor cron**: pre-gate rule engine that checks ledger freshness and nudges the main agent when execution stalls
+4. **Machine checks**: timeout detector + compliance checker
 
 ## Core rules
 
@@ -24,8 +25,9 @@ This skill is now a **semi-enforced task control system**, not just a formatting
 7. Prefer identifiers over narratives: task id, job id, PID, file path, URL, timestamp, exit state.
 8. If something is blocked, report the exact blocker, what was tried, and the next needed action.
 9. If the task is waiting for a long time, heartbeat is acceptable, but do not confuse heartbeat with progress.
-10. When complete, hand off outputs, validation result, and any still-running/background items.
-11. Do not claim progress based on hope, estimates, or hidden reasoning.
+10. If heartbeats continue but checkpoints do not, let the monitor escalate from reminder to execution nudge.
+11. When complete, hand off outputs, validation result, and any still-running/background items.
+12. Do not claim progress based on hope, estimates, or hidden reasoning.
 
 ## Long-task detection checklist
 
@@ -90,7 +92,7 @@ Minimum task fields:
 - `heartbeat.timeout_sec`
 - `next_action`
 
-See `references/task-ledger-spec.md` for the fuller schema and state semantics.
+See `references/task-ledger-spec.md` for the fuller schema and the monitor-specific fields.
 
 ## Checkpoint vs heartbeat
 
@@ -127,40 +129,115 @@ Heartbeat updates should only advance:
 
 - `heartbeat.last_heartbeat_at`
 
-If heartbeats continue but checkpoints do not, watchdog should still be able to flag `STALE_PROGRESS`.
+If heartbeats continue but checkpoints do not, the monitor should first warn, then nudge the main agent to either make progress or explicitly mark `BLOCKED` / `FAILED`.
 
-## Timeout / watchdog rules
+## Monitor cron purpose
 
-Treat silent long tasks as observable risk.
+The monitor cron is **not** a generic bug scanner. Its main purpose is to act as a **任務續行提醒器 / execution nudge**.
 
-### Recommended timing model
+It exists to answer one cheap question repeatedly:
 
-- `heartbeat.expected_interval_sec`: how often supervision should be refreshed
-- `heartbeat.timeout_sec`: maximum allowed age of the latest progress checkpoint
+> Is this task still truly progressing, or did the main agent stop moving without closing the loop?
 
-Suggested defaults:
-
-- light long task: `600 / 1800`
-- remote async task: `900 / 3600`
-- high-visibility task: `300 / 900`
-
-### Watchdog states
-
-The timeout detector may label tasks with:
+Use the monitor cron to do low-cost pre-gate checks against ledger timestamps and state, then choose one of these state-machine outcomes:
 
 - `OK`
 - `HEARTBEAT_DUE`
 - `STALE_PROGRESS`
-- `BLOCKED_SILENT`
-- `MISSING_ACTIVATION`
-- `COMPLETED_NO_VALIDATION`
+- `NUDGE_MAIN_AGENT`
+- `BLOCKED_ESCALATE`
+- `STOP_AND_DELETE`
 
-Interpretation:
+Read `references/task-ledger-spec.md` for the full state machine and `references/multi-stage-runbook.md` for operating guidance.
 
-- `HEARTBEAT_DUE`: supervision metadata is stale
-- `STALE_PROGRESS`: no meaningful checkpoint for too long
-- `BLOCKED_SILENT`: task is effectively blocked or marked blocked without usable blocker payload
-- `MISSING_ACTIVATION`: the task is active but the required activation record is absent
+## Monitor state semantics
+
+### `OK`
+
+Use when heartbeat and progress are fresh enough. No reminder needed.
+
+### `HEARTBEAT_DUE`
+
+Use when supervision metadata is stale, but the task is still plausibly healthy. This is a lightweight reminder only: update heartbeat, confirm the task is still under watch, and avoid unnecessary large-model work.
+
+### `STALE_PROGRESS`
+
+Use when there has been no real checkpoint for too long. This is a pre-gate warning state, not yet a failure verdict. The monitor should surface that execution looks stalled.
+
+### `NUDGE_MAIN_AGENT`
+
+Use when `STALE_PROGRESS` persists, activation is missing, or the task clearly needs the main agent to resume execution, post a checkpoint, or explicitly mark `BLOCKED` / `FAILED`. This is the core execution-nudge state.
+
+### `BLOCKED_ESCALATE`
+
+Use when the task is already `BLOCKED`, or when evidence shows the task cannot continue safely without external input/approval/fix. Escalate with blocker facts instead of repeatedly nudging.
+
+### `STOP_AND_DELETE`
+
+Use when the task is terminal and the monitor cron should delete itself. Terminal statuses are:
+
+- `COMPLETED`
+- `FAILED`
+- `BLOCKED` after escalation was delivered
+- `ABANDONED`
+
+## Reminder vs blocked vs failed vs self-delete
+
+### Reminder only
+
+Use `HEARTBEAT_DUE` or `NUDGE_MAIN_AGENT` when:
+
+- the task is still expected to continue
+- no terminal error has been proven
+- the main problem is silence, stale heartbeat, or missing checkpoint
+- a simple resume/checkpoint/update from the main agent would resolve ambiguity
+
+### Mark or treat as `BLOCKED`
+
+Escalate toward `BLOCKED` when:
+
+- the task needs approval, credentials, user input, upstream recovery, or a missing dependency
+- retry is unsafe or meaningless without outside action
+- the blocker is known and can be described precisely
+
+### Mark or treat as `FAILED`
+
+Use `FAILED` when:
+
+- the task has definitively failed
+- no safe automatic continuation plan exists
+- the correct next action is human review, redesign, or explicit restart from scratch
+
+Do **not** use the monitor cron alone to invent a failure. The low-cost monitor should recommend escalation; the owning agent should write the terminal status once failure is verified.
+
+### Self-delete the monitor cron
+
+Delete the cron when:
+
+- the task is `COMPLETED`
+- the task is `FAILED`
+- the task is `ABANDONED`
+- the task is `BLOCKED` and one escalation message has already been sent
+- the task record no longer exists or is no longer meant to be supervised
+
+## Cost-control rule
+
+Follow Edward's cost-control principle: the monitor is a **low-cost pre-gate**, not an excuse to wake a large model on every interval.
+
+Preferred monitor loop:
+
+1. Read the ledger.
+2. Compare timestamps and status using deterministic rules.
+3. Emit one cheap state outcome.
+4. Only if the outcome is `NUDGE_MAIN_AGENT` or `BLOCKED_ESCALATE`, send the smallest useful reminder/escalation.
+5. Stop/delete once the task is terminal.
+
+Avoid:
+
+- re-summarizing the whole task every run
+- asking a big model to re-diagnose healthy tasks
+- repeated verbose reminders with no new facts
+- keeping the cron alive after terminal closure
 
 ## Compliance expectations
 
@@ -172,7 +249,7 @@ At minimum, this upgraded skill expects checks for these failure modes:
 4. vague progress wording without facts
 5. task should be `BLOCKED` but remains silent or lacks blocker details
 
-The repo includes a baseline checker for these cases in `scripts/compliance_check.py`.
+The repo includes baseline helpers for these cases in `scripts/checkpoint_timeout.py`, `scripts/compliance_check.py`, and `scripts/monitor_nudge.py`.
 
 ## Start-of-task procedure
 
@@ -229,56 +306,6 @@ Use one of these states only:
 - `BLOCKED`
 - `COMPLETED`
 
-## Fixed report formats
-
-### Generic checkpoint update
-
-```text
-CHECKPOINT
-- task_id: <local-id>
-- checkpoint: <n>/<total> <name>
-- state: running|done|blocked
-- verified facts:
-  - <key>=<value>
-  - <key>=<value>
-- outputs:
-  - <path-or-url>
-- next: <single concrete next action>
-```
-
-### Blocker report
-
-```text
-BLOCKED
-- task_id: <local-id>
-- checkpoint: <name>
-- blocker: <specific failure or missing dependency>
-- verified facts:
-  - <key>=<value>
-- tried:
-  - <attempt 1>
-- need:
-  - <approval/input/retry decision>
-- safe next step: <what can be done once unblocked>
-```
-
-### Completion handoff
-
-```text
-COMPLETED
-- task_id: <local-id>
-- goal: <delivered outcome>
-- completed checkpoints:
-  - <checkpoint>
-- output artifacts:
-  - <path-or-url>
-- validation:
-  - <command/check and result>
-- background items still running:
-  - none | <pid/job>
-- handoff: <what the requester can now review/use>
-```
-
 ## Validation before claiming completion
 
 Before saying a task is done, verify at least one of:
@@ -293,13 +320,14 @@ If validation fails, report `BLOCKED` or a failed checkpoint instead of `COMPLET
 
 ## Use the bundled resources
 
-- `references/task-ledger-spec.md`: durable state schema + watchdog model
-- `references/multi-stage-runbook.md`: fuller SOP for planning, polling, retries, and handoff
-- `references/failure-examples.md`: explicit non-compliant examples and corrected reporting patterns
+- `references/task-ledger-spec.md`: durable state schema + monitor state machine
+- `references/multi-stage-runbook.md`: fuller SOP for planning, polling, retries, handoff, and monitor operation
+- `references/failure-examples.md`: non-compliant examples, corrected reporting patterns, and nudge-specific anti-patterns
 - `scripts/checkpoint_report.py`: generate consistent status blocks
 - `scripts/task_ledger.py`: mutate ledger state
 - `scripts/checkpoint_timeout.py`: detect stale tasks
 - `scripts/compliance_check.py`: scan for baseline rule violations
+- `scripts/monitor_nudge.py`: evaluate the low-cost execution-nudge state machine
 
 ## Minimal operating pattern
 
@@ -309,7 +337,8 @@ If validation fails, report `BLOCKED` or a failed checkpoint instead of `COMPLET
 4. Submit or launch work.
 5. Emit checkpoint when a verifiable state changes.
 6. If waiting, update heartbeat but do not fake progress.
-7. If blocked, escalate immediately with facts and blocker metadata.
-8. Run timeout/compliance checks if the task spans time or handoffs.
+7. Run the low-cost monitor; if progress stays stale, nudge the main agent to resume or close the loop.
+8. If blocked, escalate immediately with facts and blocker metadata.
 9. Validate outputs.
 10. Deliver with `COMPLETED` handoff.
+11. Stop/delete the monitor once the task is terminal.

@@ -2,6 +2,17 @@
 
 Use this runbook when a task has remote jobs, long waits, multiple renders, stitching, uploads/downloads, or more than one checkpoint.
 
+## Key monitor principle
+
+The monitor cron is not just a timeout alarm. Treat it as an **execution nudge loop**:
+
+- if the task is healthy, do nothing cheap (`OK`)
+- if supervision is old, issue a light reminder (`HEARTBEAT_DUE`)
+- if progress is stale, warn first (`STALE_PROGRESS`)
+- if the main agent appears stopped, nudge it to resume or close the loop (`NUDGE_MAIN_AGENT`)
+- if the task is truly blocked, escalate once (`BLOCKED_ESCALATE`)
+- if the task is terminal, delete the cron (`STOP_AND_DELETE`)
+
 ## SOP
 
 ### 1. Intake
@@ -64,7 +75,26 @@ Examples of meaningful changes:
 - file downloaded
 - validation passed
 
-### 5. Handle failures
+### 5. Use the monitor cron as a continuation guardrail
+
+The monitor cron should repeatedly ask: **does the main agent need a push to continue?**
+
+Recommended behavior:
+
+1. run a deterministic ledger check first
+2. avoid big-model analysis for healthy tasks
+3. if only heartbeat is due, send a cheap reminder
+4. if progress is stale, warn once and prepare to nudge
+5. if stale progress persists, nudge the main agent to do one of:
+   - resume execution
+   - emit a real checkpoint
+   - mark `BLOCKED`
+   - mark `FAILED`
+   - mark `COMPLETED`
+6. if blocked is confirmed, escalate once and stop monitoring
+7. if terminal, delete the cron immediately
+
+### 6. Handle failures
 
 If a step fails:
 
@@ -74,7 +104,13 @@ If a step fails:
 - say whether retry is safe
 - ask for the minimum needed decision only if human input is required
 
-### 6. Validate before handoff
+Important distinction:
+
+- **stale progress** is not automatically failure
+- **blocked** means continuation depends on outside action
+- **failed** means there is no safe continuation plan right now
+
+### 7. Validate before handoff
 
 For media tasks, prefer:
 
@@ -89,7 +125,7 @@ For remote jobs:
 - provider status says succeeded/completed
 - output URL or downloaded file exists
 
-### 7. Complete with handoff
+### 8. Complete with handoff
 
 A completion handoff should answer:
 
@@ -97,6 +133,37 @@ A completion handoff should answer:
 - where the outputs are
 - what validation was performed
 - whether anything is still running or pending cleanup
+
+After completion, make sure the task becomes terminal in the ledger so the monitor can choose `STOP_AND_DELETE`.
+
+## State-machine cheat sheet
+
+### `OK`
+- progress fresh enough
+- heartbeat fresh enough
+- no action
+
+### `HEARTBEAT_DUE`
+- no heartbeat within expected interval
+- reminder only
+
+### `STALE_PROGRESS`
+- no checkpoint within timeout window
+- warning, still pre-gate
+
+### `NUDGE_MAIN_AGENT`
+- stale progress persists
+- activation missing
+- or main agent appears to have stopped without a terminal update
+
+### `BLOCKED_ESCALATE`
+- task already `BLOCKED`
+- or evidence shows safe continuation requires external action
+
+### `STOP_AND_DELETE`
+- task terminal
+- escalation sent for blocked task
+- or task no longer needs supervision
 
 ## Task archetypes
 
@@ -165,7 +232,9 @@ Do not:
 - write speculative ETAs as facts
 - hide blockers until asked
 - say “still working” without a job id, PID, or changed state
-- dump huge raw logs when 3-5 facts would do
+- let the monitor cron run forever after terminal status
+- keep nudging when the correct action is blocker escalation
+- wake a large model on every cron tick for healthy tasks
 
 ## Suggested naming
 

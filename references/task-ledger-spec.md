@@ -4,6 +4,15 @@
 
 目的：把原本只存在於訊息中的 long-task status，落到一份可持久化、可檢查、可被 watchdog/cron 掃描的 ledger state file。
 
+這次升級後，monitor cron 的定位也明確改成 **任務續行提醒器 / execution nudge**：
+
+- 當任務還沒完成
+- 當 main agent 沒再推進
+- 當沒有新 checkpoint
+- 當 task 沒有被正確收尾成 `COMPLETED` / `FAILED` / `BLOCKED`
+
+monitor cron 應用低成本 rule engine 主動提醒 main agent 繼續執行，而不是只被動抓 timeout。
+
 ## 為什麼需要 ledger
 
 只有文字 checkpoint 時，常見問題是：
@@ -12,6 +21,7 @@
 - agent 說「有在做」，但沒有 durable state
 - 長時間沉默時，很難判斷是正常等待、失敗、還是忘了更新
 - 後續 compliance checker 沒有結構化輸入可檢查
+- monitor cron 不知道該提醒、升級、還是自刪
 
 ledger 的角色就是提供一個簡單、機器可讀的單一事實來源（single source of truth）。
 
@@ -34,7 +44,7 @@ state/tasks/<task_id>.json
 ```json
 {
   "version": 1,
-  "updated_at": "2026-04-11T14:30:00+08:00",
+  "updated_at": "2026-04-11T15:00:00+08:00",
   "tasks": [
     {
       "task_id": "repo-upgrade-20260411-a",
@@ -92,6 +102,15 @@ state/tasks/<task_id>.json
         "last_heartbeat_at": "2026-04-11T14:25:00+08:00",
         "watchdog_state": "OK"
       },
+      "monitoring": {
+        "nudge_after_sec": 1800,
+        "blocked_escalate_after_sec": 1800,
+        "renotify_interval_sec": 900,
+        "last_nudge_at": null,
+        "last_escalated_at": null,
+        "cron_owner": "long-task-monitor"
+      },
+      "validation": [],
       "blocker": null,
       "artifacts": [
         "references/task-ledger-spec.md"
@@ -117,74 +136,156 @@ state/tasks/<task_id>.json
 - `heartbeat.timeout_sec`
 - `next_action`
 
+### Recommended monitor fields
+
+若要讓 monitor cron 做 execution nudge，建議補上：
+
+- `monitoring.nudge_after_sec`
+- `monitoring.blocked_escalate_after_sec`
+- `monitoring.renotify_interval_sec`
+- `monitoring.last_nudge_at`
+- `monitoring.last_escalated_at`
+- `monitoring.cron_owner`
+
 ## Status semantics
 
 ### `PENDING`
-尚未真正開始執行。
+尚未真正開始執行，但若已被納入 supervision，monitor 可提醒 main agent 真正啟動或明確取消。
 
 ### `RUNNING`
 有進行中工作，且應持續產生 checkpoint 或 heartbeat。
 
 ### `BLOCKED`
-因外部條件、錯誤、缺輸入、缺權限而卡住。
+因外部條件、錯誤、缺輸入、缺權限而卡住。這不是繼續無限提醒的狀態；應轉成 `BLOCKED_ESCALATE`，送出 blocker escalation，然後停掉 cron。
 
 ### `COMPLETED`
-輸出已完成且至少做過一項 validation。
+輸出已完成且至少做過一項 validation。monitor 應 `STOP_AND_DELETE`。
 
 ### `FAILED`
-任務終止，且目前沒有自動恢復計畫。
+任務終止，且目前沒有自動恢復計畫。monitor 應 `STOP_AND_DELETE`。
 
 ### `ABANDONED`
-被人工中止或任務被替代。
+被人工中止或任務被替代。monitor 應 `STOP_AND_DELETE`。
 
 ## Checkpoint vs heartbeat
 
 - `checkpoint`: 有實際進展或新事實，應更新 `last_checkpoint_at`
 - `heartbeat`: 只是確認 task 仍被看管，未必代表有新進展
 
-如果只有 heartbeat、長時間沒有 checkpoint，watchdog 應仍可標示 `STALE_PROGRESS`。
+如果只有 heartbeat、長時間沒有 checkpoint，monitor 應先給 `STALE_PROGRESS`，之後進一步升級成 `NUDGE_MAIN_AGENT`。
 
 ## Timeout model
 
-建議拆成兩層：
+建議拆成三層：
 
 1. `expected_interval_sec`
-   - 正常情況下多久內應該至少有 heartbeat 或 checkpoint
+   - 正常情況下多久內應該至少有 heartbeat
 2. `timeout_sec`
-   - 超過這個時間仍無 checkpoint，應升級為提醒、警告、或 `BLOCKED/STALE`
+   - 超過這個時間仍無 checkpoint，視為 `STALE_PROGRESS`
+3. `nudge_after_sec`
+   - stale progress 持續多久後，要正式推進到 `NUDGE_MAIN_AGENT`
 
 ### Suggested defaults
 
-- 輕量長任務：`expected_interval_sec=600`, `timeout_sec=1800`
-- 遠端排隊任務：`expected_interval_sec=900`, `timeout_sec=3600`
-- 高風險 / 高可見度任務：`expected_interval_sec=300`, `timeout_sec=900`
+- 輕量長任務：`expected_interval_sec=600`, `timeout_sec=1800`, `nudge_after_sec=1800`
+- 遠端排隊任務：`expected_interval_sec=900`, `timeout_sec=3600`, `nudge_after_sec=3600`
+- 高風險 / 高可見度任務：`expected_interval_sec=300`, `timeout_sec=900`, `nudge_after_sec=900`
 
-## Watchdog states
+## Monitor state machine
 
-watchdog 可輸出以下狀態：
+### `OK`
+最近 checkpoint/heartbeat 正常。
 
-- `OK`: 最近 checkpoint/heartbeat 正常
-- `HEARTBEAT_DUE`: 該發 heartbeat 了
-- `STALE_PROGRESS`: 太久沒有 progress checkpoint
-- `BLOCKED_SILENT`: task 應該標成 blocked，但 ledger 長時間無 blocker 記錄且沒進度
-- `MISSING_ACTIVATION`: task 已 RUNNING 但 activation 沒記錄
-- `COMPLETED_NO_VALIDATION`: 任務完成但沒有 validation evidence
+### `HEARTBEAT_DUE`
+heartbeat 太久沒更新，但 task 尚未被證明停住。只做輕量提醒。
+
+### `STALE_PROGRESS`
+太久沒有 progress checkpoint。這是 pre-gate warning，表示「可能停住」。
+
+### `NUDGE_MAIN_AGENT`
+當以下任一成立時使用：
+
+- `STALE_PROGRESS` 已達 `nudge_after_sec`
+- activation 缺失
+- task 明顯沒有被繼續推進，也沒有被正確關閉
+
+預期動作：提醒 main agent 回來做以下其中之一：
+
+- 繼續執行
+- 補發 checkpoint
+- 明確標記 `BLOCKED`
+- 明確標記 `FAILED`
+- 若已完成則寫 `COMPLETED`
+
+### `BLOCKED_ESCALATE`
+當以下任一成立時使用：
+
+- ledger 已明確 `status=BLOCKED`
+- task 缺外部輸入/批准/修復，無法自行安全續行
+
+預期動作：送 blocker escalation，而不是再發「請繼續做」提醒。
+
+### `STOP_AND_DELETE`
+當以下任一成立時使用：
+
+- `status=COMPLETED`
+- `status=FAILED`
+- `status=ABANDONED`
+- `status=BLOCKED` 且 escalation 已送出
+- task record 已消失或不再受監控
+
+預期動作：刪除 monitor cron，避免無限空轉。
+
+## Reminder / blocked / failed / self-delete rules
+
+### 只是提醒
+
+以下情況只需要提醒，不應直接宣判失敗：
+
+- heartbeat 過期
+- 沒新 checkpoint，但沒有明確錯誤
+- main agent 只是沒有更新 ledger / 訊息
+
+### 視為 blocked
+
+以下情況應由 owner agent 明確寫入 `BLOCKED`：
+
+- 等待 approval
+- 等待 credentials
+- 等待 user input
+- 等待 upstream fix
+- 等待不可自動解的依賴
+
+### 視為 failed
+
+以下情況應由 owner agent 明確寫入 `FAILED`：
+
+- 已知步驟失敗且沒有安全自動續行方案
+- retry policy 已耗盡且沒有下一步
+- 目前能做的只有人工重新設計或重開 task
+
+### 自刪 cron
+
+cron 應自刪，不要無限保留，當：
+
+- terminal state 已成立
+- blocker escalation 已發出且 task 不再需要輪詢
+- task 被替代 / 取消 / 移除
 
 ## Recommended cron / heartbeat design
 
-### Heartbeat loop
+### Low-cost pre-gate loop
 
-適合 agent session 自己維護：
+推薦順序：
 
-- 每 5-15 分鐘看一次 active tasks
-- 若無新進展但仍有被看管，更新 `last_heartbeat_at`
-- 若發現 timeout，標記 watchdog state 並產出提醒
+1. 跑 `monitor_nudge.py`
+2. 只有出現 `STALE_PROGRESS` / `NUDGE_MAIN_AGENT` / `BLOCKED_ESCALATE` 時，才進一步觸發 deeper review
+3. terminal state 直接停掉 cron
 
-### Cron / watchdog scan
-
-適合外部 scheduler：
+### Example commands
 
 ```bash
+python3 scripts/monitor_nudge.py --ledger state/long-task-ledger.example.json --only-active
 python3 scripts/checkpoint_timeout.py --ledger state/long-task-ledger.example.json
 python3 scripts/compliance_check.py --ledger state/long-task-ledger.example.json
 ```
@@ -197,6 +298,7 @@ python3 scripts/compliance_check.py --ledger state/long-task-ledger.example.json
 
 - 把 long-task 規格轉成可檢查狀態
 - 讓 checker/watchdog 能自動抓出明顯不合規
+- 讓 monitor cron 能低成本地決定：提醒、升級、或自刪
 - 讓 maintainer 可在 PR review / QA / cron report 中快速定位問題
 
-也就是：**先做到可追蹤、可提醒、可稽核，再逐步提高 enforcement 強度。**
+也就是：**先做到可追蹤、可提醒、可稽核、可收尾，再逐步提高 enforcement 強度。**
