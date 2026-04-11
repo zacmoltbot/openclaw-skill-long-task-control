@@ -14,6 +14,14 @@ This skill is now a **semi-enforced task control system**, not just a formatting
 3. **Low-cost monitor cron**: pre-gate rule engine that checks ledger freshness and nudges the main agent when execution stalls
 4. **Machine checks**: timeout detector + compliance checker
 
+For actual OpenClaw usage, do not stop at repo-local scripts. Use `scripts/openclaw_ops.py` plus `references/openclaw-native-runbook.md` to:
+
+- emit the activation block in the live requester session
+- initialize the ledger with requester-channel metadata
+- create a **real OpenClaw cron job** with `openclaw cron add`
+- let the cron send `message.send` nudges / reconcile prompts / blocker escalations
+- auto-remove the OpenClaw cron job on `COMPLETED` / `FAILED` / post-escalated `BLOCKED`
+
 ## Core rules
 
 1. Decide whether to activate this skill based on execution characteristics, not a memorized list of task types.
@@ -338,15 +346,30 @@ If validation fails, report `BLOCKED` or a failed checkpoint instead of `COMPLET
 - `references/task-ledger-spec.md`: durable state schema + monitor state machine
 - `references/monitor-action-spec.md`: owner-vs-monitor ledger contract + action wiring semantics
 - `references/multi-stage-runbook.md`: fuller SOP for planning, polling, retries, handoff, and monitor operation
+- `references/openclaw-native-runbook.md`: the real OpenClaw activation -> ledger -> cron -> message.send -> cleanup lifecycle
 - `references/failure-examples.md`: non-compliant examples, corrected reporting patterns, and nudge-specific anti-patterns
 - `scripts/checkpoint_report.py`: generate consistent status blocks
 - `scripts/task_ledger.py`: mutate ledger state; use `supervisor-update` only for supervision metadata; use `owner-reply` to ingest owner reconciliation replies and auto-route to resume / blocked / completed
 - `scripts/checkpoint_timeout.py`: detect stale tasks
 - `scripts/compliance_check.py`: scan for baseline rule violations
 - `scripts/monitor_nudge.py`: evaluate the low-cost execution-nudge state machine and optionally write supervision metadata only
+- `scripts/openclaw_ops.py`: OpenClaw-native glue for activation text, ledger init, real `openclaw cron add/rm`, monitor prompt generation, and terminal cleanup
 - `scripts/demo_monitor_flow.py`: run a temp-ledger E2E demo for stale -> owner reconcile -> owner reply -> resume / blocked escalate / stop-delete flows
 - `scripts/monitor_cron.py`: create/remove pseudo cron registrations and execute one monitor tick with terminal self-cleanup wiring
+- `scripts/openclaw_native_e2e.py`: run an OpenClaw-style E2E smoke test with real cron create/remove plus stale -> reconcile -> completed cleanup validation
 - `scripts/shampoo_sample_e2e.py`: run the required 30s shampoo sample E2E flow: activation -> ledger init -> monitor cron install -> checkpoint -> stale/nudge -> owner reconcile -> completed -> cron cleanup
+
+## OpenClaw-native activation and monitor lifecycle
+
+When using this skill inside OpenClaw, follow this exact flow:
+
+1. Post the mandatory activation message in the live requester session (`python3 scripts/openclaw_ops.py activation ...` can generate it).
+2. Initialize the ledger with requester-channel metadata (`python3 scripts/openclaw_ops.py --ledger state/long-task-ledger.json init-task ...`).
+3. Install a **real OpenClaw cron monitor** (`python3 scripts/openclaw_ops.py --ledger state/long-task-ledger.json install-monitor <task_id>`).
+4. Keep writing owner-truth checkpoints with `task_ledger.py checkpoint`, `block`, `heartbeat`, and `owner-reply`.
+5. Let the cron agent run the generated monitor prompt: it calls `monitor_nudge.py`, then uses `message.send` only for `NUDGE_MAIN_AGENT`, `OWNER_RECONCILE`, and `BLOCKED_ESCALATE`.
+6. On `BLOCKED_ESCALATE` or `STOP_AND_DELETE`, let the cron call `openclaw_ops.py remove-monitor <task_id>` so the real OpenClaw cron job is deleted and the ledger is marked `DELETED`.
+7. Use `python3 scripts/openclaw_native_e2e.py` before handoff when you need a full OpenClaw-style smoke test.
 
 ## Minimal operating pattern
 

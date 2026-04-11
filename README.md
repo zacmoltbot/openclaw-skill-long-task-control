@@ -45,6 +45,12 @@ monitor cron 應主動提醒 main agent 繼續做，直到任務進入 terminal 
   - 用 temp ledger 跑可測的 E2E demo：stale -> OWNER_RECONCILE -> owner reply -> resume execution / BLOCKED_ESCALATE / STOP_AND_DELETE
 - `scripts/monitor_cron.py`
   - pseudo cron wrapper：建立/列出/移除 monitor registration，並可執行單次 monitor tick；若遇到 `BLOCKED_ESCALATE` 或 `STOP_AND_DELETE` 會做 terminal cleanup
+- `scripts/openclaw_ops.py`
+  - OpenClaw-native glue：產生 activation block、初始化 ledger、建立/移除真實 `openclaw cron` monitor job、生成 cron agent prompt、預覽 nudge/reconcile/escalate 訊息
+- `references/openclaw-native-runbook.md`
+  - 明確說明 activation -> ledger init -> OpenClaw cron monitor -> message.send nudge/reconcile/escalate -> terminal cleanup 的實際操作流程
+- `scripts/openclaw_native_e2e.py`
+  - 跑 OpenClaw-style E2E smoke test：真實建立 cron job、驗證 stale -> reconcile -> completed -> cron delete lifecycle
 - `scripts/shampoo_sample_e2e.py`
   - 以『30s 洗髮精廣告』sample 跑完整 E2E：activation -> ledger init -> monitor cron install -> checkpoint -> stale/nudge -> owner reconcile -> completed -> cron cleanup
 - `scripts/checkpoint_report.py`
@@ -204,6 +210,47 @@ monitor cron 應輸出以下狀態：
 - **不要盲目一直跑大模型**
 - **不要對健康任務反覆產生 verbose summary**
 - **不要讓 cron 在 terminal task 上空轉**
+
+## OpenClaw-native quick start
+
+### 1) 產生 activation block
+
+```bash
+python3 scripts/openclaw_ops.py activation --task-note "<short task note>"
+```
+
+### 2) 初始化真實 ledger task
+
+```bash
+python3 scripts/openclaw_ops.py --ledger state/long-task-ledger.json init-task <task_id> \
+  --goal "<one sentence goal>" \
+  --requester-channel <discord-channel-id> \
+  --workflow "Inspect inputs" \
+  --workflow "Implement" \
+  --workflow "Validate and handoff" \
+  --next-action "Start checkpoint 1" \
+  --message-ref "discord:msg:<activation-message-id>"
+```
+
+### 3) 安裝真實 OpenClaw cron monitor
+
+```bash
+python3 scripts/openclaw_ops.py --ledger state/long-task-ledger.json install-monitor <task_id>
+```
+
+### 4) 預覽 monitor tick 會怎麼提醒
+
+```bash
+python3 scripts/openclaw_ops.py --ledger state/long-task-ledger.json preview-tick <task_id>
+```
+
+### 5) 跑 OpenClaw-style smoke test
+
+```bash
+python3 scripts/openclaw_native_e2e.py
+```
+
+更完整操作請看 `references/openclaw-native-runbook.md`。
 
 ## Example commands
 
