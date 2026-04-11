@@ -48,8 +48,8 @@ def main():
         assert "ACTIVATED" in activation
         assert "long-task-control" in activation
 
-        init_payload = run_json(
-            "python3", str(OPS), "--ledger", str(ledger), "init-task", task_id,
+        activated = run_json(
+            "python3", str(OPS), "--ledger", str(ledger), "activate-task", task_id,
             "--goal", "Prove OpenClaw-native long-task-control activation to cron cleanup",
             "--requester-channel", "1484432523781083197",
             "--workflow", "Inspect inputs",
@@ -58,18 +58,14 @@ def main():
             "--next-action", "Run checkpoint 1",
             "--message-ref", "discord:msg:e2e-activation",
             "--fact", "channel_id=1484432523781083197",
-        )
-        assert init_payload["task_id"] == task_id
-
-        installed = run_json(
-            "python3", str(OPS), "--ledger", str(ledger), "install-monitor", task_id,
             "--every", "30m",
             "--disabled",
         )
-        job_id = installed["job"]["id"]
+        assert activated["task_id"] == task_id
+        job_id = activated["job"]["id"]
         assert job_id
-        assert "message.send" in installed["prompt_preview"]
-        assert "remove-monitor" in installed["prompt_preview"]
+        assert "message.send" in activated["prompt_preview"]
+        assert "remove-monitor" in activated["prompt_preview"]
 
         task = task_from(ledger, task_id)
         assert task["monitoring"]["openclaw_cron_job_id"] == job_id

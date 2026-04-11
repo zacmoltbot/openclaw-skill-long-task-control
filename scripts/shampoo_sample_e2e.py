@@ -6,8 +6,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 TASK_LEDGER = ROOT / "scripts" / "task_ledger.py"
-MONITOR_CRON = ROOT / "scripts" / "monitor_cron.py"
-CHECKPOINT_REPORT = ROOT / "scripts" / "checkpoint_report.py"
+OPENCLAW_OPS = ROOT / "scripts" / "openclaw_ops.py"
 
 
 ACTIVATION_BLOCK = """ACTIVATED
@@ -50,66 +49,78 @@ def main():
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
         ledger = tmp / "state" / "long-task-ledger.json"
-        cron_dir = tmp / "state" / "monitor-crons"
         task_id = "shampoo-30s-20260411-a"
         output_dir = tmp / "artifacts"
         output_dir.mkdir(parents=True, exist_ok=True)
         final_video = output_dir / "shampoo-ad-30s.mp4"
         final_video.write_bytes(b"FAKE_MP4_DATA")
 
-        run(
-            "python3", str(TASK_LEDGER), "--ledger", str(ledger), "init", task_id,
+        activation_payload = run_json(
+            "python3", str(OPENCLAW_OPS), "--ledger", str(ledger), "activate-task", task_id,
             "--goal", "Deliver a 30-second shampoo ad sample with verified lifecycle control",
             "--owner", "main-agent",
             "--channel", "discord",
+            "--requester-channel", "1484432523781083197",
             "--workflow", "Draft treatment",
             "--workflow", "Render sample",
             "--workflow", "Validate and handoff",
-            "--activation-announced",
             "--message-ref", "discord:msg:shampoo-activation",
             "--summary", "Activation announced and shampoo sample task initialized",
             "--fact", "activation_message=emitted",
             "--fact", "sample_name=30s_shampoo_ad",
             "--next-action", "Prepare treatment outline and create first checkpoint",
-            "--expected-interval-sec", "30",
-            "--timeout-sec", "60",
-            "--nudge-after-sec", "60",
+            "--expected-interval-sec", "180",
+            "--timeout-sec", "300",
+            "--nudge-after-sec", "300",
+            "--renotify-interval-sec", "300",
             "--escalate-after-nudges", "1",
             "--max-nudges", "2",
-            "--blocked-escalate-after-sec", "30",
+            "--blocked-escalate-after-sec", "300",
+            "--every", "5m",
+            "--disabled"
         )
 
         activation_task = task_from(ledger, task_id)
         assert activation_task["activation"]["announced"] is True
         assert activation_task["checkpoints"][0]["facts"]["sample_name"] == "30s_shampoo_ad"
+        assert activation_task["monitoring"]["cron_state"] == "DISABLED"
+        assert activation_task["monitoring"]["openclaw_cron_job_id"]
+        assert activation_payload["task_id"] == task_id
 
-        installed = run_json(
-            "python3", str(MONITOR_CRON), "--ledger", str(ledger), "--cron-dir", str(cron_dir),
-            "install", task_id, "--cron-spec", "*/5 * * * *"
-        )
-        assert Path(installed["cron_file"]).exists()
-
-        started_block = run(
-            "python3", str(CHECKPOINT_REPORT), "STARTED", task_id,
-            "--goal", "Deliver a 30-second shampoo ad sample with verified lifecycle control",
-            "--workflow-step", "Draft treatment",
-            "--workflow-step", "Render sample",
-            "--workflow-step", "Validate and handoff",
+        started_payload = run_json(
+            "python3", str(OPENCLAW_OPS), "--ledger", str(ledger), "record-update", "STARTED", task_id,
+            "--summary", "Activation already announced; owner re-emits STARTED block through execution wrapper",
+            "--current-checkpoint", "step-01",
+            "--next-action", "Render the 30-second sample",
             "--fact", "activation_message=emitted",
-            "--fact", "monitor_cron=installed",
-        ).stdout.strip()
+            "--fact", "monitor_cron=installed"
+        )
+        started_block = started_payload["status_block"]
 
-        run(
-            "python3", str(TASK_LEDGER), "--ledger", str(ledger), "checkpoint", task_id,
+        checkpoint_payload = run_json(
+            "python3", str(OPENCLAW_OPS), "--ledger", str(ledger), "record-update", "CHECKPOINT", task_id,
             "--summary", "Treatment outline approved for shampoo sample",
             "--current-checkpoint", "step-02",
             "--next-action", "Render the 30-second sample",
             "--fact", "storyboard=v1_ready",
-            "--fact", "duration_sec=30",
+            "--fact", "duration_sec=30"
         )
         task = task_from(ledger, task_id)
+        assert checkpoint_payload["task_status"] == "RUNNING"
         assert task["current_checkpoint"] == "step-02"
         assert task["checkpoints"][-1]["facts"]["duration_sec"] == "30"
+
+        task = load(ledger)
+        inner = next(item for item in task["tasks"] if item["task_id"] == task_id)
+        inner.setdefault("heartbeat", {})["last_heartbeat_at"] = "2020-01-01T00:00:00+00:00"
+        ledger.write_text(json.dumps(task, ensure_ascii=False, indent=2) + "\n")
+
+        reminder_result = run_json(
+            "python3", str(OPENCLAW_OPS), "--ledger", str(ledger), "preview-tick", task_id
+        )
+        assert reminder_result["state"] == "HEARTBEAT_DUE"
+        assert "HEARTBEAT_DUE" in reminder_result["notification"]
+        assert reminder_result["remove_monitor"] is False
 
         task = load(ledger)
         inner = next(item for item in task["tasks"] if item["task_id"] == task_id)
@@ -117,12 +128,11 @@ def main():
         ledger.write_text(json.dumps(task, ensure_ascii=False, indent=2) + "\n")
 
         nudge_result = run_json(
-            "python3", str(MONITOR_CRON), "--ledger", str(ledger), "--cron-dir", str(cron_dir),
-            "run-once", "--task-id", task_id
+            "python3", str(OPENCLAW_OPS), "--ledger", str(ledger), "preview-tick", task_id
         )
-        assert nudge_result["report"]["state"] == "NUDGE_MAIN_AGENT"
-        assert nudge_result["report"]["action_payload"]["kind"] == "NUDGE_MAIN_AGENT"
-        assert nudge_result["cron_removed"] is False
+        assert nudge_result["state"] == "NUDGE_MAIN_AGENT"
+        assert "請 main agent 立刻回來續行" in nudge_result["notification"]
+        assert nudge_result["remove_monitor"] is False
 
         task = load(ledger)
         inner = next(item for item in task["tasks"] if item["task_id"] == task_id)
@@ -130,11 +140,10 @@ def main():
         ledger.write_text(json.dumps(task, ensure_ascii=False, indent=2) + "\n")
 
         reconcile_result = run_json(
-            "python3", str(MONITOR_CRON), "--ledger", str(ledger), "--cron-dir", str(cron_dir),
-            "run-once", "--task-id", task_id
+            "python3", str(OPENCLAW_OPS), "--ledger", str(ledger), "preview-tick", task_id
         )
-        assert reconcile_result["report"]["state"] == "OWNER_RECONCILE"
-        assert reconcile_result["report"]["action_payload"]["kind"] == "OWNER_RECONCILE"
+        assert reconcile_result["state"] == "OWNER_RECONCILE"
+        assert "A_IN_PROGRESS_FORGOT_LEDGER" in reconcile_result["notification"]
 
         run(
             "python3", str(TASK_LEDGER), "--ledger", str(ledger), "owner-reply", task_id,
@@ -149,34 +158,32 @@ def main():
         assert task["monitoring"]["owner_response_kind"] == "E_FORGOT_OR_NOT_DOING"
         assert task["checkpoints"][-1]["facts"]["resume_required"] == "true"
 
-        run(
-            "python3", str(TASK_LEDGER), "--ledger", str(ledger), "checkpoint", task_id,
+        completed_payload = run_json(
+            "python3", str(OPENCLAW_OPS), "--ledger", str(ledger), "record-update", "COMPLETED", task_id,
             "--summary", "Rendered shampoo sample and validated output file",
-            "--kind", "COMPLETED",
-            "--status", "COMPLETED",
             "--current-checkpoint", "step-03",
             "--next-action", "None",
-            "--artifact", str(final_video),
+            "--output", str(final_video),
+            "--completed-checkpoint", "step-01",
+            "--completed-checkpoint", "step-02",
+            "--completed-checkpoint", "step-03",
             "--fact", f"output_file={final_video}",
-            "--fact", "size_bytes=13",
-            "--fact", "duration_sec=30",
+            "--fact", f"size_bytes={final_video.stat().st_size}",
+            "--fact", "duration_sec=30"
         )
-        run(
-            "python3", str(TASK_LEDGER), "--ledger", str(ledger), "owner-reply", task_id,
-            "--reply", "C",
-            "--summary", "Owner confirmed the shampoo sample is complete and validated",
-            "--validation", f"file_exists={final_video.exists()}",
-            "--validation", f"size_bytes={final_video.stat().st_size}",
-            "--artifact", str(final_video),
-        )
+        assert completed_payload["task_status"] == "COMPLETED"
+        assert any(item.startswith("artifact_exists[") for item in completed_payload["validation"])
 
         cleanup_result = run_json(
-            "python3", str(MONITOR_CRON), "--ledger", str(ledger), "--cron-dir", str(cron_dir),
-            "run-once", "--task-id", task_id
+            "python3", str(OPENCLAW_OPS), "--ledger", str(ledger), "preview-tick", task_id
         )
-        assert cleanup_result["report"]["state"] == "STOP_AND_DELETE"
-        assert cleanup_result["cron_removed"] is True
-        assert not Path(cleanup_result["cron_file"]).exists()
+        assert cleanup_result["state"] == "STOP_AND_DELETE"
+        assert cleanup_result["remove_monitor"] is True
+
+        removed = run_json(
+            "python3", str(OPENCLAW_OPS), "--ledger", str(ledger), "remove-monitor", task_id
+        )
+        assert removed["removed"] is True
 
         final_task = task_from(ledger, task_id)
         assert final_task["status"] == "COMPLETED"
@@ -189,15 +196,16 @@ def main():
             "activation_message": ACTIVATION_BLOCK,
             "started_block": started_block,
             "ledger": str(ledger),
-            "cron_dir": str(cron_dir),
             "final_video": str(final_video),
+            "openclaw_cron_job_id": final_task["monitoring"].get("openclaw_cron_job_id"),
             "states": {
-                "after_first_stale": nudge_result["report"]["state"],
-                "after_second_stale": reconcile_result["report"]["state"],
-                "after_terminal": cleanup_result["report"]["state"],
+                "after_3min_reminder": reminder_result["state"],
+                "after_5min_stale": nudge_result["state"],
+                "after_owner_reconcile": reconcile_result["state"],
+                "after_terminal": cleanup_result["state"],
             },
             "owner_reply_route": final_task["monitoring"]["owner_response_kind"],
-            "cron_removed": cleanup_result["cron_removed"],
+            "cron_removed": removed["removed"],
         }, ensure_ascii=False, indent=2))
 
 

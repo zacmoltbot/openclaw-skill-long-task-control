@@ -47,6 +47,7 @@ monitor cron 應主動提醒 main agent 繼續做，直到任務進入 terminal 
   - pseudo cron wrapper：建立/列出/移除 monitor registration，並可執行單次 monitor tick；若遇到 `BLOCKED_ESCALATE` 或 `STOP_AND_DELETE` 會做 terminal cleanup
 - `scripts/openclaw_ops.py`
   - OpenClaw-native glue：產生 activation block、初始化 ledger、建立/移除真實 `openclaw cron` monitor job、生成 cron agent prompt、預覽 nudge/reconcile/escalate 訊息
+  - 新增 `record-update` owner wrapper：把 execution truth 的 checkpoint/block/completed 與 ledger append 綁成同一條命令，避免 main agent 做了事卻忘了寫 ledger
 - `references/openclaw-native-runbook.md`
   - 明確說明 activation -> ledger init -> OpenClaw cron monitor -> message.send nudge/reconcile/escalate -> terminal cleanup 的實際操作流程
 - `scripts/openclaw_native_e2e.py`

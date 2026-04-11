@@ -167,6 +167,6 @@ This test proves:
 - main agent posts activation message
 - main agent initializes ledger
 - main agent installs OpenClaw monitor cron
-- main agent keeps writing checkpoints
+- main agent keeps writing checkpoints (prefer `python3 scripts/openclaw_ops.py --ledger state/long-task-ledger.json record-update <STARTED|CHECKPOINT|BLOCKED|COMPLETED> <task_id> ...` so execution truth and ledger append stay bound together)
 - cron agent only wakes when scheduled and sends minimal reminders when stale
 - terminal completion / blocked escalation removes the cron immediately
