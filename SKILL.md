@@ -92,7 +92,7 @@ Minimum task fields:
 - `heartbeat.timeout_sec`
 - `next_action`
 
-See `references/task-ledger-spec.md` for the fuller schema and the monitor-specific fields. See `references/monitor-action-spec.md` for the owner-vs-monitor write contract and the action wiring for `NUDGE_MAIN_AGENT`, `BLOCKED_ESCALATE`, and `STOP_AND_DELETE`.
+See `references/task-ledger-spec.md` for the fuller schema and the monitor-specific fields. See `references/monitor-action-spec.md` for the owner-vs-monitor write contract and the action wiring for `NUDGE_MAIN_AGENT`, `OWNER_RECONCILE`, `BLOCKED_ESCALATE`, and `STOP_AND_DELETE`.
 
 ## Checkpoint vs heartbeat
 
@@ -145,6 +145,7 @@ Use the monitor cron to do low-cost pre-gate checks against ledger timestamps an
 - `HEARTBEAT_DUE`
 - `STALE_PROGRESS`
 - `NUDGE_MAIN_AGENT`
+- `OWNER_RECONCILE`
 - `BLOCKED_ESCALATE`
 - `STOP_AND_DELETE`
 
@@ -166,7 +167,19 @@ Use when there has been no real checkpoint for too long. This is a pre-gate warn
 
 ### `NUDGE_MAIN_AGENT`
 
-Use when `STALE_PROGRESS` persists, activation is missing, or the task clearly needs the main agent to resume execution, post a checkpoint, or explicitly mark `BLOCKED` / `FAILED`. This is the core execution-nudge state.
+Use for the first execution nudge: ask the main agent to resume execution, post a checkpoint, or explicitly mark `BLOCKED` / `FAILED` / `COMPLETED`.
+
+### `OWNER_RECONCILE`
+
+Use when stale progress persists after prior nudges. This is the stale -> query owner state.
+
+Expected owner-reconciliation branches:
+
+- `A_IN_PROGRESS_FORGOT_LEDGER`: owner says work was progressing but the ledger was stale -> append missed checkpoint(s), refresh `next_action`, keep `RUNNING`
+- `B_BLOCKED`: owner confirms the task is blocked -> write blocker truth and move to `BLOCKED_ESCALATE`
+- `C_COMPLETED`: owner confirms the task already finished -> write `COMPLETED` plus validation evidence
+- `D_NO_REPLY`: owner does not respond -> do not invent task truth; seek external evidence first
+- `E_FORGOT_OR_NOT_DOING`: owner admits the work was forgotten / not being done -> do not only record it; immediately enter the resume-execution / 要求補做 path
 
 ### `BLOCKED_ESCALATE`
 
@@ -185,7 +198,7 @@ Use when the task is terminal and the monitor cron should delete itself. Termina
 
 ### Reminder only
 
-Use `HEARTBEAT_DUE` or `NUDGE_MAIN_AGENT` when:
+Use `HEARTBEAT_DUE`, `NUDGE_MAIN_AGENT`, or `OWNER_RECONCILE` when:
 
 - the task is still expected to continue
 - no terminal error has been proven
@@ -231,7 +244,7 @@ Preferred monitor loop:
 1. Read the ledger.
 2. Compare timestamps and status using deterministic rules.
 3. Emit one cheap state outcome.
-4. Only if the outcome is `NUDGE_MAIN_AGENT` or `BLOCKED_ESCALATE`, send the smallest useful reminder/escalation.
+4. Only if the outcome is `NUDGE_MAIN_AGENT`, `OWNER_RECONCILE`, or `BLOCKED_ESCALATE`, send the smallest useful reminder/escalation.
 5. Stop/delete once the task is terminal.
 
 Avoid:

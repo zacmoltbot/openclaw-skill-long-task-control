@@ -27,6 +27,13 @@ def force_ages(ledger_path: Path):
     running["heartbeat"]["last_progress_at"] = "2020-01-01T00:00:00+00:00"
     running["heartbeat"]["last_heartbeat_at"] = "2020-01-01T00:00:00+00:00"
 
+    reconcile = tasks["demo-reconcile"]
+    reconcile["last_checkpoint_at"] = "2020-01-01T00:00:00+00:00"
+    reconcile["heartbeat"]["last_progress_at"] = "2020-01-01T00:00:00+00:00"
+    reconcile["heartbeat"]["last_heartbeat_at"] = "2020-01-01T00:00:00+00:00"
+    reconcile["monitoring"]["nudge_count"] = 1
+    reconcile["monitoring"]["last_nudge_at"] = "2020-01-01T00:00:00+00:00"
+
     blocked = tasks["demo-blocked"]
     blocked["last_checkpoint_at"] = "2020-01-01T00:00:00+00:00"
     blocked["heartbeat"]["last_progress_at"] = "2020-01-01T00:00:00+00:00"
@@ -56,6 +63,21 @@ def main():
             "--expected-interval-sec", "30",
             "--timeout-sec", "60",
             "--nudge-after-sec", "60",
+        )
+        run(
+            "python3", str(TASK_LEDGER), "--ledger", str(ledger_path), "init", "demo-reconcile",
+            "--goal", "Demonstrate OWNER_RECONCILE",
+            "--owner", "main-agent",
+            "--channel", "discord",
+            "--workflow", "Inspect",
+            "--workflow", "Resume",
+            "--activation-announced",
+            "--next-action", "Ask owner what happened and resume the task",
+            "--expected-interval-sec", "30",
+            "--timeout-sec", "60",
+            "--nudge-after-sec", "60",
+            "--escalate-after-nudges", "1",
+            "--max-nudges", "2",
         )
         run(
             "python3", str(TASK_LEDGER), "--ledger", str(ledger_path), "init", "demo-blocked",
@@ -106,6 +128,8 @@ def main():
 
         assert reports["demo-running"]["state"] == "NUDGE_MAIN_AGENT", reports["demo-running"]
         assert reports["demo-running"]["action_payload"]["kind"] == "NUDGE_MAIN_AGENT"
+        assert reports["demo-reconcile"]["state"] == "OWNER_RECONCILE", reports["demo-reconcile"]
+        assert reports["demo-reconcile"]["action_payload"]["kind"] == "OWNER_RECONCILE"
         assert reports["demo-blocked"]["state"] == "BLOCKED_ESCALATE", reports["demo-blocked"]
         assert reports["demo-blocked"]["action_payload"]["kind"] == "BLOCKED_ESCALATE"
         assert reports["demo-complete"]["state"] == "STOP_AND_DELETE", reports["demo-complete"]
@@ -119,6 +143,10 @@ def main():
         running = next(task for task in after["tasks"] if task["task_id"] == "demo-running")
         assert running["monitoring"]["nudge_count"] == 1
         assert running["heartbeat"]["watchdog_state"] == "NUDGE_MAIN_AGENT"
+
+        reconcile = next(task for task in after["tasks"] if task["task_id"] == "demo-reconcile")
+        assert reconcile["monitoring"]["owner_query_at"]
+        assert reconcile["heartbeat"]["watchdog_state"] == "OWNER_RECONCILE"
 
         blocked = next(task for task in after["tasks"] if task["task_id"] == "demo-blocked")
         assert blocked["monitoring"]["last_escalated_at"]

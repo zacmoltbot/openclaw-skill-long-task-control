@@ -16,6 +16,9 @@ SUPERVISION_ALLOWED_KEYS = {
     "last_action_kind",
     "last_action_payload",
     "cron_state",
+    "owner_query_at",
+    "owner_response_at",
+    "owner_response_kind",
 }
 
 

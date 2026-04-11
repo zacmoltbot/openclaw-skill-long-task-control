@@ -42,7 +42,7 @@ monitor cron 應主動提醒 main agent 繼續做，直到任務進入 terminal 
 - `scripts/task_ledger.py supervisor-update`
   - 提供 monitor 專用的 supervision-only 更新入口，不允許覆寫 task truth
 - `scripts/demo_monitor_flow.py`
-  - 用 temp ledger 跑可測的 E2E demo：NUDGE_MAIN_AGENT / BLOCKED_ESCALATE / STOP_AND_DELETE
+  - 用 temp ledger 跑可測的 E2E demo：NUDGE_MAIN_AGENT / OWNER_RECONCILE / BLOCKED_ESCALATE / STOP_AND_DELETE
 - `scripts/checkpoint_report.py`
   - 產出 user-visible status block
 
@@ -109,10 +109,18 @@ monitor cron 應輸出以下狀態：
 - 先標成 pre-gate warning
 
 ### `NUDGE_MAIN_AGENT`
-- stale progress 持續存在
-- 或 activation 缺失
-- 或 task 明顯需要 main agent 回來繼續做 / 補 checkpoint / 明確標 terminal status
-- 這是 execution nudge 的核心狀態
+- 第一次 execution nudge
+- 要求 main agent 回來繼續做 / 補 checkpoint / 明確標 terminal status
+
+### `OWNER_RECONCILE`
+- stale progress 在 prior nudges 後仍持續
+- 進入 stale -> query owner 流程
+- owner 回覆後要立刻分流：
+  - A 有在做只是忘了更新 ledger -> 補 ledger，維持 `RUNNING`
+  - B 卡住 -> `BLOCKED_ESCALATE`
+  - C 已完成 -> 補 validation 並寫 `COMPLETED`
+  - D 沒回 -> 先找外部 evidence，不可憑空改 task truth
+  - E owner 承認忘了做 / 沒在做 -> 不是只記錄，而是立刻進入「要求補做 / resume execution」路徑
 
 ### `BLOCKED_ESCALATE`
 - task 已經 `BLOCKED`
@@ -140,6 +148,7 @@ monitor cron 應輸出以下狀態：
 
 - `HEARTBEAT_DUE`
 - `NUDGE_MAIN_AGENT`
+- `OWNER_RECONCILE`
 
 ### 算 `BLOCKED`
 
@@ -250,6 +259,7 @@ python3 scripts/demo_monitor_flow.py
 這個 demo 會建立 temp ledger，驗證：
 
 - `NUDGE_MAIN_AGENT` 會產生 action payload，且只增加 supervision metadata
+- `OWNER_RECONCILE` 會產生 owner-query payload，並標記 `owner_query_at`
 - `BLOCKED_ESCALATE` 會標記 `last_escalated_at` 與 `cron_state=DELETE_REQUESTED`
 - `STOP_AND_DELETE` 會標記 `cron_state=DELETE_REQUESTED`
 - monitor 不會偷偷改 `status` / `checkpoints` / `next_action` 這些 task truth
@@ -267,9 +277,10 @@ python3 scripts/demo_monitor_flow.py
 1. `monitor_nudge.py` 做最便宜的 pre-gate
 2. 若只是 `HEARTBEAT_DUE`，發最小提醒即可
 3. 若進入 `NUDGE_MAIN_AGENT`，提醒 owner agent 繼續做、補 checkpoint、或明確寫成 `COMPLETED` / `FAILED` / `BLOCKED`
-4. 若進入 `BLOCKED_ESCALATE`，送 blocker escalation，並把 cron 標成 `DELETE_REQUESTED`
-5. 若進入 `STOP_AND_DELETE`，停用 cron / watcher
-6. 只有需要 deeper audit 時，再跑其他 checker
+4. 若進入 `OWNER_RECONCILE`，立刻 query owner；根據 A/B/C/D/E 分流補 ledger、升級 blocked、寫 completed、找外部 evidence，或直接要求 resume execution
+5. 若進入 `BLOCKED_ESCALATE`，送 blocker escalation，並把 cron 標成 `DELETE_REQUESTED`
+6. 若進入 `STOP_AND_DELETE`，停用 cron / watcher
+7. 只有需要 deeper audit 時，再跑其他 checker
 
 ## Files
 
@@ -279,6 +290,7 @@ python3 scripts/demo_monitor_flow.py
 ├── SKILL.md
 ├── references/
 │   ├── failure-examples.md
+│   ├── monitor-action-spec.md
 │   ├── multi-stage-runbook.md
 │   └── task-ledger-spec.md
 ├── scripts/
@@ -299,7 +311,7 @@ python3 scripts/demo_monitor_flow.py
 - 有 **monitor cron / execution nudge** 可提醒 main agent 繼續做
 - 有明確的 **ledger ownership contract**：owner 寫 task truth，monitor 只寫 supervision metadata
 - 有 **state machine** 可區分 reminder / stale / blocked / terminal
-- 有 repo 內可跑的 **E2E demo wiring**：`NUDGE_MAIN_AGENT` / `BLOCKED_ESCALATE` / `STOP_AND_DELETE`
+- 有 repo 內可跑的 **E2E demo wiring**：`NUDGE_MAIN_AGENT` / `OWNER_RECONCILE` / `BLOCKED_ESCALATE` / `STOP_AND_DELETE`
 - 有 **low-cost pre-gate** 設計，避免盲目一直燒大模型
 - 有 **self-delete rule**，任務終結就停掉 cron
 

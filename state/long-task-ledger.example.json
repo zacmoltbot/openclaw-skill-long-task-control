@@ -56,45 +56,62 @@
         "timeout_sec": 1800,
         "last_progress_at": "2026-04-11T14:20:00+08:00",
         "last_heartbeat_at": "2026-04-11T14:25:00+08:00",
-        "watchdog_state": "NUDGE_MAIN_AGENT"
+        "watchdog_state": "OWNER_RECONCILE"
       },
       "monitoring": {
         "nudge_after_sec": 1800,
         "blocked_escalate_after_sec": 1800,
         "renotify_interval_sec": 900,
-        "last_nudge_at": "2026-04-11T15:55:32+08:00",
+        "last_nudge_at": "2026-04-11T15:25:32+08:00",
+        "owner_query_at": "2026-04-11T15:55:32+08:00",
+        "owner_response_at": null,
+        "owner_response_kind": null,
         "last_escalated_at": null,
         "last_action_at": "2026-04-11T15:55:32+08:00",
-        "last_action_state": "NUDGE_MAIN_AGENT",
-        "last_action_reason": "task has no fresh checkpoint for 5732s; main agent should resume, post checkpoint, or mark COMPLETED/FAILED/BLOCKED",
-        "last_action_kind": "send_execution_nudge",
+        "last_action_state": "OWNER_RECONCILE",
+        "last_action_reason": "task already nudged 2 times with no fresh checkpoint; stale progress must escalate to owner reconciliation before blocker escalation",
+        "last_action_kind": "query_owner_and_force_reconciliation",
         "last_action_payload": {
-          "kind": "NUDGE_MAIN_AGENT",
+          "kind": "OWNER_RECONCILE",
           "deliver_to": "coding_agent",
           "channel": "discord",
-          "title": "Execution nudge for repo-upgrade-20260411-a",
-          "message": "Task repo-upgrade-20260411-a has stale progress. Resume execution, post a real checkpoint, or write terminal truth (COMPLETED/FAILED/BLOCKED). Next action on ledger: Implement helper scripts.",
+          "title": "Owner reconciliation for repo-upgrade-20260411-a",
+          "message": "Task repo-upgrade-20260411-a still has stale progress after prior nudges. Query the owner now and reconcile task truth. If the owner forgot to update the ledger, add the missing checkpoint. If blocked, escalate. If completed, write COMPLETED with validation. If the owner admits the work was forgotten/not being done, immediately resume execution or require the owner to resume now.",
           "facts": {
             "task_id": "repo-upgrade-20260411-a",
             "status": "RUNNING",
-            "reason": "task has no fresh checkpoint for 5732s; main agent should resume, post checkpoint, or mark COMPLETED/FAILED/BLOCKED",
-            "next_action": "Implement helper scripts"
+            "reason": "task already nudged 2 times with no fresh checkpoint; stale progress must escalate to owner reconciliation before blocker escalation",
+            "next_action": "Implement helper scripts",
+            "branches": {
+              "A_IN_PROGRESS_FORGOT_LEDGER": "append missed checkpoint(s), refresh next_action, keep RUNNING",
+              "B_BLOCKED": "write blocker truth and escalate via BLOCKED_ESCALATE",
+              "C_COMPLETED": "write COMPLETED plus validation evidence",
+              "D_NO_REPLY": "seek external evidence before changing task truth",
+              "E_FORGOT_OR_NOT_DOING": "do not only log it; immediately push resume execution / 補做 path"
+            }
           },
           "monitor_contract": "monitor_only_updates_supervision_metadata",
           "created_at": "2026-04-11T15:55:32+08:00"
         },
         "action_log": [
           {
-            "at": "2026-04-11T15:55:32+08:00",
+            "at": "2026-04-11T15:25:32+08:00",
             "state": "NUDGE_MAIN_AGENT",
-            "reason": "task has no fresh checkpoint for 5732s; main agent should resume, post checkpoint, or mark COMPLETED/FAILED/BLOCKED",
+            "reason": "task has no fresh checkpoint for 3932s; main agent should resume, post checkpoint, or mark COMPLETED/FAILED/BLOCKED",
             "action": "send_execution_nudge",
             "payload_kind": "NUDGE_MAIN_AGENT"
+          },
+          {
+            "at": "2026-04-11T15:55:32+08:00",
+            "state": "OWNER_RECONCILE",
+            "reason": "task already nudged 2 times with no fresh checkpoint; stale progress must escalate to owner reconciliation before blocker escalation",
+            "action": "query_owner_and_force_reconciliation",
+            "payload_kind": "OWNER_RECONCILE"
           }
         ],
         "cron_owner": "long-task-monitor",
         "cron_state": "ACTIVE",
-        "nudge_count": 1
+        "nudge_count": 2
       },
       "validation": [],
       "blocker": null,

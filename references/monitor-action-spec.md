@@ -101,12 +101,58 @@ owner next step：
 - 寫 checkpoint
 - 或明確寫入 `COMPLETED` / `FAILED` / `BLOCKED`
 
+### `OWNER_RECONCILE`
+
+適用：
+
+- active task stale progress 在 prior nudges 後仍持續
+- monitor 需要先 query owner，避免把「忘了更新 ledger」誤判成 blocked/failed
+
+payload contract：
+
+```json
+{
+  "kind": "OWNER_RECONCILE",
+  "deliver_to": "main-agent",
+  "channel": "discord",
+  "title": "Owner reconciliation for <task_id>",
+  "message": "Query the owner now and reconcile task truth",
+  "facts": {
+    "task_id": "...",
+    "status": "RUNNING",
+    "reason": "...",
+    "branches": {
+      "A_IN_PROGRESS_FORGOT_LEDGER": "append missing checkpoints and keep RUNNING",
+      "B_BLOCKED": "write blocker truth and escalate",
+      "C_COMPLETED": "write COMPLETED with validation evidence",
+      "D_NO_REPLY": "seek external evidence before changing task truth",
+      "E_FORGOT_OR_NOT_DOING": "immediately require resume execution /補做"
+    }
+  }
+}
+```
+
+monitor side effects：
+
+- `monitoring.owner_query_at = now`
+- `heartbeat.watchdog_state = OWNER_RECONCILE`
+- append `monitoring.action_log[]`
+
+owner next step：
+
+- query owner immediately
+- branch A: 補 ledger，補 checkpoint / artifacts / next_action
+- branch B: 寫 `BLOCKED` truth，交給 monitor 送 `BLOCKED_ESCALATE`
+- branch C: 寫 `COMPLETED` + validation
+- branch D: 先找外部 evidence，不可虛構 checkpoint
+- branch E: 立刻恢復執行，不是只做紀錄
+
 ### `BLOCKED_ESCALATE`
 
 適用：
 
 - ledger 已 `status=BLOCKED`
-- 或 stale progress 已經連續被 nudge 到 escalation threshold
+- 或 owner reconciliation 已確認 task 需要外部輸入/批准/修復
 
 payload contract：
 
@@ -180,15 +226,21 @@ owner / scheduler next step：
 
 - `HEARTBEAT_DUE`
 - 初次 `STALE_PROGRESS`
+- 初次 `NUDGE_MAIN_AGENT`
 - active task 還可能只是 supervision 落後
 
-### 升級成 `BLOCKED_ESCALATE`
+### 先升級成 `OWNER_RECONCILE`
 
-- task 已明確 `BLOCKED`
 - `nudge_count` 已到 `escalate_after_nudges`
 - `nudge_count` 已超過 `max_nudges`
+- monitor 需要 owner 回答：到底是有在做、卡住、做完、沒回、還是根本沒做
 
-理由：避免 monitor 永遠只是「提醒提醒提醒」。
+理由：避免 monitor 把「owner 忘了更新」和「task 真 blocked」混成同一種 escalation。
+
+### 再升級成 `BLOCKED_ESCALATE`
+
+- task 已明確 `BLOCKED`
+- 或 owner reconciliation 已經確認 continuation 需要外部決策 / approval / input / fix
 
 ## 4. 何時刪 cron
 

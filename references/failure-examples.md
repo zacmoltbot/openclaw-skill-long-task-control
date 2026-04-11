@@ -299,7 +299,35 @@ monitor result: STOP_AND_DELETE
 action: delete_monitor_cron
 ```
 
-## 11) Treating blocked tasks as ordinary reminders
+## 11) Skipping owner reconciliation after repeated stale nudges
+
+### Why this is wrong
+
+Repeated stale progress does not always mean the task is truly blocked. The owner may have continued working but forgotten to update the ledger, or may admit the work was forgotten and needs to be resumed immediately. Jumping straight from stale nudges to blocker escalation loses that distinction.
+
+### Wrong example
+
+```text
+state=NUDGE_MAIN_AGENT
+nudge_count=2
+monitor result: BLOCKED_ESCALATE
+reason: too many nudges
+```
+
+### Correct example
+
+```text
+state=OWNER_RECONCILE
+reason: stale progress persists after prior nudges
+owner branch handling:
+- A in progress but forgot ledger -> append missing checkpoint(s)
+- B blocked -> BLOCKED_ESCALATE
+- C completed -> write COMPLETED + validation
+- D no reply -> seek external evidence
+- E forgot/not doing -> require resume execution now
+```
+
+## 12) Treating blocked tasks as ordinary reminders
 
 ### Why this is wrong
 
@@ -333,4 +361,5 @@ Before sending any progress update or monitor decision, ask:
 - If work is still ongoing, did I include the current handle or output evidence?
 - If a checkpoint finished, did I report it instead of staying silent?
 - If progress is stale, am I nudging the main agent instead of passively repeating `STALE_PROGRESS`?
+- After repeated nudges, did I run `OWNER_RECONCILE` before assuming the task is blocked?
 - If the task is terminal, did I stop/delete the monitor?

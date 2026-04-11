@@ -86,14 +86,14 @@ Recommended behavior:
 3. if only heartbeat is due, send a cheap reminder
 4. if progress is stale, warn once and prepare to nudge
 5. let the monitor update supervision metadata only; do not let it rewrite task truth such as `status`, `checkpoints`, `blocker`, or `next_action`
-6. if stale progress persists, keep nudging the main agent until the task is resumed or explicitly closed; each nudge should ask it to do one of:
-   - resume execution
-   - emit a real checkpoint
-   - mark `BLOCKED`
-   - mark `FAILED`
-   - mark `COMPLETED`
-6. if blocked is confirmed, escalate once and stop monitoring
-7. if terminal, delete the cron immediately
+6. if stale progress persists, first send `NUDGE_MAIN_AGENT`; if the task is still stale after prior nudges, switch to `OWNER_RECONCILE` and query the owner directly
+   - A in progress but forgot ledger -> append missing checkpoint(s) and keep `RUNNING`
+   - B blocked -> write blocker truth, then escalate once
+   - C completed -> write `COMPLETED` + validation
+   - D no reply -> seek external evidence before changing task truth
+   - E forgot/not doing -> do not only record it; immediately require resume execution / 補做
+7. if blocked is confirmed, escalate once and stop monitoring
+8. if terminal, delete the cron immediately
 
 ### 6. Handle failures
 
@@ -153,9 +153,13 @@ After completion, make sure the task becomes terminal in the ledger so the monit
 - warning, still pre-gate
 
 ### `NUDGE_MAIN_AGENT`
-- stale progress persists
+- first stale-progress execution nudge
 - activation missing
 - or main agent appears to have stopped without a terminal update
+
+### `OWNER_RECONCILE`
+- stale progress remains after prior nudges
+- query owner before deciding whether the truth is running / blocked / completed / abandoned work
 
 ### `BLOCKED_ESCALATE`
 - task already `BLOCKED`

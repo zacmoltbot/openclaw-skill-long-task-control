@@ -10,6 +10,7 @@ ACTIVE_STATUSES = {"PENDING", "RUNNING"}
 STATE_PRIORITY = [
     "STOP_AND_DELETE",
     "BLOCKED_ESCALATE",
+    "OWNER_RECONCILE",
     "NUDGE_MAIN_AGENT",
     "STALE_PROGRESS",
     "HEARTBEAT_DUE",
@@ -36,6 +37,9 @@ SUPERVISION_ALLOWED_PATHS = {
     "monitoring.last_action_payload",
     "monitoring.action_log",
     "monitoring.cron_state",
+    "monitoring.owner_query_at",
+    "monitoring.owner_response_at",
+    "monitoring.owner_response_kind",
 }
 
 
@@ -116,6 +120,33 @@ def build_action_payload(task, chosen, now_iso_value):
             "monitor_contract": "monitor_only_updates_supervision_metadata",
             "created_at": now_iso_value,
         }
+    if state == "OWNER_RECONCILE":
+        return {
+            "kind": "OWNER_RECONCILE",
+            "deliver_to": owner,
+            "channel": channel,
+            "title": f"Owner reconciliation for {task_id}",
+            "message": (
+                f"Task {task_id} still has stale progress after prior nudges. Query the owner now and reconcile task truth. "
+                f"If the owner forgot to update the ledger, add the missing checkpoint. If blocked, escalate. If completed, write COMPLETED with validation. "
+                f"If the owner admits the work was forgotten/not being done, immediately resume execution or require the owner to resume now."
+            ),
+            "facts": {
+                "task_id": task_id,
+                "status": task.get("status"),
+                "reason": chosen["reason"],
+                "next_action": next_action,
+                "branches": {
+                    "A_IN_PROGRESS_FORGOT_LEDGER": "append missed checkpoint(s), refresh next_action, keep RUNNING",
+                    "B_BLOCKED": "write blocker truth and escalate via BLOCKED_ESCALATE",
+                    "C_COMPLETED": "write COMPLETED plus validation evidence",
+                    "D_NO_REPLY": "seek external evidence before changing task truth",
+                    "E_FORGOT_OR_NOT_DOING": "do not only log it; immediately push resume execution / 補做 path"
+                }
+            },
+            "monitor_contract": "monitor_only_updates_supervision_metadata",
+            "created_at": now_iso_value,
+        }
     if state == "BLOCKED_ESCALATE":
         return {
             "kind": "BLOCKED_ESCALATE",
@@ -168,6 +199,8 @@ def apply_supervision_update(task, report, now_iso_value):
     if report["state"] == "NUDGE_MAIN_AGENT" and report["action"] == "send_execution_nudge":
         monitoring["nudge_count"] = int(monitoring.get("nudge_count", 0) or 0) + 1
         monitoring["last_nudge_at"] = now_iso_value
+    elif report["state"] == "OWNER_RECONCILE":
+        monitoring["owner_query_at"] = now_iso_value
     elif report["state"] == "BLOCKED_ESCALATE":
         monitoring["last_escalated_at"] = now_iso_value
         monitoring.setdefault("cron_state", "DELETE_REQUESTED")
@@ -299,19 +332,19 @@ def evaluate_task(task, now):
     if status in ACTIVE_STATUSES and last_progress_age is not None and last_progress_age > nudge_after_sec:
         if nudge_count >= max_nudges:
             candidates.append({
-                "state": "BLOCKED_ESCALATE",
+                "state": "OWNER_RECONCILE",
                 "reason": (
-                    f"task exceeded max nudges ({nudge_count}/{max_nudges}); escalate instead of sending more reminders"
+                    f"task exceeded max nudges ({nudge_count}/{max_nudges}) with no fresh checkpoint; query owner and reconcile task truth"
                 ),
-                "action": "escalate_human_or_owner_then_delete_cron",
+                "action": "query_owner_and_force_reconciliation",
             })
         elif nudge_count >= escalate_after_nudges and should_renotify:
             candidates.append({
-                "state": "BLOCKED_ESCALATE",
+                "state": "OWNER_RECONCILE",
                 "reason": (
-                    f"task already nudged {nudge_count} times with no fresh checkpoint; escalate to avoid infinite reminder loop"
+                    f"task already nudged {nudge_count} times with no fresh checkpoint; stale progress must escalate to owner reconciliation before blocker escalation"
                 ),
-                "action": "escalate_human_or_owner_then_delete_cron",
+                "action": "query_owner_and_force_reconciliation",
             })
         else:
             candidates.append({
