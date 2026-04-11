@@ -86,6 +86,22 @@ def activation_block(task_note=None):
     return ACTIVATION_TEMPLATE.format(task_note=note)
 
 
+def task_start_block(task_id, goal, workflow=None, artifacts=None, first_action=None):
+    lines = [
+        "TASK START",
+        f"- task_id: {task_id}",
+        f"- goal: {goal}",
+        "- workflow:",
+    ]
+    for idx, step in enumerate(workflow or [], start=1):
+        lines.append(f"  {idx}. {step}")
+    lines.append("- expected artifacts:")
+    for item in artifacts or ["<add file/url/job handle>"]:
+        lines.append(f"  - {item}")
+    lines.append(f"- first action: {first_action or '<next concrete step>'}")
+    return "\n".join(lines)
+
+
 def default_monitor_name(task_id: str):
     return f"long-task-control monitor {task_id} @ {datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
 
@@ -299,11 +315,7 @@ def cmd_activation(args):
     print(activation_block(args.task_note))
 
 
-def cmd_init_task(args):
-    task_note = args.task_note or args.goal
-    if args.print_activation:
-        print(activation_block(task_note))
-        print()
+def run_init_task(args):
     cmd = [
         "python3", str(TASK_LEDGER), "--ledger", str(args.ledger), "init", args.task_id,
         "--goal", args.goal,
@@ -340,14 +352,23 @@ def cmd_init_task(args):
     task["message"]["nudge_target"] = args.nudge_target or args.requester_channel or task.get("channel")
     task.setdefault("monitoring", {})["cron_state"] = "PENDING_INSTALL"
     save_ledger(args.ledger, ledger)
+    return result.stdout.strip(), task
 
+
+def cmd_init_task(args):
+    task_note = args.task_note or args.goal
+    if args.print_activation:
+        print(activation_block(task_note))
+        print()
+    stdout, task = run_init_task(args)
     print(json.dumps({
         "ok": True,
         "task_id": args.task_id,
         "activation": activation_block(task_note),
+        "task_start": task_start_block(args.task_id, args.goal, workflow=args.workflow, artifacts=args.artifact, first_action=args.next_action),
         "ledger": str(args.ledger),
         "requester_channel": task["message"]["requester_channel"],
-        "stdout": result.stdout.strip(),
+        "stdout": stdout,
     }, ensure_ascii=False, indent=2))
 
 
@@ -361,42 +382,7 @@ def cmd_render_prompt(args):
 
 def cmd_activate_task(args):
     task_note = args.task_note or args.goal
-    cmd = [
-        "python3", str(TASK_LEDGER), "--ledger", str(args.ledger), "init", args.task_id,
-        "--goal", args.goal,
-        "--owner", args.owner,
-        "--channel", args.channel,
-        "--next-action", args.next_action,
-        "--expected-interval-sec", str(args.expected_interval_sec),
-        "--timeout-sec", str(args.timeout_sec),
-        "--max-nudges", str(args.max_nudges),
-        "--escalate-after-nudges", str(args.escalate_after_nudges),
-        "--blocked-escalate-after-sec", str(args.blocked_escalate_after_sec),
-        "--renotify-interval-sec", str(args.renotify_interval_sec),
-        "--message-ref", args.message_ref,
-        "--summary", args.summary or f"Activation announced and {args.task_id} initialized",
-    ]
-    if args.activation_announced:
-        cmd.append("--activation-announced")
-    if args.nudge_after_sec is not None:
-        cmd.extend(["--nudge-after-sec", str(args.nudge_after_sec)])
-    for item in args.workflow or []:
-        cmd.extend(["--workflow", item])
-    for item in args.fact or []:
-        cmd.extend(["--fact", item])
-    for item in args.artifact or []:
-        cmd.extend(["--artifact", item])
-    for item in args.note or []:
-        cmd.extend(["--note", item])
-    init_result = run(*cmd)
-
-    ledger = load_ledger(args.ledger)
-    task = find_task(ledger, args.task_id)
-    task.setdefault("message", {})["requester_channel"] = args.requester_channel or task.get("channel")
-    task["message"]["nudge_channel"] = args.nudge_channel or task.get("channel")
-    task["message"]["nudge_target"] = args.nudge_target or args.requester_channel or task.get("channel")
-    task.setdefault("monitoring", {})["cron_state"] = "PENDING_INSTALL"
-    save_ledger(args.ledger, ledger)
+    init_stdout, _ = run_init_task(args)
 
     install_ns = argparse.Namespace(
         ledger=args.ledger,
@@ -479,9 +465,16 @@ def cmd_activate_task(args):
         "activation": activation_block(task_note),
         "ledger": str(args.ledger),
         "requester_channel": task["message"]["requester_channel"],
-        "init_stdout": init_result.stdout.strip(),
+        "task_start": task_start_block(args.task_id, args.goal, workflow=args.workflow, artifacts=args.artifact, first_action=args.next_action),
+        "init_stdout": init_stdout,
         "job": payload,
         "prompt_preview": prompt,
+        "suggested_owner_updates": {
+            "started": f"python3 scripts/openclaw_ops.py --ledger {args.ledger} record-update STARTED {args.task_id} --summary '<what actually started>' --current-checkpoint <step-id> --next-action '<next real action>' --fact key=value",
+            "checkpoint": f"python3 scripts/openclaw_ops.py --ledger {args.ledger} record-update CHECKPOINT {args.task_id} --summary '<what verifiably changed>' --current-checkpoint <step-id> --next-action '<next real action>' --fact key=value",
+            "blocked": f"python3 scripts/openclaw_ops.py --ledger {args.ledger} record-update BLOCKED {args.task_id} --summary '<blocker>' --current-checkpoint <step-id> --need '<required unblock action>' --next-action '<safe next step>'",
+            "completed": f"python3 scripts/openclaw_ops.py --ledger {args.ledger} record-update COMPLETED {args.task_id} --summary '<completion evidence>' --current-checkpoint <step-id> --output <file> --fact key=value",
+        },
     }, ensure_ascii=False, indent=2))
 
 
@@ -671,6 +664,24 @@ def build_parser():
     activate_p.add_argument("--light-context", action="store_true")
     activate_p.add_argument("--dry-run", action="store_true")
     activate_p.set_defaults(func=cmd_activate_task)
+
+    bootstrap_p = sp.add_parser("bootstrap-task")
+    add_task_init_args(bootstrap_p)
+    bootstrap_p.add_argument("--session-key")
+    bootstrap_p.add_argument("--name")
+    bootstrap_p.add_argument("--agent", default=DEFAULT_AGENT)
+    bootstrap_p.add_argument("--session", default="isolated")
+    bootstrap_p.add_argument("--wake", default="now")
+    bootstrap_p.add_argument("--every", default="10m")
+    bootstrap_p.add_argument("--cron-expr")
+    bootstrap_p.add_argument("--tz", default=DEFAULT_TIMEZONE)
+    bootstrap_p.add_argument("--monitor-timeout-seconds", type=int, default=240)
+    bootstrap_p.add_argument("--thinking", default="low")
+    bootstrap_p.add_argument("--model", default="minimax/MiniMax-M2.7")
+    bootstrap_p.add_argument("--disabled", action="store_true")
+    bootstrap_p.add_argument("--light-context", action="store_true")
+    bootstrap_p.add_argument("--dry-run", action="store_true")
+    bootstrap_p.set_defaults(func=cmd_activate_task)
 
     prompt_p = sp.add_parser("render-monitor-prompt")
     prompt_p.add_argument("task_id")

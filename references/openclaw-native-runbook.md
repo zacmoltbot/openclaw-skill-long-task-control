@@ -15,7 +15,34 @@ The integration helper is `scripts/openclaw_ops.py`.
 
 ## Activation lifecycle
 
-### Step 1: emit the activation message
+### Preferred default: one-shot bootstrap
+
+```bash
+python3 scripts/openclaw_ops.py --ledger state/long-task-ledger.json bootstrap-task <task_id> \
+  --goal "<one sentence goal>" \
+  --requester-channel <discord-channel-id> \
+  --workflow "Inspect inputs" \
+  --workflow "Run implementation" \
+  --workflow "Validate and handoff" \
+  --next-action "Start checkpoint 1" \
+  --message-ref "discord:msg:<activation-message-id>" \
+  --fact channel_id=<discord-channel-id>
+```
+
+Treat this as the canonical OpenClaw-native entrypoint. It bundles four things that previously had to be remembered separately:
+
+- mandatory activation block
+- `TASK START` block
+- ledger initialization
+- monitor cron installation
+
+It also returns suggested `record-update` commands so the owner can keep execution truth and ledger truth bound together.
+
+### Advanced / manual split-phase path
+
+Only use this when debugging or custom orchestration requires phase separation.
+
+#### Step 1: emit the activation message
 
 ```bash
 python3 scripts/openclaw_ops.py activation --task-note "<short task note>"
@@ -23,7 +50,7 @@ python3 scripts/openclaw_ops.py activation --task-note "<short task note>"
 
 Post that block to the requester session/channel before meaningful work starts.
 
-### Step 2: create the ledger task
+#### Step 2: create the ledger task
 
 ```bash
 python3 scripts/openclaw_ops.py --ledger state/long-task-ledger.json init-task <task_id> \
@@ -45,7 +72,7 @@ This writes:
 - requester channel metadata for later nudges
 - `monitoring.cron_state=PENDING_INSTALL`
 
-### Step 3: install the monitor cron
+#### Step 3: install the monitor cron
 
 ```bash
 python3 scripts/openclaw_ops.py --ledger state/long-task-ledger.json install-monitor <task_id>
@@ -164,9 +191,9 @@ This test proves:
 
 ## Recommended real-world pattern
 
-- main agent posts activation message
-- main agent initializes ledger
-- main agent installs OpenClaw monitor cron
+- main agent runs `bootstrap-task` as the default entrypoint
+- main agent posts the returned activation + `TASK START` blocks
+- bootstrap writes the ledger and installs the OpenClaw monitor cron automatically
 - main agent keeps writing checkpoints (prefer `python3 scripts/openclaw_ops.py --ledger state/long-task-ledger.json record-update <STARTED|CHECKPOINT|BLOCKED|COMPLETED> <task_id> ...` so execution truth and ledger append stay bound together)
 - cron agent only wakes when scheduled and sends minimal reminders when stale
 - terminal completion / blocked escalation removes the cron immediately

@@ -56,7 +56,7 @@ def main():
         final_video.write_bytes(b"FAKE_MP4_DATA")
 
         activation_payload = run_json(
-            "python3", str(OPENCLAW_OPS), "--ledger", str(ledger), "activate-task", task_id,
+            "python3", str(OPENCLAW_OPS), "--ledger", str(ledger), "bootstrap-task", task_id,
             "--goal", "Deliver a 30-second shampoo ad sample with verified lifecycle control",
             "--owner", "main-agent",
             "--channel", "discord",

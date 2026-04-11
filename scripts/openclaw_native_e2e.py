@@ -49,7 +49,7 @@ def main():
         assert "long-task-control" in activation
 
         activated = run_json(
-            "python3", str(OPS), "--ledger", str(ledger), "activate-task", task_id,
+            "python3", str(OPS), "--ledger", str(ledger), "bootstrap-task", task_id,
             "--goal", "Prove OpenClaw-native long-task-control activation to cron cleanup",
             "--requester-channel", "1484432523781083197",
             "--workflow", "Inspect inputs",
