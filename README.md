@@ -23,6 +23,8 @@ monitor cron 應主動提醒 main agent 繼續做，直到任務進入 terminal 
 
 - `references/task-ledger-spec.md`
   - 定義 ledger schema、status semantics、checkpoint vs heartbeat、monitor state machine
+- `references/monitor-action-spec.md`
+  - 定義 owner vs monitor 的 ledger ownership contract、action payload、何時 escalation / 刪 cron
 - `references/multi-stage-runbook.md`
   - 定義 multi-stage task 與 monitor cron 的 operating model
 - `references/failure-examples.md`
@@ -36,7 +38,11 @@ monitor cron 應主動提醒 main agent 繼續做，直到任務進入 terminal 
 - `scripts/compliance_check.py`
   - 檢查 activation、task_id、vague progress、blocked silence、completion validation
 - `scripts/monitor_nudge.py`
-  - 用 deterministic rule engine 評估 execution-nudge state，決定提醒 / 升級 / 自刪
+  - 用 deterministic rule engine 評估 execution-nudge state，決定提醒 / 升級 / 自刪；可選擇寫回 supervision metadata 與 action payload
+- `scripts/task_ledger.py supervisor-update`
+  - 提供 monitor 專用的 supervision-only 更新入口，不允許覆寫 task truth
+- `scripts/demo_monitor_flow.py`
+  - 用 temp ledger 跑可測的 E2E demo：NUDGE_MAIN_AGENT / BLOCKED_ESCALATE / STOP_AND_DELETE
 - `scripts/checkpoint_report.py`
   - 產出 user-visible status block
 
@@ -195,12 +201,30 @@ python3 scripts/monitor_nudge.py \
   --ledger state/long-task-ledger.example.json
 ```
 
+### Evaluate + write supervision metadata only
+
+```bash
+python3 scripts/monitor_nudge.py \
+  --ledger state/long-task-ledger.example.json \
+  --apply-supervision
+```
+
 ### Only inspect active tasks
 
 ```bash
 python3 scripts/monitor_nudge.py \
   --ledger state/long-task-ledger.example.json \
   --only-active
+```
+
+### Supervision-only metadata update
+
+```bash
+python3 scripts/task_ledger.py \
+  --ledger state/long-task-ledger.example.json \
+  supervisor-update repo-upgrade-20260411-a \
+  --watchdog-state NUDGE_MAIN_AGENT \
+  --monitoring last_action_state=NUDGE_MAIN_AGENT
 ```
 
 ### Timeout scan
@@ -217,6 +241,19 @@ python3 scripts/compliance_check.py \
   --ledger state/long-task-ledger.example.json
 ```
 
+### Demo test
+
+```bash
+python3 scripts/demo_monitor_flow.py
+```
+
+這個 demo 會建立 temp ledger，驗證：
+
+- `NUDGE_MAIN_AGENT` 會產生 action payload，且只增加 supervision metadata
+- `BLOCKED_ESCALATE` 會標記 `last_escalated_at` 與 `cron_state=DELETE_REQUESTED`
+- `STOP_AND_DELETE` 會標記 `cron_state=DELETE_REQUESTED`
+- monitor 不會偷偷改 `status` / `checkpoints` / `next_action` 這些 task truth
+
 ## Suggested cron pattern
 
 ```bash
@@ -230,8 +267,9 @@ python3 scripts/compliance_check.py \
 1. `monitor_nudge.py` 做最便宜的 pre-gate
 2. 若只是 `HEARTBEAT_DUE`，發最小提醒即可
 3. 若進入 `NUDGE_MAIN_AGENT`，提醒 owner agent 繼續做、補 checkpoint、或明確寫成 `COMPLETED` / `FAILED` / `BLOCKED`
-4. 只有需要 deeper audit 時，再跑其他 checker
-5. task terminal 後，刪 monitor cron
+4. 若進入 `BLOCKED_ESCALATE`，送 blocker escalation，並把 cron 標成 `DELETE_REQUESTED`
+5. 若進入 `STOP_AND_DELETE`，停用 cron / watcher
+6. 只有需要 deeper audit 時，再跑其他 checker
 
 ## Files
 
@@ -259,7 +297,9 @@ python3 scripts/compliance_check.py \
 
 - 有 **ledger** 可追蹤狀態
 - 有 **monitor cron / execution nudge** 可提醒 main agent 繼續做
+- 有明確的 **ledger ownership contract**：owner 寫 task truth，monitor 只寫 supervision metadata
 - 有 **state machine** 可區分 reminder / stale / blocked / terminal
+- 有 repo 內可跑的 **E2E demo wiring**：`NUDGE_MAIN_AGENT` / `BLOCKED_ESCALATE` / `STOP_AND_DELETE`
 - 有 **low-cost pre-gate** 設計，避免盲目一直燒大模型
 - 有 **self-delete rule**，任務終結就停掉 cron
 

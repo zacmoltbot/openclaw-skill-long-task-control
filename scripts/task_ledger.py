@@ -5,6 +5,18 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 DEFAULT_LEDGER = Path("state/long-task-ledger.example.json")
+SUPERVISION_ALLOWED_KEYS = {
+    "watchdog_state",
+    "nudge_count",
+    "last_nudge_at",
+    "last_escalated_at",
+    "last_action_at",
+    "last_action_state",
+    "last_action_reason",
+    "last_action_kind",
+    "last_action_payload",
+    "cron_state",
+}
 
 
 def now_iso():
@@ -25,7 +37,8 @@ def save_ledger(path: Path, ledger):
 
 def find_task(ledger, task_id):
     for task in ledger.get("tasks", []):
-        if task.get("task_id") == task_id:
+        return_task_id = task.get("task_id")
+        if return_task_id == task_id:
             return task
     return None
 
@@ -103,6 +116,7 @@ def cmd_init(args):
             "escalate_after_nudges": args.escalate_after_nudges,
             "nudge_count": 0,
             "last_nudge_at": None,
+            "last_escalated_at": None,
             "blocked_escalate_after_sec": args.blocked_escalate_after_sec or max(args.timeout_sec, args.expected_interval_sec),
         },
         "validation": [],
@@ -180,6 +194,29 @@ def cmd_heartbeat(args):
     print(f"Heartbeat updated for {args.task_id}")
 
 
+def cmd_supervisor_update(args):
+    ledger = load_ledger(args.ledger)
+    task = ensure_task(ledger, args.task_id)
+    heartbeat = task.setdefault("heartbeat", {})
+    monitoring = task.setdefault("monitoring", {})
+
+    if args.watchdog_state:
+        heartbeat["watchdog_state"] = args.watchdog_state
+    for item in args.monitoring or []:
+        if "=" not in item:
+            raise SystemExit(f"Invalid --monitoring value: {item}; expected key=value")
+        key, value = item.split("=", 1)
+        key = key.strip()
+        if key not in SUPERVISION_ALLOWED_KEYS:
+            raise SystemExit(
+                f"Disallowed supervision key: {key}. Monitor may update supervision metadata only, not task truth."
+            )
+        monitoring[key] = json.loads(value) if value.strip().startswith(("{", "[", '"')) or value.strip() in {"true", "false", "null"} else value.strip()
+
+    save_ledger(args.ledger, ledger)
+    print(f"Supervisor metadata updated for {args.task_id}")
+
+
 def build_parser():
     p = argparse.ArgumentParser(description="Manage long-task ledger state")
     p.add_argument("--ledger", type=Path, default=DEFAULT_LEDGER)
@@ -237,6 +274,12 @@ def build_parser():
     hb_p.add_argument("--watchdog-state")
     hb_p.add_argument("--note")
     hb_p.set_defaults(func=cmd_heartbeat)
+
+    sup_p = sp.add_parser("supervisor-update")
+    sup_p.add_argument("task_id")
+    sup_p.add_argument("--watchdog-state")
+    sup_p.add_argument("--monitoring", action="append", help="Repeatable key=value for supervision metadata only")
+    sup_p.set_defaults(func=cmd_supervisor_update)
 
     return p
 

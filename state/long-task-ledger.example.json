@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updated_at": "2026-04-11T15:20:00+08:00",
+  "updated_at": "2026-04-11T15:55:32+08:00",
   "tasks": [
     {
       "task_id": "repo-upgrade-20260411-a",
@@ -56,15 +56,45 @@
         "timeout_sec": 1800,
         "last_progress_at": "2026-04-11T14:20:00+08:00",
         "last_heartbeat_at": "2026-04-11T14:25:00+08:00",
-        "watchdog_state": "STALE_PROGRESS"
+        "watchdog_state": "NUDGE_MAIN_AGENT"
       },
       "monitoring": {
         "nudge_after_sec": 1800,
         "blocked_escalate_after_sec": 1800,
         "renotify_interval_sec": 900,
-        "last_nudge_at": null,
+        "last_nudge_at": "2026-04-11T15:55:32+08:00",
         "last_escalated_at": null,
-        "cron_owner": "long-task-monitor"
+        "last_action_at": "2026-04-11T15:55:32+08:00",
+        "last_action_state": "NUDGE_MAIN_AGENT",
+        "last_action_reason": "task has no fresh checkpoint for 5732s; main agent should resume, post checkpoint, or mark COMPLETED/FAILED/BLOCKED",
+        "last_action_kind": "send_execution_nudge",
+        "last_action_payload": {
+          "kind": "NUDGE_MAIN_AGENT",
+          "deliver_to": "coding_agent",
+          "channel": "discord",
+          "title": "Execution nudge for repo-upgrade-20260411-a",
+          "message": "Task repo-upgrade-20260411-a has stale progress. Resume execution, post a real checkpoint, or write terminal truth (COMPLETED/FAILED/BLOCKED). Next action on ledger: Implement helper scripts.",
+          "facts": {
+            "task_id": "repo-upgrade-20260411-a",
+            "status": "RUNNING",
+            "reason": "task has no fresh checkpoint for 5732s; main agent should resume, post checkpoint, or mark COMPLETED/FAILED/BLOCKED",
+            "next_action": "Implement helper scripts"
+          },
+          "monitor_contract": "monitor_only_updates_supervision_metadata",
+          "created_at": "2026-04-11T15:55:32+08:00"
+        },
+        "action_log": [
+          {
+            "at": "2026-04-11T15:55:32+08:00",
+            "state": "NUDGE_MAIN_AGENT",
+            "reason": "task has no fresh checkpoint for 5732s; main agent should resume, post checkpoint, or mark COMPLETED/FAILED/BLOCKED",
+            "action": "send_execution_nudge",
+            "payload_kind": "NUDGE_MAIN_AGENT"
+          }
+        ],
+        "cron_owner": "long-task-monitor",
+        "cron_state": "ACTIVE",
+        "nudge_count": 1
       },
       "validation": [],
       "blocker": null,
@@ -132,7 +162,7 @@
         "timeout_sec": 1800,
         "last_progress_at": "2026-04-11T10:40:00+08:00",
         "last_heartbeat_at": "2026-04-11T10:45:00+08:00",
-        "watchdog_state": "BLOCKED_ESCALATE"
+        "watchdog_state": "STOP_AND_DELETE"
       },
       "monitoring": {
         "nudge_after_sec": 1800,
@@ -140,7 +170,42 @@
         "renotify_interval_sec": 900,
         "last_nudge_at": null,
         "last_escalated_at": "2026-04-11T10:50:00+08:00",
-        "cron_owner": "long-task-monitor"
+        "last_action_at": "2026-04-11T15:55:32+08:00",
+        "last_action_state": "STOP_AND_DELETE",
+        "last_action_reason": "seg03 upstream job failed; escalation already sent, monitor cron should self-delete",
+        "last_action_kind": "delete_monitor_cron",
+        "last_action_payload": {
+          "kind": "STOP_AND_DELETE",
+          "deliver_to": "long-task-monitor",
+          "channel": "discord",
+          "title": "Stop monitor for render-20260411-b",
+          "message": "Task render-20260411-b is terminal or no longer requires supervision. Delete/disable the monitor cron now.",
+          "facts": {
+            "task_id": "render-20260411-b",
+            "status": "BLOCKED",
+            "reason": "seg03 upstream job failed; escalation already sent, monitor cron should self-delete"
+          },
+          "monitor_contract": "monitor_only_updates_supervision_metadata",
+          "created_at": "2026-04-11T15:55:32+08:00"
+        },
+        "action_log": [
+          {
+            "at": "2026-04-11T10:50:00+08:00",
+            "state": "BLOCKED_ESCALATE",
+            "reason": "seg03 upstream job failed; blocked tasks should escalate once, then stop monitor cron",
+            "action": "send_blocked_escalation_then_delete_cron",
+            "payload_kind": "BLOCKED_ESCALATE"
+          },
+          {
+            "at": "2026-04-11T15:55:32+08:00",
+            "state": "STOP_AND_DELETE",
+            "reason": "seg03 upstream job failed; escalation already sent, monitor cron should self-delete",
+            "action": "delete_monitor_cron",
+            "payload_kind": "STOP_AND_DELETE"
+          }
+        ],
+        "cron_owner": "long-task-monitor",
+        "cron_state": "DELETE_REQUESTED"
       },
       "validation": [],
       "blocker": {
@@ -221,7 +286,42 @@
         "renotify_interval_sec": 900,
         "last_nudge_at": null,
         "last_escalated_at": null,
-        "cron_owner": "long-task-monitor"
+        "last_action_at": "2026-04-11T15:55:32+08:00",
+        "last_action_state": "STOP_AND_DELETE",
+        "last_action_reason": "task status is terminal (COMPLETED); monitor cron should self-delete",
+        "last_action_kind": "delete_monitor_cron",
+        "last_action_payload": {
+          "kind": "STOP_AND_DELETE",
+          "deliver_to": "long-task-monitor",
+          "channel": "discord",
+          "title": "Stop monitor for pkg-20260411-c",
+          "message": "Task pkg-20260411-c is terminal or no longer requires supervision. Delete/disable the monitor cron now.",
+          "facts": {
+            "task_id": "pkg-20260411-c",
+            "status": "COMPLETED",
+            "reason": "task status is terminal (COMPLETED); monitor cron should self-delete"
+          },
+          "monitor_contract": "monitor_only_updates_supervision_metadata",
+          "created_at": "2026-04-11T15:55:32+08:00"
+        },
+        "action_log": [
+          {
+            "at": "2026-04-11T12:18:00+08:00",
+            "state": "STOP_AND_DELETE",
+            "reason": "task status is terminal (COMPLETED); monitor cron should self-delete",
+            "action": "delete_monitor_cron",
+            "payload_kind": "STOP_AND_DELETE"
+          },
+          {
+            "at": "2026-04-11T15:55:32+08:00",
+            "state": "STOP_AND_DELETE",
+            "reason": "task status is terminal (COMPLETED); monitor cron should self-delete",
+            "action": "delete_monitor_cron",
+            "payload_kind": "STOP_AND_DELETE"
+          }
+        ],
+        "cron_owner": "long-task-monitor",
+        "cron_state": "DELETE_REQUESTED"
       },
       "validation": [
         "unzip -t /tmp/pkg-20260411-c/build.zip passed"

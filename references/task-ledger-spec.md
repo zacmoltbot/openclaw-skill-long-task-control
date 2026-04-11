@@ -25,6 +25,8 @@ monitor cron 應用低成本 rule engine 主動提醒 main agent 繼續執行，
 
 ledger 的角色就是提供一個簡單、機器可讀的單一事實來源（single source of truth）。
 
+**重要 contract：** owner / main agent 維護 task truth；monitor 只允許更新 supervision metadata。詳細欄位清單與 action contract 請看 `references/monitor-action-spec.md`。
+
 ## 建議檔案位置
 
 ```text
@@ -145,7 +147,14 @@ state/tasks/<task_id>.json
 - `monitoring.renotify_interval_sec`
 - `monitoring.last_nudge_at`
 - `monitoring.last_escalated_at`
+- `monitoring.last_action_at`
+- `monitoring.last_action_state`
+- `monitoring.last_action_reason`
+- `monitoring.last_action_kind`
+- `monitoring.last_action_payload`
+- `monitoring.action_log[]`
 - `monitoring.cron_owner`
+- `monitoring.cron_state`
 
 ## Status semantics
 

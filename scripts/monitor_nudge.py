@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 import argparse
 import json
-from datetime import datetime
+from copy import deepcopy
+from datetime import datetime, timezone
 from pathlib import Path
 
 TERMINAL_STATUSES = {"COMPLETED", "FAILED", "ABANDONED"}
@@ -21,6 +22,25 @@ DEFAULTS = {
     "escalate_after_nudges": 2,
     "blocked_escalate_after_sec": None,
 }
+SUPERVISION_ALLOWED_PATHS = {
+    "heartbeat",
+    "heartbeat.watchdog_state",
+    "monitoring",
+    "monitoring.nudge_count",
+    "monitoring.last_nudge_at",
+    "monitoring.last_escalated_at",
+    "monitoring.last_action_at",
+    "monitoring.last_action_state",
+    "monitoring.last_action_reason",
+    "monitoring.last_action_kind",
+    "monitoring.last_action_payload",
+    "monitoring.action_log",
+    "monitoring.cron_state",
+}
+
+
+def now_iso():
+    return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 
 
 def parse_ts(value):
@@ -58,6 +78,143 @@ def monitoring_config(task):
     monitoring["renotify_interval_sec"] = monitoring["renotify_interval_sec"] or expected_interval
     monitoring["blocked_escalate_after_sec"] = monitoring["blocked_escalate_after_sec"] or max(timeout_sec, expected_interval)
     return monitoring
+
+
+def load_ledger(path: Path):
+    return json.loads(path.read_text())
+
+
+def save_ledger(path: Path, ledger):
+    ledger["updated_at"] = now_iso()
+    path.write_text(json.dumps(ledger, ensure_ascii=False, indent=2) + "\n")
+
+
+def build_action_payload(task, chosen, now_iso_value):
+    task_id = task.get("task_id")
+    owner = task.get("owner")
+    channel = task.get("channel")
+    next_action = task.get("next_action")
+    blocker = task.get("blocker")
+    state = chosen["state"]
+
+    if state == "NUDGE_MAIN_AGENT":
+        return {
+            "kind": "NUDGE_MAIN_AGENT",
+            "deliver_to": owner,
+            "channel": channel,
+            "title": f"Execution nudge for {task_id}",
+            "message": (
+                f"Task {task_id} has stale progress. Resume execution, post a real checkpoint, or write terminal truth "
+                f"(COMPLETED/FAILED/BLOCKED). Next action on ledger: {next_action}."
+            ),
+            "facts": {
+                "task_id": task_id,
+                "status": task.get("status"),
+                "reason": chosen["reason"],
+                "next_action": next_action,
+            },
+            "monitor_contract": "monitor_only_updates_supervision_metadata",
+            "created_at": now_iso_value,
+        }
+    if state == "BLOCKED_ESCALATE":
+        return {
+            "kind": "BLOCKED_ESCALATE",
+            "deliver_to": owner,
+            "channel": channel,
+            "title": f"Blocked escalation for {task_id}",
+            "message": (
+                f"Task {task_id} is blocked. Escalate blocker facts, then stop/delete the monitor cron. "
+                f"Owner must decide and update task truth."
+            ),
+            "facts": {
+                "task_id": task_id,
+                "status": task.get("status"),
+                "reason": chosen["reason"],
+                "blocker": blocker,
+            },
+            "monitor_contract": "monitor_only_updates_supervision_metadata",
+            "created_at": now_iso_value,
+        }
+    if state == "STOP_AND_DELETE":
+        return {
+            "kind": "STOP_AND_DELETE",
+            "deliver_to": task.get("monitoring", {}).get("cron_owner", "long-task-monitor"),
+            "channel": channel,
+            "title": f"Stop monitor for {task_id}",
+            "message": (
+                f"Task {task_id} is terminal or no longer requires supervision. Delete/disable the monitor cron now."
+            ),
+            "facts": {
+                "task_id": task_id,
+                "status": task.get("status"),
+                "reason": chosen["reason"],
+            },
+            "monitor_contract": "monitor_only_updates_supervision_metadata",
+            "created_at": now_iso_value,
+        }
+    return None
+
+
+def apply_supervision_update(task, report, now_iso_value):
+    heartbeat = task.setdefault("heartbeat", {})
+    monitoring = task.setdefault("monitoring", {})
+    heartbeat["watchdog_state"] = report["state"]
+    monitoring["last_action_at"] = now_iso_value
+    monitoring["last_action_state"] = report["state"]
+    monitoring["last_action_reason"] = report["reason"]
+    monitoring["last_action_kind"] = report["action"]
+    monitoring["last_action_payload"] = report.get("action_payload")
+
+    if report["state"] == "NUDGE_MAIN_AGENT" and report["action"] == "send_execution_nudge":
+        monitoring["nudge_count"] = int(monitoring.get("nudge_count", 0) or 0) + 1
+        monitoring["last_nudge_at"] = now_iso_value
+    elif report["state"] == "BLOCKED_ESCALATE":
+        monitoring["last_escalated_at"] = now_iso_value
+        monitoring.setdefault("cron_state", "DELETE_REQUESTED")
+    elif report["state"] == "STOP_AND_DELETE":
+        monitoring["cron_state"] = "DELETE_REQUESTED"
+
+    log_entry = {
+        "at": now_iso_value,
+        "state": report["state"],
+        "reason": report["reason"],
+        "action": report["action"],
+    }
+    if report.get("action_payload"):
+        log_entry["payload_kind"] = report["action_payload"]["kind"]
+    monitoring.setdefault("action_log", []).append(log_entry)
+
+
+def collect_paths(obj, prefix=""):
+    paths = set()
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            child = f"{prefix}.{key}" if prefix else key
+            paths.add(child)
+            paths |= collect_paths(value, child)
+    return paths
+
+
+def assert_only_supervision_changes(before_task, after_task):
+    changed = set()
+    all_paths = collect_paths(before_task) | collect_paths(after_task)
+    for path in all_paths:
+        before_value = lookup_path(before_task, path)
+        after_value = lookup_path(after_task, path)
+        if before_value != after_value:
+            changed.add(path)
+    disallowed = [path for path in changed if not any(path == allowed or path.startswith(f"{allowed}.") for allowed in SUPERVISION_ALLOWED_PATHS)]
+    if disallowed:
+        raise RuntimeError(f"Monitor wrote non-supervision fields: {sorted(disallowed)}")
+
+
+def lookup_path(obj, path):
+    node = obj
+    for part in path.split("."):
+        if not isinstance(node, dict) or part not in node:
+            return None
+        node = node[part]
+    return node
 
 
 def evaluate_task(task, now):
@@ -98,9 +255,14 @@ def evaluate_task(task, now):
         })
 
     if status == "BLOCKED":
-        # BLOCKED is terminal for execution-nudge purposes: escalate once, then delete the cron.
         blocked_reason = (blocker or {}).get("reason") or "task marked BLOCKED"
-        if last_progress_age is not None and last_progress_age >= blocked_escalate_after_sec:
+        if monitoring.get("last_escalated_at"):
+            candidates.append({
+                "state": "STOP_AND_DELETE",
+                "reason": f"{blocked_reason}; escalation already sent, monitor cron should self-delete",
+                "action": "delete_monitor_cron",
+            })
+        elif last_progress_age is not None and last_progress_age >= blocked_escalate_after_sec:
             candidates.append({
                 "state": "BLOCKED_ESCALATE",
                 "reason": f"{blocked_reason}; blocked for {last_progress_age}s",
@@ -169,12 +331,14 @@ def evaluate_task(task, now):
         })
 
     chosen = choose_state(candidates)
+    payload = build_action_payload(task, chosen, now.isoformat(timespec="seconds"))
     return {
         "task_id": task.get("task_id"),
         "status": status,
         "state": chosen["state"],
         "reason": chosen["reason"],
         "action": chosen["action"],
+        "action_payload": payload,
         "last_progress_age_sec": last_progress_age,
         "last_heartbeat_age_sec": last_heartbeat_age,
         "last_nudge_age_sec": last_nudge_age,
@@ -189,15 +353,27 @@ def main():
     parser = argparse.ArgumentParser(description="Evaluate low-cost execution nudge state for long tasks")
     parser.add_argument("--ledger", type=Path, required=True)
     parser.add_argument("--only-active", action="store_true", help="Skip terminal tasks from output")
+    parser.add_argument("--apply-supervision", action="store_true", help="Write supervision metadata back to ledger")
     args = parser.parse_args()
 
-    ledger = json.loads(args.ledger.read_text())
+    ledger = load_ledger(args.ledger)
     now = datetime.now().astimezone()
     reports = []
+    touched = False
+
     for task in ledger.get("tasks", []):
         if args.only_active and task.get("status") in TERMINAL_STATUSES:
             continue
-        reports.append(evaluate_task(task, now))
+        before_task = deepcopy(task)
+        report = evaluate_task(task, now)
+        if args.apply_supervision:
+            apply_supervision_update(task, report, now.isoformat(timespec="seconds"))
+            assert_only_supervision_changes(before_task, task)
+            touched = True
+        reports.append(report)
+
+    if args.apply_supervision and touched:
+        save_ledger(args.ledger, ledger)
 
     print(json.dumps({"generated_at": now.isoformat(timespec="seconds"), "reports": reports}, ensure_ascii=False, indent=2))
 

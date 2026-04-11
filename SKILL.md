@@ -92,7 +92,7 @@ Minimum task fields:
 - `heartbeat.timeout_sec`
 - `next_action`
 
-See `references/task-ledger-spec.md` for the fuller schema and the monitor-specific fields.
+See `references/task-ledger-spec.md` for the fuller schema and the monitor-specific fields. See `references/monitor-action-spec.md` for the owner-vs-monitor write contract and the action wiring for `NUDGE_MAIN_AGENT`, `BLOCKED_ESCALATE`, and `STOP_AND_DELETE`.
 
 ## Checkpoint vs heartbeat
 
@@ -148,7 +148,7 @@ Use the monitor cron to do low-cost pre-gate checks against ledger timestamps an
 - `BLOCKED_ESCALATE`
 - `STOP_AND_DELETE`
 
-Read `references/task-ledger-spec.md` for the full state machine and `references/multi-stage-runbook.md` for operating guidance.
+Read `references/task-ledger-spec.md` for the full state machine, `references/monitor-action-spec.md` for action payload / escalation / self-delete semantics, and `references/multi-stage-runbook.md` for operating guidance.
 
 ## Monitor state semantics
 
@@ -219,6 +219,8 @@ Delete the cron when:
 - the task is `ABANDONED`
 - the task is `BLOCKED` and one escalation message has already been sent
 - the task record no longer exists or is no longer meant to be supervised
+
+For repo-local pseudo-implementation, let the monitor mark `monitoring.cron_state=DELETE_REQUESTED` and emit an action payload; let the owner/scheduler integration layer perform the real cron deletion.
 
 ## Cost-control rule
 
@@ -321,13 +323,15 @@ If validation fails, report `BLOCKED` or a failed checkpoint instead of `COMPLET
 ## Use the bundled resources
 
 - `references/task-ledger-spec.md`: durable state schema + monitor state machine
+- `references/monitor-action-spec.md`: owner-vs-monitor ledger contract + action wiring semantics
 - `references/multi-stage-runbook.md`: fuller SOP for planning, polling, retries, handoff, and monitor operation
 - `references/failure-examples.md`: non-compliant examples, corrected reporting patterns, and nudge-specific anti-patterns
 - `scripts/checkpoint_report.py`: generate consistent status blocks
-- `scripts/task_ledger.py`: mutate ledger state
+- `scripts/task_ledger.py`: mutate ledger state; use `supervisor-update` only for supervision metadata
 - `scripts/checkpoint_timeout.py`: detect stale tasks
 - `scripts/compliance_check.py`: scan for baseline rule violations
-- `scripts/monitor_nudge.py`: evaluate the low-cost execution-nudge state machine
+- `scripts/monitor_nudge.py`: evaluate the low-cost execution-nudge state machine and optionally write supervision metadata only
+- `scripts/demo_monitor_flow.py`: run a temp-ledger E2E demo for nudge / escalate / stop-delete flows
 
 ## Minimal operating pattern
 
