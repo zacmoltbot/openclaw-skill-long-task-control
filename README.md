@@ -32,7 +32,7 @@ monitor cron 應主動提醒 main agent 繼續做，直到任務進入 terminal 
 - `state/long-task-ledger.example.json`
   - 提供可直接餵給 scripts 的 example ledger
 - `scripts/task_ledger.py`
-  - 初始化 task、寫 checkpoint、標記 blocked、更新 heartbeat
+  - 初始化 task、寫 checkpoint、標記 blocked、更新 heartbeat、ingest owner reply 並自動分流到 resume / blocked / completed
 - `scripts/checkpoint_timeout.py`
   - 掃描 timeout / stale progress / heartbeat due / missing activation
 - `scripts/compliance_check.py`
@@ -42,7 +42,7 @@ monitor cron 應主動提醒 main agent 繼續做，直到任務進入 terminal 
 - `scripts/task_ledger.py supervisor-update`
   - 提供 monitor 專用的 supervision-only 更新入口，不允許覆寫 task truth
 - `scripts/demo_monitor_flow.py`
-  - 用 temp ledger 跑可測的 E2E demo：NUDGE_MAIN_AGENT / OWNER_RECONCILE / BLOCKED_ESCALATE / STOP_AND_DELETE
+  - 用 temp ledger 跑可測的 E2E demo：stale -> OWNER_RECONCILE -> owner reply -> resume execution / BLOCKED_ESCALATE / STOP_AND_DELETE
 - `scripts/checkpoint_report.py`
   - 產出 user-visible status block
 
@@ -226,6 +226,25 @@ python3 scripts/monitor_nudge.py \
   --only-active
 ```
 
+### Owner reply ingestion
+
+```bash
+python3 scripts/task_ledger.py \
+  --ledger state/long-task-ledger.example.json \
+  owner-reply repo-upgrade-20260411-a \
+  --reply E \
+  --summary "Owner admitted the task was forgotten; resume now" \
+  --next-action "Resume execution immediately and post the next real checkpoint"
+```
+
+分流結果：
+
+- `A` / `A_IN_PROGRESS_FORGOT_LEDGER` -> 補 checkpoint，維持 `RUNNING`
+- `B` / `B_BLOCKED` -> 寫 `BLOCKED` truth，下一次 monitor 走 `BLOCKED_ESCALATE`
+- `C` / `C_COMPLETED` -> 寫 `COMPLETED` + validation，下一次 monitor 走 `STOP_AND_DELETE`
+- `D` / `D_NO_REPLY` -> 只記錄 owner 沒回，保留 `OWNER_RECONCILE`，要求先找外部 evidence
+- `E` / `E_FORGOT_OR_NOT_DOING` -> **不是只記錄**；會立刻寫入 resume-required checkpoint，維持 `RUNNING`，把 `next_action` 改成恢復執行路徑
+
 ### Supervision-only metadata update
 
 ```bash
@@ -258,11 +277,11 @@ python3 scripts/demo_monitor_flow.py
 
 這個 demo 會建立 temp ledger，驗證：
 
-- `NUDGE_MAIN_AGENT` 會產生 action payload，且只增加 supervision metadata
-- `OWNER_RECONCILE` 會產生 owner-query payload，並標記 `owner_query_at`
-- `BLOCKED_ESCALATE` 會標記 `last_escalated_at` 與 `cron_state=DELETE_REQUESTED`
-- `STOP_AND_DELETE` 會標記 `cron_state=DELETE_REQUESTED`
-- monitor 不會偷偷改 `status` / `checkpoints` / `next_action` 這些 task truth
+- stale task 會先進入 `OWNER_RECONCILE`，並產生 owner-query payload
+- `owner-reply --reply E` 會把「忘了做 / 沒在做」自動改成 **resume-required** 路徑，而不是只留 note
+- `owner-reply --reply B` 會寫 `BLOCKED` truth，下一次 monitor 走 `BLOCKED_ESCALATE`
+- `owner-reply --reply C` 會寫 `COMPLETED` + validation，下一次 monitor 走 `STOP_AND_DELETE`
+- monitor 仍只會改 supervision metadata，不會偷偷改 task truth
 
 ## Suggested cron pattern
 
@@ -311,7 +330,7 @@ python3 scripts/demo_monitor_flow.py
 - 有 **monitor cron / execution nudge** 可提醒 main agent 繼續做
 - 有明確的 **ledger ownership contract**：owner 寫 task truth，monitor 只寫 supervision metadata
 - 有 **state machine** 可區分 reminder / stale / blocked / terminal
-- 有 repo 內可跑的 **E2E demo wiring**：`NUDGE_MAIN_AGENT` / `OWNER_RECONCILE` / `BLOCKED_ESCALATE` / `STOP_AND_DELETE`
+- 有 repo 內可跑的 **E2E demo wiring**：`stale -> OWNER_RECONCILE -> owner reply -> resume / BLOCKED_ESCALATE / STOP_AND_DELETE`
 - 有 **low-cost pre-gate** 設計，避免盲目一直燒大模型
 - 有 **self-delete rule**，任務終結就停掉 cron
 

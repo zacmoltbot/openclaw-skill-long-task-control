@@ -203,7 +203,7 @@ def apply_supervision_update(task, report, now_iso_value):
         monitoring["owner_query_at"] = now_iso_value
     elif report["state"] == "BLOCKED_ESCALATE":
         monitoring["last_escalated_at"] = now_iso_value
-        monitoring.setdefault("cron_state", "DELETE_REQUESTED")
+        monitoring["cron_state"] = "DELETE_REQUESTED"
     elif report["state"] == "STOP_AND_DELETE":
         monitoring["cron_state"] = "DELETE_REQUESTED"
 

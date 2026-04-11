@@ -91,7 +91,7 @@ Recommended behavior:
    - B blocked -> write blocker truth, then escalate once
    - C completed -> write `COMPLETED` + validation
    - D no reply -> seek external evidence before changing task truth
-   - E forgot/not doing -> do not only record it; immediately require resume execution / 補做
+   - E forgot/not doing -> do not only record it; immediately require resume execution / 補做 (`task_ledger.py owner-reply --reply E`)
 7. if blocked is confirmed, escalate once and stop monitoring
 8. if terminal, delete the cron immediately
 

@@ -266,7 +266,38 @@ owner / scheduler next step：
 - supervision-only ledger writes
 - `action_payload` 產生
 - `DELETE_REQUESTED` marker
-- demo E2E test 驗證三種 action path
+- demo E2E test 驗證 stale -> owner query -> owner reply -> resume / blocked / completed routing
+
+## 6. Owner reply ingestion
+
+repo 內現在提供：
+
+```bash
+python3 scripts/task_ledger.py --ledger state/long-task-ledger.json owner-reply <task_id> --reply <A|B|C|D|E> [...args]
+```
+
+自動分流規則：
+
+- `A_IN_PROGRESS_FORGOT_LEDGER`
+  - append checkpoint
+  - `status=RUNNING`
+  - 清掉 blocker
+  - `owner_response_kind=A_IN_PROGRESS_FORGOT_LEDGER`
+- `B_BLOCKED`
+  - 要求 `--reason` + `--safe-next-step`
+  - owner 直接寫 `BLOCKED` truth
+  - 下一次 monitor 自動走 `BLOCKED_ESCALATE`
+- `C_COMPLETED`
+  - owner 直接寫 `COMPLETED` + validation/artifacts
+  - 下一次 monitor 自動走 `STOP_AND_DELETE`
+- `D_NO_REPLY`
+  - 只記錄 `owner_response_kind=D_NO_REPLY`，保留 reconciliation 狀態
+  - 明確要求先找外部 evidence，不可亂改 truth
+- `E_FORGOT_OR_NOT_DOING`
+  - append 一筆 **resume-required checkpoint**
+  - `status=RUNNING`
+  - `next_action` 強制改成恢復執行路徑（可自訂；未提供時用預設 resume wording）
+  - 這是 repo 內可執行規則，不是文案
 
 ### 尚未實作
 
@@ -275,4 +306,4 @@ owner / scheduler next step：
 - 多 owner routing / retry queue
 - cross-process locking
 
-所以目前狀態是：**repo 內已可測 end-to-end wiring；外部通知與系統 cron deletion 仍保留為 integration layer。**
+所以目前狀態是：**repo 內已可測 end-to-end wiring（含 owner reply ingestion / auto-routing）；外部通知與系統 cron deletion 仍保留為 integration layer。**

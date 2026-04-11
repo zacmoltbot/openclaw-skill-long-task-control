@@ -179,7 +179,7 @@ Expected owner-reconciliation branches:
 - `B_BLOCKED`: owner confirms the task is blocked -> write blocker truth and move to `BLOCKED_ESCALATE`
 - `C_COMPLETED`: owner confirms the task already finished -> write `COMPLETED` plus validation evidence
 - `D_NO_REPLY`: owner does not respond -> do not invent task truth; seek external evidence first
-- `E_FORGOT_OR_NOT_DOING`: owner admits the work was forgotten / not being done -> do not only record it; immediately enter the resume-execution / 要求補做 path
+- `E_FORGOT_OR_NOT_DOING`: owner admits the work was forgotten / not being done -> do not only record it; immediately enter the resume-execution / 要求補做 path, update `next_action`, and require a fresh real checkpoint
 
 ### `BLOCKED_ESCALATE`
 
@@ -340,11 +340,11 @@ If validation fails, report `BLOCKED` or a failed checkpoint instead of `COMPLET
 - `references/multi-stage-runbook.md`: fuller SOP for planning, polling, retries, handoff, and monitor operation
 - `references/failure-examples.md`: non-compliant examples, corrected reporting patterns, and nudge-specific anti-patterns
 - `scripts/checkpoint_report.py`: generate consistent status blocks
-- `scripts/task_ledger.py`: mutate ledger state; use `supervisor-update` only for supervision metadata
+- `scripts/task_ledger.py`: mutate ledger state; use `supervisor-update` only for supervision metadata; use `owner-reply` to ingest owner reconciliation replies and auto-route to resume / blocked / completed
 - `scripts/checkpoint_timeout.py`: detect stale tasks
 - `scripts/compliance_check.py`: scan for baseline rule violations
 - `scripts/monitor_nudge.py`: evaluate the low-cost execution-nudge state machine and optionally write supervision metadata only
-- `scripts/demo_monitor_flow.py`: run a temp-ledger E2E demo for nudge / escalate / stop-delete flows
+- `scripts/demo_monitor_flow.py`: run a temp-ledger E2E demo for stale -> owner reconcile -> owner reply -> resume / blocked escalate / stop-delete flows
 
 ## Minimal operating pattern
 
