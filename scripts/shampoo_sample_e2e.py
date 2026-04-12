@@ -77,7 +77,7 @@ def main():
         assert activation_payload["job"]["schedule"]["everyMs"] == 300000
 
         run_json(
-            "python3", str(OPENCLAW_OPS), "--ledger", str(ledger), "record-update", "STARTED", task_id,
+            "python3", str(OPENCLAW_OPS), "--ledger", str(ledger), "record-update", "STEP_PROGRESS", task_id,
             "--summary", "Treatment drafting started",
             "--current-checkpoint", "step-01",
             "--next-action", "Submit RunningHub render job",
@@ -168,7 +168,7 @@ def main():
         assert completed_external["pending_external"] is False
 
         completed_payload = run_json(
-            "python3", str(OPENCLAW_OPS), "--ledger", str(ledger), "record-update", "COMPLETED", task_id,
+            "python3", str(OPENCLAW_OPS), "--ledger", str(ledger), "record-update", "TASK_COMPLETED", task_id,
             "--summary", "Rendered shampoo sample and validated output file",
             "--current-checkpoint", "step-03",
             "--next-action", "None",
@@ -208,3 +208,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

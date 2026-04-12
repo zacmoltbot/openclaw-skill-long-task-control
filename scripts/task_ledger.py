@@ -393,7 +393,8 @@ def project_task(task):
         elif current_checkpoint == step_id and not current_running_found:
             derived_state = "RUNNING"
         workflow_states.append({"id": step_id, "title": step.get("title"), "state": derived_state})
-        step["state"] = derived_state
+        # NOTE: we do NOT write back to task["workflow"]; original is immutable.
+        # derived["workflow"] is the canonical current state.
         if derived_state == "RUNNING":
             current_running_found = True
         if obs.get("completed_at") and obs.get("last_progress_at") and obs["last_progress_at"] > obs["completed_at"]:
@@ -460,11 +461,9 @@ def project_task(task):
         derived_status = "RUNNING"
         truth_state = "CONSISTENT"
 
-    task["status"] = completed_task and "COMPLETED" or blocked_task and "BLOCKED" or task.get("status", "RUNNING")
-    task["current_checkpoint"] = current_step
-    task["last_checkpoint_at"] = latest_step_event_at or task.get("last_checkpoint_at") or task.get("created_at")
-    heartbeat = task.setdefault("heartbeat", {})
-    heartbeat["last_progress_at"] = latest_step_event_at or heartbeat.get("last_progress_at") or task.get("created_at")
+    # NOTE: we do NOT write root-level task fields.
+    # Canonical state lives in derived.*; task["status"/"current_checkpoint"/"last_checkpoint_at"]
+    # are owned by command handlers (init/checkpoint/block/etc), not by project_task().
 
     derived.update({
         "workflow": workflow_states,

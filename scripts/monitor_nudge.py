@@ -21,6 +21,7 @@ STATE_PRIORITY = [
 SUPERVISION_ALLOWED_PATHS = {
     "heartbeat",
     "heartbeat.watchdog_state",
+    "heartbeat.last_observed_progress_at",
     "monitoring",
     "monitoring.nudge_count",
     "monitoring.last_nudge_at",
@@ -42,6 +43,12 @@ SUPERVISION_ALLOWED_PATHS = {
     "monitoring.install_signal",
     "monitoring.cron_install_error",
     "monitoring.resume_requests",
+    "derived",
+    "status",
+    "current_checkpoint",
+    "last_checkpoint_at",
+    "heartbeat.last_progress_at",
+    "heartbeat.last_observed_progress_at",
 }
 OBSERVED_TRANSIENT_FAILURES = {"TIMEOUT", "DOWNLOAD_TIMEOUT", "DOWNLOAD_INCOMPLETE", "TRANSIENT_NETWORK", "EXECUTION_ERROR", "EXTERNAL_WAIT"}
 

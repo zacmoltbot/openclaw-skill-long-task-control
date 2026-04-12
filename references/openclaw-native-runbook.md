@@ -4,18 +4,33 @@ Use this runbook when you want `long-task-control` to operate as a real OpenClaw
 
 ## Goal
 
-Turn one long-running task into four connected OpenClaw-native pieces:
+Turn one long-running task into connected OpenClaw-native pieces:
 
 1. **activation message in the live session**
 2. **durable ledger entry on disk**
-3. **real OpenClaw cron monitor job**
-4. **message-driven nudge / reconcile / blocked-escalate / auto-cleanup flow**
+3. **executor subagent** that drives the task step by step
+4. **monitor cron** that watches the executor and handles GAP-1 / delivery push
+5. **message-driven nudge / reconcile / blocked-escalate / auto-cleanup flow**
 
 The integration helper is `scripts/openclaw_ops.py`.
 
+## Executor + Monitor Architecture
+
+```
+Executor subagent (cron)
+  └─ reads ledger → executes next step → writes CHECKPOINT → repeats
+       │
+       └─ monitor cron watches executor's ledger progress
+            ├─ GAP-1: step done but next hasn't started → nudge once → escalate
+            ├─ delivery push: pending_user_updates → Discord (passive every tick)
+            └─ STOP_AND_DELETE when task is COMPLETED / escalated
+```
+
+The monitor observes the executor, not the other way around. If the executor stalls, the monitor GAP-1 kicks in. The executor auto-resumes from the ledger's `current_checkpoint`.
+
 ## Activation lifecycle
 
-### Preferred default: one-shot bootstrap
+### Preferred default: bootstrap + executor
 
 ```bash
 python3 scripts/openclaw_ops.py --ledger state/long-task-ledger.json bootstrap-task <task_id> \
@@ -25,18 +40,17 @@ python3 scripts/openclaw_ops.py --ledger state/long-task-ledger.json bootstrap-t
   --workflow "Run implementation" \
   --workflow "Validate and handoff" \
   --next-action "Start checkpoint 1" \
-  --message-ref "discord:msg:<activation-message-id>" \
-  --fact channel_id=<discord-channel-id>
+  --message-ref "discord:msg:<activation-message-id>"
+
+# Then spawn the executor subagent:
+python3 scripts/openclaw_ops.py --ledger state/long-task-ledger.json run-executor <task_id>
 ```
 
-Treat this as the canonical OpenClaw-native entrypoint. It bundles four things that previously had to be remembered separately:
+`bootstrap-task` creates the ledger and installs the monitor cron. `run-executor` installs the executor cron that drives the workflow.
 
-- mandatory activation block
-- `TASK START` block
-- ledger initialization
-- monitor cron installation
-
-It also returns suggested `record-update` commands so the owner can keep execution truth and ledger truth bound together.
+Treat these as the canonical OpenClaw-native entrypoint for multi-stage tasks:
+- `bootstrap-task`: bundles activation block, `TASK START` block, ledger init, monitor cron install
+- `run-executor`: spawns the executor subagent that auto-resumes and executes each step
 
 ### Advanced / manual split-phase path
 
@@ -70,7 +84,6 @@ This writes:
 - workflow checkpoints
 - heartbeat / timeout settings
 - requester channel metadata for later nudges
-- `monitoring.cron_state=PENDING_INSTALL`
 
 #### Step 3: install the monitor cron
 
@@ -78,13 +91,11 @@ This writes:
 python3 scripts/openclaw_ops.py --ledger state/long-task-ledger.json install-monitor <task_id>
 ```
 
-This will:
+#### Step 4: install the executor (optional — for auto-drive mode)
 
-- call `openclaw cron add`
-- create a real OpenClaw job
-- bind the cron to an isolated monitor session
-- store the returned OpenClaw cron job id back into the ledger
-- store the exact session key / requester channel / schedule metadata in `monitoring.*`
+```bash
+python3 scripts/openclaw_ops.py --ledger state/long-task-ledger.json run-executor <task_id>
+```
 
 Use `--dry-run` if you only want to preview the generated job + prompt.
 
@@ -98,11 +109,32 @@ python3 scripts/openclaw_ops.py --ledger state/long-task-ledger.json render-moni
 
 The prompt tells the cron agent to:
 
-1. run `monitor_nudge.py`
-2. read only the selected `task_id`
-3. decide whether to stay quiet, send a reminder, reconcile owner truth, escalate blocked, or delete the cron
-4. use `message.send` for live nudges / reconciles / escalations
-5. call `openclaw_ops.py remove-monitor` for `BLOCKED_ESCALATE` and `STOP_AND_DELETE`
+1. **PASSIVE DELIVERY PUSH (mandatory, every tick)**: check `reporting.pending_updates[]` for `delivered=false`; send each to Discord via `message.send`; then `ack-delivery`
+2. run `monitor_nudge.py`
+3. read only the selected `task_id`
+4. decide whether to stay quiet, send a reminder, reconcile owner truth, escalate blocked, or delete the cron
+5. use `message.send` for live nudges / reconciles / escalations
+6. call `openclaw_ops.py remove-monitor` for `BLOCKED_ESCALATE` and `STOP_AND_DELETE`
+
+## What the executor subagent does
+
+The executor cron wakes every 5 minutes and:
+
+1. runs `executor_engine.py preview <task_id>` to see what to do next
+2. executes the next pending workflow step
+3. writes a CHECKPOINT via `task_ledger.py checkpoint`
+4. loops until `workflow_complete` or `blocked`
+5. outputs `EXECUTOR_DONE` or `EXECUTOR_BLOCKED`
+
+**Auto-resume**: reads the ledger's `current_checkpoint`; if step-01 is DONE and step-02 is RUNNING, starts step-02 immediately.
+
+## GAP-1: One-shot nudge + escalate
+
+When a step is terminal (DONE/COMPLETED) but the task hasn't advanced to the next step:
+
+1. **First tick**: monitor fires `NUDGE_MAIN_AGENT` (once), records step in `gap1_nudged_steps[]`
+2. **Second tick**: same step still stalled → step already in `gap1_nudged_steps` → immediately `BLOCKED_ESCALATE`, cron stops
+3. No repeat notifications
 
 ## Nudge / reconcile / escalate flow
 
@@ -114,7 +146,7 @@ The cron sends a concise fact-based message to the requester channel:
 - state = `NUDGE_MAIN_AGENT`
 - stale reason
 - `next_action`
-- explicit instruction: main agent must resume / checkpoint / close the task
+- explicit instruction: resume / checkpoint / close the task
 
 ### OWNER_RECONCILE
 
@@ -157,6 +189,13 @@ This is useful during testing because it shows:
 - the computed monitor state
 - the exact notification text the cron would send
 - whether the cron would remove itself
+- `pending_user_updates_deliverable_count`
+
+### Preview what the executor would do next
+
+```bash
+python3 scripts/openclaw_ops.py --ledger state/long-task-ledger.json executor-preview <task_id>
+```
 
 ### Remove a monitor manually
 
@@ -184,16 +223,17 @@ This test proves:
 2. ledger init writes requester-channel metadata
 3. OpenClaw monitor install can create a real cron job
 4. stale progress produces `NUDGE_MAIN_AGENT`
-5. repeated staleness produces `OWNER_RECONCILE`
-6. owner reply `E` forces resume-required path
-7. owner reply `C` closes the task as `COMPLETED`
-8. terminal cleanup removes the real OpenClaw cron job and marks the ledger as deleted
+5. GAP-1 one-shot nudge → escalate flow
+6. passive delivery push fires correctly
+7. owner reply `E` forces resume-required path
+8. owner reply `C` closes the task as `COMPLETED`
+9. terminal cleanup removes the real OpenClaw cron job and marks the ledger as deleted
 
 ## Recommended real-world pattern
 
 - main agent runs `bootstrap-task` as the default entrypoint
 - main agent posts the returned activation + `TASK START` blocks
-- bootstrap writes the ledger and installs the OpenClaw monitor cron automatically
-- main agent keeps writing checkpoints (prefer `python3 scripts/openclaw_ops.py --ledger state/long-task-ledger.json record-update <STARTED|CHECKPOINT|BLOCKED|COMPLETED> <task_id> ...` so execution truth and ledger append stay bound together)
-- cron agent only wakes when scheduled and sends minimal reminders when stale
-- terminal completion / blocked escalation removes the cron immediately
+- main agent spawns `run-executor` to auto-drive the workflow
+- executor writes checkpoints as it advances
+- monitor cron watches executor: GAP-1 nudge if step stalled, passive delivery push every tick
+- terminal completion / blocked escalation removes both crons

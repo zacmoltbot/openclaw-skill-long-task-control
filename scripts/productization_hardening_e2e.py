@@ -76,7 +76,7 @@ def main():
         assert boot_a["job"]["id"]
         assert task_from(ledger, task_a)["monitoring"]["cron_state"] == "DISABLED"
         step_a = run_json(
-            "python3", str(OPS), "--ledger", str(ledger), "record-update", "CHECKPOINT", task_a,
+            "python3", str(OPS), "--ledger", str(ledger), "record-update", "STEP_COMPLETED", task_a,
             "--summary", "Step 1 completed",
             "--current-checkpoint", "step-01",
             "--next-action", "Start step 2",
@@ -195,7 +195,7 @@ def main():
         )
         run("python3", str(CRON), "--ledger", str(ledger), "--cron-dir", str(cron_dir), "install", task_f)
         completed = run_json(
-            "python3", str(OPS), "--ledger", str(ledger), "record-update", "COMPLETED", task_f,
+            "python3", str(OPS), "--ledger", str(ledger), "record-update", "TASK_COMPLETED", task_f,
             "--summary", "All done with validated artifact",
             "--current-checkpoint", "step-02", "--next-action", "None",
             "--output", str(artifact), "--fact", "validation=passed",
@@ -216,7 +216,7 @@ def main():
             "--next-action", "Do step",
         )
         run_json(
-            "python3", str(OPS), "--ledger", str(ledger), "record-update", "CHECKPOINT", task_g,
+            "python3", str(OPS), "--ledger", str(ledger), "record-update", "STEP_COMPLETED", task_g,
             "--summary", "Did the step but forgot to report it",
             "--current-checkpoint", "step-01", "--next-action", "Continue",
             "--fact", "step=done",
@@ -242,3 +242,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

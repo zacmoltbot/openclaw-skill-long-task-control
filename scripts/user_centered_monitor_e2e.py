@@ -76,7 +76,7 @@ def main():
             "--fact", "owner_statement=forgot_to_do_it",
         )
         run_json(
-            "python3", str(OPS), "--ledger", str(ledger), "record-update", "CHECKPOINT", resume_task,
+            "python3", str(OPS), "--ledger", str(ledger), "record-update", "STEP_COMPLETED", resume_task,
             "--summary", "Transient failure recovered and execution resumed",
             "--current-checkpoint", "step-02",
             "--next-action", "Finish the task",

@@ -89,7 +89,7 @@ def main():
         resume_report = next(r for r in first_resume["reports"] if r["task_id"] == task_resume)
         token = resume_report["action_payload"]["resume_token"]
         run_json(
-            "python3", str(OPS), "--ledger", str(ledger), "record-update", "STARTED", task_resume,
+            "python3", str(OPS), "--ledger", str(ledger), "record-update", "STEP_PROGRESS", task_resume,
             "--summary", "resume owner picked up step 2",
             "--current-checkpoint", "step-02",
             "--next-action", "download file",
@@ -115,7 +115,7 @@ def main():
             "--next-action", "do",
         )
         run_json(
-            "python3", str(OPS), "--ledger", str(ledger), "record-update", "CHECKPOINT", task_delivery,
+            "python3", str(OPS), "--ledger", str(ledger), "record-update", "STEP_COMPLETED", task_delivery,
             "--summary", "step done",
             "--current-checkpoint", "step-01",
             "--next-action", "continue",

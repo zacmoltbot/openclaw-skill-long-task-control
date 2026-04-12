@@ -73,17 +73,17 @@ def main():
         assert task['monitoring']['cron_state'] == 'DISABLED'
 
         started = run_json(
-            'python3', str(OPENCLAW_OPS), '--ledger', str(ledger), 'record-update', 'STARTED', task_id,
+            'python3', str(OPENCLAW_OPS), '--ledger', str(ledger), 'record-update', 'STEP_PROGRESS', task_id,
             '--summary', 'Input inspection started with source manifest loaded',
             '--current-checkpoint', 'step-01',
             '--next-action', 'Build the artifact',
             '--fact', 'input_manifest=loaded',
         )
         assert started['task_status'] == 'RUNNING'
-        assert 'STARTED' in started['status_block']
+        assert 'STEP_PROGRESS' in started['status_block']
 
         checkpoint = run_json(
-            'python3', str(OPENCLAW_OPS), '--ledger', str(ledger), 'record-update', 'CHECKPOINT', task_id,
+            'python3', str(OPENCLAW_OPS), '--ledger', str(ledger), 'record-update', 'STEP_COMPLETED', task_id,
             '--summary', 'Artifact build finished',
             '--current-checkpoint', 'step-02',
             '--next-action', 'Validate output and handoff',
@@ -109,7 +109,7 @@ def main():
         assert task['status'] == 'RUNNING'
 
         completed = run_json(
-            'python3', str(OPENCLAW_OPS), '--ledger', str(ledger), 'record-update', 'COMPLETED', task_id,
+            'python3', str(OPENCLAW_OPS), '--ledger', str(ledger), 'record-update', 'TASK_COMPLETED', task_id,
             '--summary', 'Validated final artifact and ready for handoff',
             '--current-checkpoint', 'step-03',
             '--next-action', 'None',
