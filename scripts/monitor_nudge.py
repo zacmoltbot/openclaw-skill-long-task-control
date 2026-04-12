@@ -20,9 +20,28 @@ FAILURE_TYPES = {
     "TIMEOUT": "TIMEOUT",
     "EXECUTION_ERROR": "EXECUTION_ERROR",
     "EXTERNAL_WAIT": "EXTERNAL_WAIT",
+    "MISSING_EXTERNAL_EVIDENCE": "MISSING_EXTERNAL_EVIDENCE",
 }
 MAX_RETRY_COUNT = 3
 MAX_TASK_AGE_SEC = 3600
+PENDING_EXTERNAL_STATES = {"SUBMITTED", "PENDING", "RUNNING", "RETRYING", "SWITCHED_WORKFLOW"}
+PROVIDER_EVIDENCE_KEYS = {
+    "provider_job_id",
+    "submission_receipt",
+    "submission_receipt_id",
+    "provider_status_handle",
+    "status_handle",
+    "status_url",
+    "provider_response_ref",
+    "provider_receipt_ref",
+    "artifact_path",
+    "artifact_url",
+    "output_file",
+    "poll_token",
+    "remote_job_id",
+    "runninghub_job_id",
+    "rh_job_id",
+}
 DEFAULTS = {
     "nudge_after_sec": None,
     "renotify_interval_sec": None,
@@ -104,10 +123,71 @@ def clear_all_retries_for_step(monitoring, step_id):
             del counts[key]
 
 
-def has_pending_external_return(task):
+def nonempty(value):
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (list, dict, tuple, set)):
+        return bool(value)
+    return True
+
+
+def collect_provider_evidence(job):
+    evidence = {}
+    raw = job.get("provider_evidence") or {}
+    if isinstance(raw, dict):
+        for key, value in raw.items():
+            if nonempty(value):
+                evidence[key] = value
+    if nonempty(job.get("job_id")):
+        evidence.setdefault("provider_job_id", job.get("job_id"))
+    for key in PROVIDER_EVIDENCE_KEYS:
+        if nonempty(job.get(key)):
+            evidence.setdefault(key, job.get(key))
+    history = job.get("history") or []
+    if history:
+        last_facts = (history[-1] or {}).get("facts") or {}
+        if isinstance(last_facts, dict):
+            for key in PROVIDER_EVIDENCE_KEYS:
+                if nonempty(last_facts.get(key)):
+                    evidence.setdefault(key, last_facts.get(key))
+    return evidence
+
+
+def evaluate_external_evidence(task):
+    suspicious_jobs = []
+    legit_pending_jobs = []
     for job in task.get("external_jobs", []):
-        if job.get("pending_external") or str(job.get("status", "")).upper() in {"SUBMITTED", "PENDING", "RUNNING", "RETRYING", "SWITCHED_WORKFLOW"}:
-            return True
+        state = str(job.get("status", "")).upper()
+        if state not in PENDING_EXTERNAL_STATES and not job.get("pending_external"):
+            continue
+        evidence = collect_provider_evidence(job)
+        if evidence:
+            legit_pending_jobs.append({
+                "provider": job.get("provider"),
+                "job_id": job.get("job_id"),
+                "status": state,
+                "evidence": evidence,
+            })
+        else:
+            suspicious_jobs.append({
+                "provider": job.get("provider"),
+                "job_id": job.get("job_id"),
+                "status": state,
+                "missing_contract": sorted(PROVIDER_EVIDENCE_KEYS),
+            })
+    return {
+        "has_legit_pending": bool(legit_pending_jobs),
+        "legit_pending_jobs": legit_pending_jobs,
+        "suspicious_jobs": suspicious_jobs,
+    }
+
+
+def has_pending_external_return(task):
+    evaluation = evaluate_external_evidence(task)
+    if evaluation["has_legit_pending"]:
+        return True
 
     checkpoints = task.get("checkpoints", [])
     for cp in checkpoints[-3:]:
@@ -191,6 +271,8 @@ def build_action_payload(task, chosen, now_iso_value):
             "facts": {
                 "task_id": task_id,
                 "reason": chosen["reason"],
+                "suspicious_external_jobs": chosen.get("suspicious_external_jobs", []),
+                "required_provider_evidence": sorted(PROVIDER_EVIDENCE_KEYS),
                 "branches": {
                     "A_IN_PROGRESS_FORGOT_LEDGER": "append missed checkpoint(s), refresh next_action, keep RUNNING",
                     "B_BLOCKED": "write blocker truth only after self-recovery is ruled out, then escalate",
@@ -220,6 +302,7 @@ def build_action_payload(task, chosen, now_iso_value):
                 "blocker": blocker,
                 "retry_count": retry_count,
                 "recent_attempts": recent_attempts,
+                "suspicious_external_jobs": chosen.get("suspicious_external_jobs", []),
             },
             "created_at": now_iso_value,
         }
@@ -258,13 +341,17 @@ def apply_supervision_update(task, report, now_iso_value):
     elif report["state"] in {"BLOCKED_ESCALATE", "STOP_AND_DELETE"}:
         monitoring["last_escalated_at"] = now_iso_value if report["state"] == "BLOCKED_ESCALATE" else monitoring.get("last_escalated_at")
         monitoring["cron_state"] = "DELETE_REQUESTED"
-    monitoring.setdefault("action_log", []).append({
+    action_log_entry = {
         "at": now_iso_value,
         "state": report["state"],
         "reason": report["reason"],
         "action": report["action"],
-        **({"payload_kind": report["action_payload"]["kind"]} if report.get("action_payload") else {}),
-    })
+    }
+    if report.get("action_payload"):
+        action_log_entry["payload_kind"] = report["action_payload"]["kind"]
+    if report.get("failure_type"):
+        action_log_entry["failure_type"] = report["failure_type"]
+    monitoring.setdefault("action_log", []).append(action_log_entry)
 
 
 def collect_paths(obj, prefix=""):
@@ -323,7 +410,10 @@ def evaluate_task(task, now):
     escalate_after_nudges = int(monitoring.get("escalate_after_nudges", DEFAULTS["escalate_after_nudges"]) or DEFAULTS["escalate_after_nudges"])
     renotify_interval_sec = int(monitoring.get("renotify_interval_sec", expected_interval) or expected_interval)
     progress_is_fresh = is_progress_updating(task, now)
-    pending_external = has_pending_external_return(task)
+    external_eval = evaluate_external_evidence(task)
+    pending_external = external_eval["has_legit_pending"] or has_pending_external_return(task)
+    suspicious_jobs = external_eval["suspicious_jobs"]
+    suspicious_reconcile_count = get_retry_count(monitoring, current_step, FAILURE_TYPES["MISSING_EXTERNAL_EVIDENCE"])
     should_renotify = last_nudge_age is None or last_nudge_age >= renotify_interval_sec
     candidates = []
 
@@ -336,15 +426,36 @@ def evaluate_task(task, now):
     if status in ACTIVE_STATUSES and task_age is not None and task_age > MAX_TASK_AGE_SEC:
         candidates.append({"state": "BLOCKED_ESCALATE", "reason": f"task exceeded 60-minute wall clock limit ({task_age}s > {MAX_TASK_AGE_SEC}s)", "action": "enforce_max_task_age_then_delete_cron"})
 
+    if status in ACTIVE_STATUSES and suspicious_jobs:
+        reconcile_attempt = increment_retry(monitoring, current_step, FAILURE_TYPES["MISSING_EXTERNAL_EVIDENCE"])
+        reason = f"external pending claim lacks provider evidence on step '{current_step}'; monitor must reconcile owner evidence before trusting external wait"
+        if reconcile_attempt >= MAX_RETRY_COUNT:
+            candidates.append({
+                "state": "BLOCKED_ESCALATE",
+                "reason": f"{reason}; missing-evidence reconcile retry {reconcile_attempt}/{MAX_RETRY_COUNT}",
+                "action": "escalate_missing_external_evidence_then_delete_cron",
+                "failure_type": FAILURE_TYPES["MISSING_EXTERNAL_EVIDENCE"],
+                "suspicious_external_jobs": suspicious_jobs,
+            })
+        else:
+            candidates.append({
+                "state": "OWNER_RECONCILE",
+                "reason": f"{reason}; request owner evidence reconcile {reconcile_attempt}/{MAX_RETRY_COUNT}",
+                "action": "query_owner_for_provider_evidence",
+                "failure_type": FAILURE_TYPES["MISSING_EXTERNAL_EVIDENCE"],
+                "suspicious_external_jobs": suspicious_jobs,
+            })
+
     if status == "BLOCKED":
         timeout_count = get_retry_count(monitoring, current_step, FAILURE_TYPES["TIMEOUT"])
         exec_count = get_retry_count(monitoring, current_step, FAILURE_TYPES["EXECUTION_ERROR"])
         ext_count = get_retry_count(monitoring, current_step, FAILURE_TYPES["EXTERNAL_WAIT"])
-        max_retry = max(timeout_count, exec_count, ext_count)
+        missing_evidence_count = get_retry_count(monitoring, current_step, FAILURE_TYPES["MISSING_EXTERNAL_EVIDENCE"])
+        max_retry = max(timeout_count, exec_count, ext_count, missing_evidence_count)
         if monitoring.get("last_escalated_at"):
             candidates.append({"state": "STOP_AND_DELETE", "reason": f"{(blocker or {}).get('reason') or 'task blocked'}; escalation already sent", "action": "delete_monitor_cron"})
         elif max_retry >= MAX_RETRY_COUNT:
-            candidates.append({"state": "BLOCKED_ESCALATE", "reason": f"retry limit reached on step '{current_step}' (timeouts={timeout_count}, exec_errors={exec_count}, ext_waits={ext_count})", "action": "send_blocked_escalation_then_delete_cron"})
+            candidates.append({"state": "BLOCKED_ESCALATE", "reason": f"retry limit reached on step '{current_step}' (timeouts={timeout_count}, exec_errors={exec_count}, ext_waits={ext_count}, weak_external_claims={missing_evidence_count})", "action": "send_blocked_escalation_then_delete_cron"})
         elif last_progress_age is not None and last_progress_age >= blocked_escalate_after_sec:
             candidates.append({"state": "BLOCKED_ESCALATE", "reason": f"{(blocker or {}).get('reason') or 'task blocked'}; blocked for {last_progress_age}s", "action": "send_blocked_escalation_then_delete_cron"})
         else:
@@ -359,9 +470,9 @@ def evaluate_task(task, now):
         else:
             new_count = increment_retry(monitoring, current_step, FAILURE_TYPES["TIMEOUT"])
             if new_count >= MAX_RETRY_COUNT:
-                candidates.append({"state": "BLOCKED_ESCALATE", "reason": f"no checkpoint for {last_progress_age}s on step '{current_step}'; TIMEOUT retry {new_count}/{MAX_RETRY_COUNT}", "action": "send_blocked_escalation_then_delete_cron"})
+                candidates.append({"state": "BLOCKED_ESCALATE", "reason": f"no checkpoint for {last_progress_age}s on step '{current_step}'; TIMEOUT retry {new_count}/{MAX_RETRY_COUNT}", "action": "send_blocked_escalation_then_delete_cron", "failure_type": FAILURE_TYPES["TIMEOUT"]})
             else:
-                candidates.append({"state": "STALE_PROGRESS", "reason": f"no new checkpoint for {last_progress_age}s (> timeout_sec={timeout_sec}); TIMEOUT retry {new_count}/{MAX_RETRY_COUNT}", "action": "flag_stale_progress_pre_gate"})
+                candidates.append({"state": "STALE_PROGRESS", "reason": f"no new checkpoint for {last_progress_age}s (> timeout_sec={timeout_sec}); TIMEOUT retry {new_count}/{MAX_RETRY_COUNT}", "action": "flag_stale_progress_pre_gate", "failure_type": FAILURE_TYPES["TIMEOUT"]})
 
     if status in ACTIVE_STATUSES and last_heartbeat_age is not None and last_heartbeat_age > expected_interval:
         if pending_external or progress_is_fresh:
@@ -369,7 +480,7 @@ def evaluate_task(task, now):
         else:
             candidates.append({"state": "HEARTBEAT_DUE", "reason": f"no heartbeat for {last_heartbeat_age}s (> expected_interval_sec={expected_interval})", "action": "send_lightweight_supervision_reminder"})
 
-    if status in ACTIVE_STATUSES and last_progress_age is not None and last_progress_age > nudge_after_sec and not (pending_external or progress_is_fresh):
+    if status in ACTIVE_STATUSES and last_progress_age is not None and last_progress_age > nudge_after_sec and not (pending_external or progress_is_fresh or suspicious_jobs):
         if nudge_count >= max_nudges or (nudge_count >= escalate_after_nudges and should_renotify):
             candidates.append({"state": "OWNER_RECONCILE", "reason": f"task already nudged {nudge_count} times with no fresh checkpoint", "action": "query_owner_and_force_reconciliation"})
         else:
@@ -400,6 +511,9 @@ def evaluate_task(task, now):
         "current_step": current_step,
         "retry_count": dict(monitoring.get("retry_count", {})),
         "pending_external": pending_external,
+        "suspicious_external_jobs": suspicious_jobs,
+        "failure_type": chosen.get("failure_type"),
+        "external_evidence_ok": external_eval["has_legit_pending"],
     }
 
 

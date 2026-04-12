@@ -64,8 +64,11 @@ When waiting on a remote job or background process:
 
 - report the job id or PID
 - report the last known state
+- persist minimum provider evidence on `external_jobs[].provider_evidence` (for example: provider job id, submission receipt, provider status handle, poll token, status URL, artifact handle)
 - avoid noisy non-updates
 - only emit a new checkpoint when something verifiable changed
+
+Do not treat a bare owner-written `pending/running` claim as valid external wait. If provider evidence is missing, the monitor must treat it as suspicious, ask owner to reconcile evidence first, and escalate/cleanup after repeated failed reconciliations.
 
 Examples of meaningful changes:
 

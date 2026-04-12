@@ -61,6 +61,23 @@ EXTERNAL_JOB_STATES = {
     "COMPLETED",
 }
 PENDING_EXTERNAL_STATES = {"SUBMITTED", "PENDING", "RUNNING", "RETRYING", "SWITCHED_WORKFLOW"}
+PROVIDER_EVIDENCE_KEYS = {
+    "provider_job_id",
+    "submission_receipt",
+    "submission_receipt_id",
+    "provider_status_handle",
+    "status_handle",
+    "status_url",
+    "provider_response_ref",
+    "provider_receipt_ref",
+    "artifact_path",
+    "artifact_url",
+    "output_file",
+    "poll_token",
+    "remote_job_id",
+    "runninghub_job_id",
+    "rh_job_id",
+}
 
 
 def now_iso():
@@ -108,6 +125,39 @@ def normalize_owner_reply(value: str):
     return OWNER_REPLY_ALIASES.get(reply, reply)
 
 
+def nonempty(value):
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (list, dict, tuple, set)):
+        return bool(value)
+    return True
+
+
+def extract_provider_evidence(job, facts=None):
+    evidence = {}
+    raw = job.get("provider_evidence") or {}
+    if isinstance(raw, dict):
+        for key, value in raw.items():
+            if nonempty(value):
+                evidence[key] = value
+    if nonempty(job.get("job_id")):
+        evidence.setdefault("provider_job_id", job.get("job_id"))
+    merged_facts = facts or {}
+    for key in PROVIDER_EVIDENCE_KEYS:
+        value = merged_facts.get(key)
+        if nonempty(value):
+            evidence.setdefault(key, value)
+    return evidence
+
+
+def provider_evidence_contract_ok(job, state, facts=None):
+    if state not in PENDING_EXTERNAL_STATES:
+        return True
+    return bool(extract_provider_evidence(job, facts=facts))
+
+
 def append_checkpoint(task, *, kind, summary, facts=None, touch_progress=True):
     at = now_iso()
     task.setdefault("checkpoints", []).append({
@@ -147,6 +197,7 @@ def ensure_external_job(task, provider, job_id, workflow=None, app=None):
         "workflow": workflow,
         "app": app,
         "pending_external": True,
+        "provider_evidence": {"provider_job_id": job_id},
         "history": [],
         "failure_count": 0,
         "switch_count": 0,
@@ -168,6 +219,11 @@ def record_external_job_event(task, *, provider, job_id, state, summary, facts=N
         job["workflow"] = workflow
     if app:
         job["app"] = app
+    job["provider_evidence"] = extract_provider_evidence(job, facts=facts)
+    if not provider_evidence_contract_ok(job, state, facts=facts):
+        raise SystemExit(
+            "Pending external job requires minimum provider evidence: provider_job_id / submission_receipt / provider_status_handle / status_url / artifact_path / output_file / other verifiable provider handle"
+        )
     event = {
         "at": at,
         "state": state,
@@ -529,7 +585,7 @@ def cmd_external_job(args):
         key = f"{current_step}:{failure_type}"
         counts = monitoring.setdefault("retry_count", {})
         counts[key] = int(counts.get(key, 0) or 0) + 1
-    queued_update = maybe_queue_external_update(
+    maybe_queue_external_update(
         task,
         state=args.state,
         summary=args.summary,
@@ -545,6 +601,7 @@ def cmd_external_job(args):
         "job_id": args.job_id,
         "state": args.state,
         "pending_external": job.get("pending_external"),
+        "provider_evidence": job.get("provider_evidence", {}),
         "job": job,
     }, ensure_ascii=False, indent=2))
 

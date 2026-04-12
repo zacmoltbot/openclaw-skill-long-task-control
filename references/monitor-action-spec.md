@@ -147,11 +147,14 @@ monitor side effects：
 owner next step：
 
 - query owner immediately
+- 若原因是 `pending external claim lacks provider evidence`，先補 `external_jobs[].provider_evidence`（真實 provider job id / receipt / status handle / artifact handle 等），不要只回一句「還在跑」
 - branch A: 補 ledger，補 checkpoint / artifacts / next_action
 - branch B: 寫 `BLOCKED` truth，交給 monitor 送 `BLOCKED_ESCALATE`
 - branch C: 寫 `COMPLETED` + validation
 - branch D: 先找外部 evidence，不可虛構 checkpoint
 - branch E: 立刻恢復執行，不是只做紀錄
+
+若 monitor 已多次要求 reconcile，但 owner 仍補不出 provider evidence，monitor 需將其視為 weak/fake external pending claim，升級 `BLOCKED_ESCALATE` 並要求 cleanup，避免 cron 無限空等。
 
 ### `BLOCKED_ESCALATE`
 

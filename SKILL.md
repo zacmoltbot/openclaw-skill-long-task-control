@@ -86,7 +86,7 @@ Recommended file:
 state/long-task-ledger.json
 ```
 
-For external async jobs, keep durable truth under `external_jobs[]` on the task record. Submitted / pending / running / failed / retrying / switched-workflow / completed must be written there via `python3 scripts/task_ledger.py --ledger ... external-job ...` instead of relying on chat memory.
+For external async jobs, keep durable truth under `external_jobs[]` on the task record. Submitted / pending / running / failed / retrying / switched-workflow / completed must be written there via `python3 scripts/task_ledger.py --ledger ... external-job ...` instead of relying on chat memory. For `SUBMITTED | PENDING | RUNNING | RETRYING | SWITCHED_WORKFLOW`, the external job must carry minimum provider evidence under `provider_evidence` (for example: real provider job id, submission receipt, provider status handle, status URL, poll token, or output/artifact handle). A bare owner-written pending claim without evidence is suspicious and must not be trusted as a legitimate external wait.
 
 For every user-visible progress point, also keep durable reporting truth under `reporting.pending_updates[]`. Owner wrappers (`record-update`, `external-job`, `owner-reply`) now create those obligations automatically for step-complete, external-job success/failure, workflow switch, blocked escalate, and completed handoff. After the real user-visible message is sent, acknowledge it with `python3 scripts/task_ledger.py --ledger ... ack-delivery <task_id> <update_id> --message-ref <ref>`.
 
@@ -401,6 +401,7 @@ If validation fails, report `BLOCKED` or a failed checkpoint instead of `COMPLET
 - `scripts/openclaw_native_e2e.py`: run an OpenClaw-style E2E smoke test with real cron create/remove plus stale -> reconcile -> completed cleanup validation
 - `scripts/generic_long_task_e2e.py`: run a task-agnostic E2E proving bootstrap -> updates -> stale nudge -> reconcile -> completed -> cleanup without task-specific patches
 - `scripts/user_centered_monitor_e2e.py`: run two required user-centered scenarios: (A) transient/self-recoverable stall -> resume/rebuild/reconcile without blocked escalation; (B) true unrecoverable blocker -> BLOCKED_ESCALATE plus immediate cron cleanup
+- `scripts/external_evidence_reconcile_e2e.py`: run the provider-evidence contract scenarios: (A) legit external pending with evidence => OK/noop, (B) weak pending claim without evidence => OWNER_RECONCILE, (C) owner later supplies evidence => task stays RUNNING/OK, (D) repeated reconcile with no evidence => BLOCKED_ESCALATE + cleanup
 - `scripts/shampoo_sample_e2e.py`: run the required 30s shampoo sample E2E flow via the same bootstrap entrypoint: activation -> ledger init -> monitor cron install -> checkpoint -> stale/nudge -> owner reconcile -> completed -> cron cleanup
 
 ## OpenClaw-native activation and monitor lifecycle

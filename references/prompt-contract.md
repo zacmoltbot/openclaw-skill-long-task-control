@@ -11,7 +11,7 @@ If the task is long-running by the detection checklist, treat this lifecycle as 
 3. initialize the durable ledger
 4. install the monitor cron
 5. use `record-update` for STARTED / CHECKPOINT / BLOCKED / COMPLETED
-6. let monitor drive nudge / reconcile / blocked-escalate / cleanup, with user-centered bias: first push resume / rebuild-safe-step / reconcile / 補做, and only use blocked escalation once self-recovery is no longer viable
+6. let monitor drive nudge / reconcile / blocked-escalate / cleanup, with user-centered bias: first push resume / rebuild-safe-step / reconcile / 補做, and only use blocked escalation once self-recovery is no longer viable; if an external job is marked pending/running, require minimum `provider_evidence` (real provider job id / receipt / status handle / artifact handle). A weak pending claim without evidence must enter owner-evidence reconcile first, not be trusted as legitimate external wait
 7. remove the monitor on terminal state
 
 ## Preferred integration command

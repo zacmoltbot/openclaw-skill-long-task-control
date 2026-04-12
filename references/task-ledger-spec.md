@@ -170,7 +170,16 @@ Allowed lifecycle states:
 - `SWITCHED_WORKFLOW`
 - `COMPLETED`
 
-Monitor stale detection must consult this structure first. If any external job is still pending/running/retrying/switched-workflow, do not misclassify the task as stale.
+每個 pending external job 還必須帶最小 `provider_evidence` contract，至少有一個可驗證欄位，例如：
+- `provider_job_id`
+- `submission_receipt` / `submission_receipt_id`
+- `provider_status_handle` / `status_handle`
+- `status_url`
+- `poll_token`
+- `artifact_path` / `artifact_url` / `output_file`
+- `provider_response_ref`
+
+Monitor stale detection must consult this structure first. 只有「pending state + provider evidence contract 成立」才可視為 legitimate external wait。若 ledger 只有 owner 自己寫的 pending claim、但缺 provider evidence，monitor 必須先進 `OWNER_RECONCILE` 要 owner 補證據；多次 reconcile 仍補不出來才 escalation / stop cron.
 
 ### Reporting delivery fields
 

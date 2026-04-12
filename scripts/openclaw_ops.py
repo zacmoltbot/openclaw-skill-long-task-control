@@ -151,13 +151,20 @@ def format_notification(task, report):
         ])
     if state == "OWNER_RECONCILE":
         branches = facts.get("branches") or {}
+        suspicious_jobs = facts.get("suspicious_external_jobs") or []
+        required_provider_evidence = facts.get("required_provider_evidence") or []
         lines = [
             "【long-task-control / owner reconcile】",
             f"task_id={task_id}",
             f"state={state}",
             f"reason={report['reason']}",
-            "請 main agent 立即 reconcile owner truth，優先把任務往完成推：",
         ]
+        if suspicious_jobs:
+            lines.append("弱證據 external pending claim，請先補 provider evidence：")
+            for job in suspicious_jobs:
+                lines.append(f"- provider={job.get('provider')} job_id={job.get('job_id')} status={job.get('status')}")
+            lines.append("可接受 evidence: " + ", ".join(required_provider_evidence[:6]) + (" ..." if len(required_provider_evidence) > 6 else ""))
+        lines.append("請 main agent 立即 reconcile owner truth，優先把任務往完成推：")
         for key in ["A_IN_PROGRESS_FORGOT_LEDGER", "B_BLOCKED", "C_COMPLETED", "D_NO_REPLY", "E_FORGOT_OR_NOT_DOING"]:
             if key in branches:
                 lines.append(f"- {key}: {branches[key]}")
