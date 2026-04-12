@@ -6,6 +6,8 @@
 
 ### Owner / main agent 負責寫 task truth
 
+另外，owner 也負責 **user-visible delivery truth**：`reporting.pending_updates[]` / `reporting.delivered_updates[]`。這不是 monitor 的職責。
+
 只有 owner / main agent 可以更新這些 **task truth** 欄位：
 
 - `status`

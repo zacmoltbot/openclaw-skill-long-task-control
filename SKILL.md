@@ -7,12 +7,13 @@ description: Standardize task control, checkpointing, and status reporting for l
 
 Keep long tasks boring, traceable, and easy to audit.
 
-This skill is now a **semi-enforced task control system**, not just a formatting guide. The contract has four layers:
+This skill is now a **semi-enforced task control system**, not just a formatting guide. The contract has five layers:
 
 1. **User-visible reporting**: activation → task start → checkpoint → blocked → completed
 2. **Durable state**: task ledger with `task_id`, workflow, timestamps, blocker, validation, heartbeat
-3. **Low-cost monitor cron**: pre-gate rule engine that checks ledger freshness and nudges the main agent when execution stalls
-4. **Machine checks**: timeout detector + compliance checker
+3. **Reporting contract**: every user-visible progress point creates a durable `reporting.pending_updates[]` obligation until delivery is acknowledged
+4. **Low-cost monitor cron**: pre-gate rule engine that checks ledger freshness and nudges the main agent when execution stalls
+5. **Machine checks**: timeout detector + compliance checker
 
 For actual OpenClaw usage, do not stop at repo-local scripts. Use `scripts/openclaw_ops.py` plus `references/openclaw-native-runbook.md` and `references/prompt-contract.md`.
 
@@ -86,6 +87,8 @@ state/long-task-ledger.json
 ```
 
 For external async jobs, keep durable truth under `external_jobs[]` on the task record. Submitted / pending / running / failed / retrying / switched-workflow / completed must be written there via `python3 scripts/task_ledger.py --ledger ... external-job ...` instead of relying on chat memory.
+
+For every user-visible progress point, also keep durable reporting truth under `reporting.pending_updates[]`. Owner wrappers (`record-update`, `external-job`, `owner-reply`) now create those obligations automatically for step-complete, external-job success/failure, workflow switch, blocked escalate, and completed handoff. After the real user-visible message is sent, acknowledge it with `python3 scripts/task_ledger.py --ledger ... ack-delivery <task_id> <update_id> --message-ref <ref>`.
 
 This repo ships an example state file:
 
@@ -388,7 +391,7 @@ If validation fails, report `BLOCKED` or a failed checkpoint instead of `COMPLET
 - `references/prompt-contract.md`: default contract that makes lifecycle bootstrap the preferred OpenClaw-native entrypoint
 - `references/failure-examples.md`: non-compliant examples, corrected reporting patterns, and nudge-specific anti-patterns
 - `scripts/checkpoint_report.py`: generate consistent status blocks
-- `scripts/task_ledger.py`: mutate ledger state; use `supervisor-update` only for supervision metadata; use `owner-reply` to ingest owner reconciliation replies and auto-route to resume / blocked / completed
+- `scripts/task_ledger.py`: mutate ledger state; use `supervisor-update` only for supervision metadata; use `owner-reply` to ingest owner reconciliation replies and auto-route to resume / blocked / completed; use `ack-delivery` to close user-visible reporting obligations
 - `scripts/checkpoint_timeout.py`: detect stale tasks
 - `scripts/compliance_check.py`: scan for baseline rule violations
 - `scripts/monitor_nudge.py`: evaluate the low-cost execution-nudge state machine and optionally write supervision metadata only
@@ -408,6 +411,7 @@ When using this skill inside OpenClaw, follow this exact flow:
 2. Product rule: if total task age exceeds **60 minutes**, treat it as `BLOCKED_ESCALATE` and stop/delete the monitor cron in the same monitor cycle.
 2. That bootstrap should be treated as the default lifecycle entry: it returns the activation block, the `TASK START` block, initializes the ledger, and installs a **real OpenClaw cron monitor** in one operation.
 3. Keep writing owner-truth checkpoints with `python3 scripts/openclaw_ops.py --ledger state/long-task-ledger.json record-update <STARTED|CHECKPOINT|BLOCKED|COMPLETED> ...` plus `task_ledger.py owner-reply` when reconcile input arrives.
+4. Treat every returned `pending_user_update` as mandatory delivery work, not optional prose. After the corresponding requester-visible message is actually sent, run `task_ledger.py ack-delivery` so the reporting obligation is closed.
 4. Let the cron agent run the generated monitor prompt: it calls `monitor_nudge.py`, then uses `message.send` only for `NUDGE_MAIN_AGENT`, `OWNER_RECONCILE`, and `BLOCKED_ESCALATE`.
 5. On `BLOCKED_ESCALATE` or `STOP_AND_DELETE`, let the cron call `openclaw_ops.py remove-monitor <task_id>` so the real OpenClaw cron job is deleted and the ledger is marked `DELETED`.
 6. Only use the split `activation` -> `init-task` -> `install-monitor` sequence when debugging or when custom orchestration really requires phase separation.

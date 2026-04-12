@@ -7,6 +7,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from reporting_contract import ensure_reporting
+
 STATE_CHOICES = ["STARTED", "CHECKPOINT", "BLOCKED", "COMPLETED"]
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -292,6 +294,8 @@ def cmd_record_update(args):
 
     ledger = load_ledger(args.ledger)
     task = find_task(ledger, args.task_id)
+    reporting = ensure_reporting(task)
+    pending_update = reporting.get("pending_updates", [])[-1] if reporting.get("pending_updates") else None
     print(json.dumps({
         "ok": True,
         "task_id": args.task_id,
@@ -316,6 +320,11 @@ def cmd_record_update(args):
         "current_checkpoint": task.get("current_checkpoint"),
         "task_status": task.get("status"),
         "validation": task.get("validation", []),
+        "pending_user_update": pending_update,
+        "ack_delivery_command": (
+            f"python3 scripts/task_ledger.py --ledger {args.ledger} ack-delivery {args.task_id} {pending_update['update_id']} --delivered-via message.send --message-ref <message-ref>"
+            if pending_update else None
+        ),
     }, ensure_ascii=False, indent=2))
 
 
@@ -619,6 +628,7 @@ def cmd_preview_tick(args):
     task = find_task(ledger, args.task_id)
     report = next(item for item in run_json["reports"] if item["task_id"] == args.task_id)
     notify = report["state"] in {"NUDGE_MAIN_AGENT", "OWNER_RECONCILE", "BLOCKED_ESCALATE"}
+    reporting = ensure_reporting(task)
     print(json.dumps({
         "task_id": args.task_id,
         "state": report["state"],
@@ -628,6 +638,7 @@ def cmd_preview_tick(args):
         "remove_monitor": report["state"] in {"BLOCKED_ESCALATE", "STOP_AND_DELETE"},
         "current_step": report.get("current_step"),
         "retry_count": report.get("retry_count", {}),
+        "pending_user_updates": reporting.get("pending_updates", []),
     }, ensure_ascii=False, indent=2))
 
 

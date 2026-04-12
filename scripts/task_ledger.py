@@ -4,6 +4,8 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
+from reporting_contract import acknowledge_update, ensure_reporting, maybe_queue_checkpoint_update, maybe_queue_external_update
+
 DEFAULT_LEDGER = Path("state/long-task-ledger.example.json")
 OWNER_REPLY_CHOICES = {
     "A_IN_PROGRESS_FORGOT_LEDGER",
@@ -274,6 +276,7 @@ def cmd_init(args):
         "next_action": args.next_action,
         "notes": args.note or [],
     }
+    ensure_reporting(task)
     ledger.setdefault("tasks", []).append(task)
     save_ledger(args.ledger, ledger)
     print(f"Initialized {args.task_id}")
@@ -293,6 +296,15 @@ def cmd_checkpoint(args):
         task.setdefault("artifacts", []).extend(args.artifact)
     if task.get("status") != "BLOCKED":
         task["blocker"] = None
+    maybe_queue_checkpoint_update(
+        task,
+        kind=args.kind,
+        summary=args.summary,
+        checkpoint=args.current_checkpoint or task.get("current_checkpoint"),
+        facts=entry_facts,
+        outputs=args.artifact,
+        next_action=args.next_action or task.get("next_action"),
+    )
     save_ledger(args.ledger, ledger)
     print(f"Recorded {args.kind} for {args.task_id}")
 
@@ -311,6 +323,15 @@ def cmd_block(args):
         task["current_checkpoint"] = args.current_checkpoint
     if args.next_action:
         task["next_action"] = args.next_action
+    maybe_queue_checkpoint_update(
+        task,
+        kind="BLOCKED",
+        summary=args.reason,
+        checkpoint=args.current_checkpoint or task.get("current_checkpoint"),
+        facts=parse_fact(args.fact),
+        next_action=args.next_action or task.get("next_action"),
+        blocker=task.get("blocker"),
+    )
     save_ledger(args.ledger, ledger)
     print(f"Blocked {args.task_id}")
 
@@ -367,6 +388,8 @@ def cmd_owner_reply(args):
     task.setdefault("heartbeat", {})["last_heartbeat_at"] = responded_at
     task.setdefault("notes", [])
 
+    queued_update = None
+
     if reply_kind == "A_IN_PROGRESS_FORGOT_LEDGER":
         task["status"] = "RUNNING"
         task["blocker"] = None
@@ -378,6 +401,14 @@ def cmd_owner_reply(args):
             task["current_checkpoint"] = args.current_checkpoint
         if args.next_action:
             task["next_action"] = args.next_action
+        queued_update = maybe_queue_checkpoint_update(
+            task,
+            kind="CHECKPOINT",
+            summary=summary,
+            checkpoint=args.current_checkpoint or task.get("current_checkpoint"),
+            facts=facts,
+            next_action=args.next_action or task.get("next_action"),
+        )
         task["notes"].append("Owner reconcile A: ledger backfilled and task remains RUNNING")
     elif reply_kind == "B_BLOCKED":
         if not args.reason or not args.safe_next_step:
@@ -394,6 +425,15 @@ def cmd_owner_reply(args):
         if args.current_checkpoint:
             task["current_checkpoint"] = args.current_checkpoint
         task["next_action"] = args.next_action or args.safe_next_step
+        queued_update = maybe_queue_checkpoint_update(
+            task,
+            kind="BLOCKED",
+            summary=summary,
+            checkpoint=args.current_checkpoint or task.get("current_checkpoint"),
+            facts=facts,
+            next_action=task.get("next_action"),
+            blocker=task.get("blocker"),
+        )
         task["notes"].append("Owner reconcile B: task truth moved to BLOCKED and is ready for escalation")
     elif reply_kind == "C_COMPLETED":
         task["status"] = "COMPLETED"
@@ -410,6 +450,15 @@ def cmd_owner_reply(args):
         elif not task.get("validation"):
             task.setdefault("validation", []).append("owner-confirmed completion; add stronger validation evidence when available")
         task["next_action"] = args.next_action or "None"
+        queued_update = maybe_queue_checkpoint_update(
+            task,
+            kind="COMPLETED",
+            summary=summary,
+            checkpoint=args.current_checkpoint or task.get("current_checkpoint"),
+            facts=facts,
+            outputs=args.artifact,
+            next_action=task.get("next_action"),
+        )
         task["notes"].append("Owner reconcile C: task closed as COMPLETED")
     elif reply_kind == "D_NO_REPLY":
         task.setdefault("heartbeat", {})["watchdog_state"] = "OWNER_RECONCILE"
@@ -429,10 +478,26 @@ def cmd_owner_reply(args):
         if args.current_checkpoint:
             task["current_checkpoint"] = args.current_checkpoint
         task["next_action"] = args.next_action or "Resume execution immediately and post the next real checkpoint"
+        queued_update = maybe_queue_checkpoint_update(
+            task,
+            kind="CHECKPOINT",
+            summary=summary,
+            checkpoint=args.current_checkpoint or task.get("current_checkpoint"),
+            facts=facts,
+            next_action=task.get("next_action"),
+        )
         task["notes"].append("Owner reconcile E: task resumed by rule; not just logged")
 
     save_ledger(args.ledger, ledger)
     print(f"Recorded owner reply {reply_kind} for {args.task_id}")
+
+
+def cmd_ack_delivery(args):
+    ledger = load_ledger(args.ledger)
+    task = ensure_task(ledger, args.task_id)
+    update = acknowledge_update(task, args.update_id, delivered_via=args.delivered_via, message_ref=args.message_ref, note=args.note)
+    save_ledger(args.ledger, ledger)
+    print(json.dumps({"ok": True, "task_id": args.task_id, "update": update}, ensure_ascii=False, indent=2))
 
 
 def cmd_external_job(args):
@@ -464,6 +529,14 @@ def cmd_external_job(args):
         key = f"{current_step}:{failure_type}"
         counts = monitoring.setdefault("retry_count", {})
         counts[key] = int(counts.get(key, 0) or 0) + 1
+    queued_update = maybe_queue_external_update(
+        task,
+        state=args.state,
+        summary=args.summary,
+        checkpoint=args.current_checkpoint or task.get("current_checkpoint"),
+        facts=facts,
+        next_action=args.next_action or task.get("next_action"),
+    )
     save_ledger(args.ledger, ledger)
     print(json.dumps({
         "ok": True,
@@ -555,6 +628,14 @@ def build_parser():
     owner_p.add_argument("--note")
     owner_p.add_argument("--message-ref")
     owner_p.set_defaults(func=cmd_owner_reply)
+
+    ack_p = sp.add_parser("ack-delivery")
+    ack_p.add_argument("task_id")
+    ack_p.add_argument("update_id")
+    ack_p.add_argument("--delivered-via", default="message.send")
+    ack_p.add_argument("--message-ref")
+    ack_p.add_argument("--note")
+    ack_p.set_defaults(func=cmd_ack_delivery)
 
     ext_p = sp.add_parser("external-job")
     ext_p.add_argument("task_id")

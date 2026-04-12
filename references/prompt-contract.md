@@ -41,6 +41,8 @@ python3 scripts/openclaw_ops.py --ledger state/long-task-ledger.json record-upda
 
 This keeps user-visible execution truth and ledger truth bound to the same operation.
 
+Each such command now also creates a durable `pending_user_update` / `reporting.pending_updates[]` obligation. Treat that as mandatory follow-up: after the requester-visible message is actually sent, run `python3 scripts/task_ledger.py --ledger state/long-task-ledger.json ack-delivery <task_id> <update_id> --message-ref <message-ref>`.
+
 ## Advanced / manual path
 
 Only fall back to separate `activation`, `init-task`, and `install-monitor` commands when you explicitly need split-phase control for debugging or custom orchestration.

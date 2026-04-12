@@ -172,6 +172,31 @@ Allowed lifecycle states:
 
 Monitor stale detection must consult this structure first. If any external job is still pending/running/retrying/switched-workflow, do not misclassify the task as stale.
 
+### Reporting delivery fields
+
+`ledger truth`、`monitor supervision`、`user-visible status update` 要分開，但必須被同一套 durable contract 綁住。
+
+每個 task 應有：
+
+- `reporting.delivery_seq`
+- `reporting.pending_updates[]`
+- `reporting.delivered_updates[]`
+
+`pending_updates[]` entry 建議至少包含：
+
+- `update_id`
+- `event_type`: `STEP_COMPLETED | EXTERNAL_JOB_COMPLETED | EXTERNAL_JOB_FAILED | WORKFLOW_SWITCH | BLOCKED_ESCALATE | COMPLETED_HANDOFF`
+- `summary`
+- `checkpoint`
+- `facts`
+- `status_block`
+- `created_at`
+- `required`
+- `delivered`
+- `delivered_at` / `message_ref`（delivery 完成後）
+
+規則：owner 一旦寫進可見進度點，就必須同時產生 `pending_updates[]`；之後只有在實際 requester-visible delivery 完成後，才可用 `ack-delivery` 將該 obligation 轉入 `delivered_updates[]`。
+
 ### Recommended monitor fields
 
 若要讓 monitor cron 做 execution nudge，建議補上：

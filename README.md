@@ -33,6 +33,7 @@ monitor cron 應主動提醒 main agent 繼續做，直到任務進入 terminal 
   - 提供可直接餵給 scripts 的 example ledger
 - `scripts/task_ledger.py`
   - 初始化 task、寫 checkpoint、標記 blocked、更新 heartbeat、ingest owner reply 並自動分流到 resume / blocked / completed
+  - 新增 `ack-delivery`：把 user-visible reporting obligation 從 `reporting.pending_updates[]` 正式結案
 - `scripts/checkpoint_timeout.py`
   - 掃描 timeout / stale progress / heartbeat due / missing activation
 - `scripts/compliance_check.py`
@@ -49,6 +50,7 @@ monitor cron 應主動提醒 main agent 繼續做，直到任務進入 terminal 
   - OpenClaw-native glue：產生 activation block、`TASK START` block、初始化 ledger、建立/移除真實 `openclaw cron` monitor job、生成 cron agent prompt、預覽 nudge/reconcile/escalate 訊息
   - 新增 `bootstrap-task` one-shot entrypoint：把 activation -> task start -> ledger init -> monitor install 綁成單一預設 lifecycle，避免 main agent 靠記憶手動 bootstrap
   - 新增 `record-update` owner wrapper：把 execution truth 的 checkpoint/block/completed 與 ledger append 綁成同一條命令，避免 main agent 做了事卻忘了寫 ledger
+  - 每次可見進度點都會回傳 `pending_user_update` + `ack_delivery_command`，強制 main agent 把 requester-visible delivery 補齊
 - `references/openclaw-native-runbook.md`
   - 明確說明 bootstrap-task / activation -> ledger init -> OpenClaw cron monitor -> message.send nudge/reconcile/escalate -> terminal cleanup 的實際操作流程
 - `references/prompt-contract.md`
@@ -331,6 +333,8 @@ python3 scripts/checkpoint_timeout.py \
 python3 scripts/compliance_check.py \
   --ledger state/long-task-ledger.example.json
 ```
+
+這個 checker 現在也會抓 `missing_user_visible_update`：如果 owner 只更新 ledger、沒有把 `reporting.pending_updates[]` 真正送給 requester 並 `ack-delivery`，就會報錯。
 
 ### Demo test
 

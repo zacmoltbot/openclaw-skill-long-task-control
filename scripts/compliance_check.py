@@ -31,6 +31,7 @@ def check_ledger(ledger):
         checkpoints = task.get("checkpoints", []) or []
         blocker = task.get("blocker")
         heartbeat = task.get("heartbeat", {})
+        reporting = task.get("reporting", {})
 
         if status in {"RUNNING", "BLOCKED", "COMPLETED"} and not activation.get("announced"):
             findings.append({"severity": "error", "code": "missing_activation", "message": f"{prefix} task active but activation.announced=false"})
@@ -48,6 +49,15 @@ def check_ledger(ledger):
 
         if status == "COMPLETED" and not task.get("validation"):
             findings.append({"severity": "warn", "code": "completed_without_validation", "message": f"{prefix} completed task has no validation evidence"})
+
+        pending_updates = reporting.get("pending_updates", []) or []
+        for update in pending_updates:
+            if update.get("required", True) and not update.get("delivered"):
+                findings.append({
+                    "severity": "error",
+                    "code": "missing_user_visible_update",
+                    "message": f"{prefix} pending required user-visible update not delivered: {update.get('update_id')} ({update.get('event_type')})",
+                })
 
         for idx, cp in enumerate(checkpoints, start=1):
             summary = cp.get("summary", "")
