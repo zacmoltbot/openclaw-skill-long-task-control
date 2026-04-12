@@ -314,11 +314,24 @@ python3 scripts/task_ledger.py --ledger state/long-task-ledger.json owner-reply 
   - `next_action` 強制改成恢復執行路徑（可自訂；未提供時用預設 resume wording）
   - 這是 repo 內可執行規則，不是文案
 
-### 尚未實作
+### 被動 Delivery Push（重要）
 
-- 真實對 Discord / message bus 送提醒（目前由 cron agent 调用 message.send 處理）
+每次 monitor tick（5 分鐘）都必須主動檢查 ledger 中 `reporting.pending_updates[]` 是否有 `delivered=false` 的項目。若有，**monitor 會馬上用 `message.send` 推到 Discord**，不需要等 main agent 主動來問。
+
+具體流程（每次 tick）：
+1. 執行 `preview-tick`，解析 `pending_user_updates_deliverable_count`
+2. 若 `> 0`，對每一筆 `delivered=false` 的更新：
+   - 用 `message.send --channel <requester_channel> --message "<update['status_block']>"` 發到 Discord
+   - 若發送成功，執行 `ack-delivery <task_id> <update_id> --delivered-via message.send` 更新 ledger `delivered=true`
+3. 若 message.send 失敗但訊息已出現在 channel，視為 delivered=true，仍更新 ledger
+
+這個機制補足了「你不來問，我就不報」的缺口。所有 `pending_user_update` 都會被 monitor 被動送達 Discord。
+
+### 尚未實作（部分已補足）
+
+- ~~真實對 Discord / message bus 送提醒（目前由 cron agent 调用 message.send 處理）~~ → **已補足**：被動 delivery push 機制由 monitor cron 主動執行，不再依賴 main agent 主動觸發
 - 真實安裝 / 刪除 crontab entry（透過 openclaw cron add/rm 處理）
 - 多 owner routing / retry queue
 - cross-process locking（retry_count 目前存在 ledger supervision metadata 中，跨 cron tick 持久化）
 
-所以目前狀態是：**repo 內已可測 end-to-end wiring（含 retry-count tracking / smart stale / owner reply ingestion / auto-routing）；外部通知與系統 cron deletion 仍保留為 integration layer。**
+所以目前狀態是：**repo 內已可測 end-to-end wiring（含被動 delivery push / retry-count tracking / smart stale / owner reply ingestion / auto-routing）；系統 cron deletion 仍保留為 integration layer。**
