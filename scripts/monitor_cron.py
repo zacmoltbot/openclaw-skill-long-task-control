@@ -149,6 +149,38 @@ def cmd_run_once(args):
         task["monitoring"]["cron_removed_at"] = now_iso()
         save_json(args.ledger, ledger)
 
+    if report["state"] in {"BLOCKED_ESCALATE", "STOP_AND_DELETE"}:
+        cron_path.unlink(missing_ok=True)
+        cron_removed = True
+        ledger = load_ledger(args.ledger)
+        task = find_task(ledger, args.task_id)
+        task.setdefault("monitoring", {})["cron_state"] = "DELETED"
+        task["monitoring"]["cron_removed_at"] = now_iso()
+        save_json(args.ledger, ledger)
+
+    # Handle NUDGE_MAIN_AGENT and OWNER_RECONCILE: actually send the nudge via openclaw agent
+    owner_session_key = report.get("action_payload", {}).get("session_key") or \
+                        report.get("action_payload", {}).get("facts", {}).get("owner_session_key") or \
+                        f"agent:main:discord:channel:{task.get('channel', 'discord')}"
+    nudge_sent = False
+    if report["state"] in {"NUDGE_MAIN_AGENT", "OWNER_RECONCILE"}:
+        nudge_msg = report.get("action_payload", {}).get("message") or format_fallback_nudge(report, task)
+        nudge_result = subprocess.run(
+            ["openclaw", "agent", "--to", owner_session_key, "--message", nudge_msg, "--deliver"],
+            check=False, text=True, capture_output=True, timeout=30,
+        )
+        nudge_sent = nudge_result.returncode == 0
+        # Record in monitoring that nudge was sent
+        ledger = load_ledger(args.ledger)
+        task = find_task(ledger, args.task_id)
+        monitoring = task.setdefault("monitoring", {})
+        monitoring["last_resume_request_at"] = now_iso()
+        monitoring["last_resume_request_via"] = "openclaw_agent_deliver"
+        monitoring["last_resume_request_result"] = "ok" if nudge_sent else "failed"
+        if nudge_result.stdout:
+            monitoring["last_resume_request_output"] = nudge_result.stdout[:200]
+        save_json(args.ledger, ledger)
+
     print(json.dumps({
         "ok": True,
         "task_id": args.task_id,
@@ -157,6 +189,8 @@ def cmd_run_once(args):
         "cron_file": str(cron_path),
         "delivery_push_count": len(delivery_push_ids),
         "delivery_push_update_ids": delivery_push_ids,
+        "nudge_sent": nudge_sent,
+        "nudge_sent_via": "openclaw_agent_deliver" if nudge_sent else None,
     }, ensure_ascii=False, indent=2))
 
 
