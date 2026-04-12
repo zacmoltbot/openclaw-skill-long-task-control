@@ -209,6 +209,8 @@ Failure types:
 
 Use for the first execution nudge: ask the main agent to resume execution, post a checkpoint, or explicitly mark `BLOCKED` / `FAILED` / `COMPLETED`.
 
+**Step-completion stall (GAP-1):** A new class of stall is detected when the current step's workflow sub-state is terminal (DONE/COMPLETED/FAILED/BLOCKED) but the task hasn't moved to the next step and no new checkpoint arrives within one check interval (5 minutes). This catches the case where step-01 completes (e.g. external job done, checkpoint written) but step-02 never starts — previously the monitor would say OK forever because `pending_external` flips False after the external job completes and `last_checkpoint_at` is recent. With GAP-1 detection, the monitor fires `NUDGE_MAIN_AGENT` on the first check after the step enters terminal state and goes stale, then escalates to `BLOCKED_ESCALATE` after 3 checks. This works even for tasks with no external jobs at all.
+
 ### `OWNER_RECONCILE`
 
 Use when stale progress persists after prior nudges. This is the stale -> query owner state.

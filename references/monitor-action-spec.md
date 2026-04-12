@@ -279,6 +279,7 @@ owner / scheduler next step：
 - `DELETE_REQUESTED` marker
 - **【新】** retry-count tracking：`monitoring.retry_count` dict，per-step per-failure-type，3 次同樣失敗 → immediate BLOCKED_ESCALATE
 - **【新】** smart stale detection：外部 task 回傳 pending（RunningHub queue/pending）或 progress_at 仍在更新中 → 不觸發 STALE_PROGRESS / HEARTBEAT_DUE
+- **【新】** GAP-1 step stall detection：current step 的 workflow sub-state 達到 terminal（DONE/COMPLETED/FAILED/BLOCKED）但 task 沒有推進到下一個 step，也沒有新 checkpoint → 馬上 NUDGE_MAIN_AGENT（第一個檢查），3 次後 BLOCKED_ESCALATE；適用於完全無 external jobs 的 task
 - **【新】** 5 分鐘 monitoring interval（從 10 分鐘改為 5 分鐘）
 - **【新】** BLOCKED_ESCALATE notification 一次交代清楚：step / retry 次數 / 嘗試了什麼 / 為什麼失敗 / 建議下一步
 - demo E2E test 驗證 stale -> owner query -> owner reply -> resume / blocked / completed routing
