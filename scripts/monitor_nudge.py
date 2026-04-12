@@ -272,8 +272,17 @@ def evaluate_task(task, now):
             "message": "Observed truth is inconsistent. First observe the real world and backfill truth; do not guess pending/OK from partial data.",
         })
 
-    if status in TERMINAL_STATUSES and derived.get("truth_state") != "INCONSISTENT":
-        candidates.append({"state": "STOP_AND_DELETE", "reason": f"task status is terminal ({status})", "action": "delete_monitor_cron"})
+    if status in TERMINAL_STATUSES:
+        inconsistencies = derived.get("inconsistencies", [])
+        # "completed_but_steps_not_done" is an informational marker (steps were skipped),
+        # not a real recoverable inconsistency. For monitoring purposes, treat terminal
+        # tasks with only this inconsistency as clean terminal → STOP_AND_DELETE.
+        non_step_inconsistencies = [i for i in inconsistencies if i != "task:completed_but_steps_not_done" and not i.startswith("task:completed")]
+        if non_step_inconsistencies or derived.get("truth_state") != "INCONSISTENT":
+            # Only real inconsistencies block STOP_AND_DELETE
+            candidates.append({"state": "TRUTH_INCONSISTENT", "reason": f"task status is terminal ({status}) but has unresolved inconsistencies", "action": "request_owner_reconcile_then_delete"})
+        else:
+            candidates.append({"state": "STOP_AND_DELETE", "reason": f"task status is terminal ({status})", "action": "delete_monitor_cron"})
 
     if derived.get("suspicious_external_jobs"):
         candidates.append({
