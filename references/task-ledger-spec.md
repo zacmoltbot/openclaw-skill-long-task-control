@@ -138,6 +138,40 @@ state/tasks/<task_id>.json
 - `heartbeat.timeout_sec`
 - `next_action`
 
+### External async job fields
+
+對於 RunningHub / queue / remote render 這類外部 async job，task 內要保留 `external_jobs[]`：
+
+```json
+{
+  "provider": "runninghub",
+  "job_id": "rh-123",
+  "status": "RUNNING",
+  "workflow": "wf-a",
+  "app": "app-a",
+  "pending_external": true,
+  "submitted_at": "2026-04-12T12:00:00+08:00",
+  "updated_at": "2026-04-12T12:05:00+08:00",
+  "failure_count": 1,
+  "switch_count": 0,
+  "history": [
+    {"at": "...", "state": "SUBMITTED", "summary": "...", "facts": {}},
+    {"at": "...", "state": "RUNNING", "summary": "...", "facts": {}}
+  ]
+}
+```
+
+Allowed lifecycle states:
+- `SUBMITTED`
+- `PENDING`
+- `RUNNING`
+- `FAILED`
+- `RETRYING`
+- `SWITCHED_WORKFLOW`
+- `COMPLETED`
+
+Monitor stale detection must consult this structure first. If any external job is still pending/running/retrying/switched-workflow, do not misclassify the task as stale.
+
 ### Recommended monitor fields
 
 若要讓 monitor cron 做 execution nudge，建議補上：

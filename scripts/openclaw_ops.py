@@ -17,6 +17,7 @@ DEFAULT_CHANNEL = "discord"
 DEFAULT_TIMEZONE = "Asia/Taipei"
 DEFAULT_AGENT = "main"
 DEFAULT_SESSION_KEY = "agent:main:discord:channel:{channel}"
+DEFAULT_MONITOR_EVERY = "5m"
 
 ACTIVATION_TEMPLATE = """ACTIVATED
 - skill: long-task-control
@@ -144,7 +145,7 @@ def format_notification(task, report):
             f"state={state}",
             f"reason={report['reason']}",
             f"next_action={next_action}",
-            "請 main agent 先自救：resume / rebuild-safe-step / reconcile 缺漏 checkpoint；真的推不動才標記 BLOCKED。",
+            "請 main agent 立刻回來續行，先自救：resume / rebuild-safe-step / reconcile 缺漏 checkpoint；真的推不動才標記 BLOCKED。",
         ])
     if state == "OWNER_RECONCILE":
         branches = facts.get("branches") or {}
@@ -404,17 +405,20 @@ def _run_cron_add_with_retry(add_cmd, ledger_path, task_id, disabled):
             ledger = load_ledger(ledger_path)
             task = find_task(ledger, task_id)
             task.setdefault("monitoring", {})["cron_state"] = "INSTALL_FAILED"
+            task.setdefault("monitoring", {})["install_signal"] = "INSTALL_FAILED"
             task.setdefault("monitoring", {})["cron_install_error"] = err_msg
             save_ledger(ledger_path, ledger)
-            # Emit a structured error block on stderr so main agent can parse it
-            sys.stderr.write(
-                f"INSTALL_FAILED task_id={task_id} "
-                f"reason=cron_add_failed_after_retry "
-                f"exit_code={proc.returncode} "
-                f"stderr={shlex.quote(proc.stderr[:200].strip())}\n"
-            )
+            payload = {
+                "ok": False,
+                "signal": "INSTALL_FAILED",
+                "task_id": task_id,
+                "reason": "cron_add_failed_after_retry",
+                "exit_code": proc.returncode,
+                "stderr": proc.stderr[:200].strip(),
+            }
+            sys.stderr.write(json.dumps(payload, ensure_ascii=False) + "\n")
             sys.stderr.flush()
-            raise SystemExit(1)  # non-zero exit, ledger already updated above
+            raise SystemExit(1)
     return parse_json_from_mixed_output(proc.stdout)
 
 
@@ -487,6 +491,7 @@ def cmd_activate_task(args):
     update_monitor_metadata(
         task,
         cron_state="ACTIVE" if not install_ns.disabled else "DISABLED",
+        install_signal="INSTALL_OK",
         openclaw_cron_job_id=payload["id"],
         openclaw_cron_name=name,
         openclaw_session_key=session_key,
@@ -559,6 +564,7 @@ def cmd_install_monitor(args):
     update_monitor_metadata(
         task,
         cron_state="ACTIVE" if not args.disabled else "DISABLED",
+        install_signal="INSTALL_OK",
         openclaw_cron_job_id=payload["id"],
         openclaw_cron_name=name,
         openclaw_session_key=session_key,
@@ -650,10 +656,10 @@ def build_parser():
         parser.add_argument("--artifact", action="append")
         parser.add_argument("--note", action="append")
         parser.add_argument("--next-action", required=True)
-        parser.add_argument("--expected-interval-sec", type=int, default=900)
+        parser.add_argument("--expected-interval-sec", type=int, default=300)
         parser.add_argument("--timeout-sec", type=int, default=1800)
         parser.add_argument("--nudge-after-sec", type=int)
-        parser.add_argument("--renotify-interval-sec", type=int, default=900)
+        parser.add_argument("--renotify-interval-sec", type=int, default=300)
         parser.add_argument("--max-nudges", type=int, default=3)
         parser.add_argument("--escalate-after-nudges", type=int, default=2)
         parser.add_argument("--blocked-escalate-after-sec", type=int, default=1800)
@@ -667,7 +673,7 @@ def build_parser():
         parser.add_argument("--agent", default=DEFAULT_AGENT)
         parser.add_argument("--session", default="isolated")
         parser.add_argument("--wake", default="now")
-        parser.add_argument("--every", default="5m")
+        parser.add_argument("--every", default=DEFAULT_MONITOR_EVERY)
         parser.add_argument("--cron-expr")
         parser.add_argument("--tz", default=DEFAULT_TIMEZONE)
         parser.add_argument("--timeout-seconds", type=int, default=240)

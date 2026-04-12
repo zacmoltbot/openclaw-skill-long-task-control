@@ -85,6 +85,8 @@ Recommended file:
 state/long-task-ledger.json
 ```
 
+For external async jobs, keep durable truth under `external_jobs[]` on the task record. Submitted / pending / running / failed / retrying / switched-workflow / completed must be written there via `python3 scripts/task_ledger.py --ledger ... external-job ...` instead of relying on chat memory.
+
 This repo ships an example state file:
 
 ```text
@@ -126,6 +128,7 @@ Checkpoint updates should advance:
 
 - `last_checkpoint_at`
 - `heartbeat.last_progress_at`
+- for external async work, the matching `external_jobs[]` record as the durable source of truth
 
 ### Heartbeat
 
@@ -401,7 +404,8 @@ If validation fails, report `BLOCKED` or a failed checkpoint instead of `COMPLET
 
 When using this skill inside OpenClaw, follow this exact flow:
 
-1. Prefer the one-shot bootstrap entrypoint: `python3 scripts/openclaw_ops.py --ledger state/long-task-ledger.json bootstrap-task <task_id> ...`. Default monitor check interval is **5 minutes** (previously 10 minutes).
+1. Prefer the one-shot bootstrap entrypoint: `python3 scripts/openclaw_ops.py --ledger state/long-task-ledger.json bootstrap-task <task_id> ...`. Default monitor check interval is **5 minutes**.
+2. Product rule: if total task age exceeds **60 minutes**, treat it as `BLOCKED_ESCALATE` and stop/delete the monitor cron in the same monitor cycle.
 2. That bootstrap should be treated as the default lifecycle entry: it returns the activation block, the `TASK START` block, initializes the ledger, and installs a **real OpenClaw cron monitor** in one operation.
 3. Keep writing owner-truth checkpoints with `python3 scripts/openclaw_ops.py --ledger state/long-task-ledger.json record-update <STARTED|CHECKPOINT|BLOCKED|COMPLETED> ...` plus `task_ledger.py owner-reply` when reconcile input arrives.
 4. Let the cron agent run the generated monitor prompt: it calls `monitor_nudge.py`, then uses `message.send` only for `NUDGE_MAIN_AGENT`, `OWNER_RECONCILE`, and `BLOCKED_ESCALATE`.

@@ -46,7 +46,19 @@ SUPERVISION_ALLOWED_KEYS = {
     "last_resume_request_at",
     "recovery_attempt_count",
     "retry_count",
+    "cron_install_error",
+    "install_signal",
 }
+EXTERNAL_JOB_STATES = {
+    "SUBMITTED",
+    "PENDING",
+    "RUNNING",
+    "FAILED",
+    "RETRYING",
+    "SWITCHED_WORKFLOW",
+    "COMPLETED",
+}
+PENDING_EXTERNAL_STATES = {"SUBMITTED", "PENDING", "RUNNING", "RETRYING", "SWITCHED_WORKFLOW"}
 
 
 def now_iso():
@@ -115,6 +127,75 @@ def mark_owner_response(task, reply_kind, responded_at):
     return monitoring
 
 
+def ensure_external_job(task, provider, job_id, workflow=None, app=None):
+    task.setdefault("external_jobs", [])
+    for job in task["external_jobs"]:
+        if job.get("provider") == provider and job.get("job_id") == job_id:
+            if workflow:
+                job["workflow"] = workflow
+            if app:
+                job["app"] = app
+            return job
+    job = {
+        "provider": provider,
+        "job_id": job_id,
+        "status": "SUBMITTED",
+        "submitted_at": now_iso(),
+        "updated_at": now_iso(),
+        "workflow": workflow,
+        "app": app,
+        "pending_external": True,
+        "history": [],
+        "failure_count": 0,
+        "switch_count": 0,
+    }
+    task["external_jobs"].append(job)
+    return job
+
+
+def record_external_job_event(task, *, provider, job_id, state, summary, facts=None, workflow=None, app=None, current_checkpoint=None, next_action=None):
+    if state not in EXTERNAL_JOB_STATES:
+        raise SystemExit(f"Unsupported external job state: {state}")
+    job = ensure_external_job(task, provider, job_id, workflow=workflow, app=app)
+    at = now_iso()
+    previous_status = job.get("status")
+    job["status"] = state
+    job["updated_at"] = at
+    job["pending_external"] = state in PENDING_EXTERNAL_STATES
+    if workflow:
+        job["workflow"] = workflow
+    if app:
+        job["app"] = app
+    event = {
+        "at": at,
+        "state": state,
+        "summary": summary,
+        "facts": facts or {},
+    }
+    if previous_status:
+        event["from_status"] = previous_status
+    job.setdefault("history", []).append(event)
+    if state == "FAILED":
+        job["failure_count"] = int(job.get("failure_count", 0) or 0) + 1
+    if state == "SWITCHED_WORKFLOW":
+        job["switch_count"] = int(job.get("switch_count", 0) or 0) + 1
+
+    cp_facts = {
+        "external_provider": provider,
+        "job_id": job_id,
+        "external_state": state.lower(),
+        "latest_status": state.lower(),
+    }
+    cp_facts.update(facts or {})
+    append_checkpoint(task, kind="CHECKPOINT", summary=summary, facts=cp_facts, touch_progress=state not in {"PENDING", "RUNNING", "RETRYING"})
+    task.setdefault("heartbeat", {})["last_heartbeat_at"] = at
+    if current_checkpoint:
+        task["current_checkpoint"] = current_checkpoint
+    if next_action:
+        task["next_action"] = next_action
+    return job
+
+
 def cmd_list(args):
     ledger = load_ledger(args.ledger)
     for task in ledger.get("tasks", []):
@@ -142,6 +223,7 @@ def cmd_init(args):
         "status": "RUNNING",
         "channel": args.channel,
         "owner": args.owner,
+        "created_at": started_at,
         "activation": {
             "announced": args.activation_announced,
             "announced_at": args.activation_at or started_at,
@@ -182,11 +264,13 @@ def cmd_init(args):
             "last_escalated_at": None,
             "blocked_escalate_after_sec": args.blocked_escalate_after_sec or max(args.timeout_sec, args.expected_interval_sec),
             "cron_state": "ACTIVE",
-            "retry_count": {},  # {"step_id:failure_type": count} — 3 of same → BLOCKED_ESCALATE
+            "retry_count": {},
+            "install_signal": "NOT_REQUESTED",
         },
         "validation": [],
         "blocker": None,
         "artifacts": args.artifact or [],
+        "external_jobs": [],
         "next_action": args.next_action,
         "notes": args.note or [],
     }
@@ -258,10 +342,9 @@ def cmd_supervisor_update(args):
         key, value = item.split("=", 1)
         key = key.strip()
         if key not in SUPERVISION_ALLOWED_KEYS:
-            raise SystemExit(
-                f"Disallowed supervision key: {key}. Monitor may update supervision metadata only, not task truth."
-            )
-        monitoring[key] = json.loads(value) if value.strip().startswith(("{", "[", '"')) or value.strip() in {"true", "false", "null"} else value.strip()
+            raise SystemExit(f"Disallowed supervision key: {key}. Monitor may update supervision metadata only, not task truth.")
+        raw = value.strip()
+        monitoring[key] = json.loads(raw) if raw.startswith(("{", "[", '"')) or raw in {"true", "false", "null"} else raw
 
     save_ledger(args.ledger, ledger)
     print(f"Supervisor metadata updated for {args.task_id}")
@@ -352,6 +435,47 @@ def cmd_owner_reply(args):
     print(f"Recorded owner reply {reply_kind} for {args.task_id}")
 
 
+def cmd_external_job(args):
+    ledger = load_ledger(args.ledger)
+    task = ensure_task(ledger, args.task_id)
+    facts = parse_fact(args.fact)
+    if args.failure_type:
+        facts.setdefault("failure_type", args.failure_type)
+    if args.workflow:
+        facts.setdefault("workflow", args.workflow)
+    if args.app:
+        facts.setdefault("app", args.app)
+    job = record_external_job_event(
+        task,
+        provider=args.provider,
+        job_id=args.job_id,
+        state=args.state,
+        summary=args.summary,
+        facts=facts,
+        workflow=args.workflow,
+        app=args.app,
+        current_checkpoint=args.current_checkpoint,
+        next_action=args.next_action,
+    )
+    if args.state == "FAILED":
+        monitoring = task.setdefault("monitoring", {})
+        current_step = args.current_checkpoint or task.get("current_checkpoint") or "unknown"
+        failure_type = args.failure_type or "EXTERNAL_WAIT"
+        key = f"{current_step}:{failure_type}"
+        counts = monitoring.setdefault("retry_count", {})
+        counts[key] = int(counts.get(key, 0) or 0) + 1
+    save_ledger(args.ledger, ledger)
+    print(json.dumps({
+        "ok": True,
+        "task_id": args.task_id,
+        "provider": args.provider,
+        "job_id": args.job_id,
+        "state": args.state,
+        "pending_external": job.get("pending_external"),
+        "job": job,
+    }, ensure_ascii=False, indent=2))
+
+
 def build_parser():
     p = argparse.ArgumentParser(description="Manage long-task ledger state")
     p.add_argument("--ledger", type=Path, default=DEFAULT_LEDGER)
@@ -374,7 +498,7 @@ def build_parser():
     init_p.add_argument("--artifact", action="append")
     init_p.add_argument("--note", action="append")
     init_p.add_argument("--next-action", required=True)
-    init_p.add_argument("--expected-interval-sec", type=int, default=900)
+    init_p.add_argument("--expected-interval-sec", type=int, default=300)
     init_p.add_argument("--timeout-sec", type=int, default=1800)
     init_p.add_argument("--nudge-after-sec", type=int)
     init_p.add_argument("--renotify-interval-sec", type=int)
@@ -431,6 +555,20 @@ def build_parser():
     owner_p.add_argument("--note")
     owner_p.add_argument("--message-ref")
     owner_p.set_defaults(func=cmd_owner_reply)
+
+    ext_p = sp.add_parser("external-job")
+    ext_p.add_argument("task_id")
+    ext_p.add_argument("--provider", required=True)
+    ext_p.add_argument("--job-id", required=True)
+    ext_p.add_argument("--state", required=True, choices=sorted(EXTERNAL_JOB_STATES))
+    ext_p.add_argument("--summary", required=True)
+    ext_p.add_argument("--workflow")
+    ext_p.add_argument("--app")
+    ext_p.add_argument("--failure-type", choices=["EXTERNAL_WAIT", "EXECUTION_ERROR"])
+    ext_p.add_argument("--current-checkpoint")
+    ext_p.add_argument("--next-action")
+    ext_p.add_argument("--fact", action="append")
+    ext_p.set_defaults(func=cmd_external_job)
 
     return p
 
