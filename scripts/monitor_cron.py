@@ -159,12 +159,15 @@ def cmd_run_once(args):
         save_json(args.ledger, ledger)
 
     # Handle NUDGE_MAIN_AGENT and OWNER_RECONCILE: actually send the nudge via openclaw agent
-    owner_session_key = report.get("action_payload", {}).get("session_key") or \
-                        report.get("action_payload", {}).get("facts", {}).get("owner_session_key") or \
+    # Need task for default channel fallback
+    ledger = load_ledger(args.ledger)
+    task = find_task(ledger, args.task_id)
+    owner_session_key = (report.get("action_payload") or {}).get("session_key") or \
+                        (report.get("action_payload") or {}).get("facts", {}).get("owner_session_key") or \
                         f"agent:main:discord:channel:{task.get('channel', 'discord')}"
     nudge_sent = False
     if report["state"] in {"NUDGE_MAIN_AGENT", "OWNER_RECONCILE"}:
-        nudge_msg = report.get("action_payload", {}).get("message") or format_fallback_nudge(report, task)
+        nudge_msg = (report.get("action_payload") or {}).get("message") or format_fallback_nudge(report, task)
         nudge_result = subprocess.run(
             ["openclaw", "agent", "--to", owner_session_key, "--message", nudge_msg, "--deliver"],
             check=False, text=True, capture_output=True, timeout=30,
