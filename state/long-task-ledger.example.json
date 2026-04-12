@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updated_at": "2026-04-11T15:55:32+08:00",
+  "updated_at": "2026-04-12T14:41:52+08:00",
   "tasks": [
     {
       "task_id": "repo-upgrade-20260411-a",
@@ -56,7 +56,7 @@
         "timeout_sec": 1800,
         "last_progress_at": "2026-04-11T14:20:00+08:00",
         "last_heartbeat_at": "2026-04-11T14:25:00+08:00",
-        "watchdog_state": "OWNER_RECONCILE"
+        "watchdog_state": "BLOCKED_ESCALATE"
       },
       "monitoring": {
         "nudge_after_sec": 1800,
@@ -66,32 +66,45 @@
         "owner_query_at": "2026-04-11T15:55:32+08:00",
         "owner_response_at": null,
         "owner_response_kind": null,
-        "last_escalated_at": null,
-        "last_action_at": "2026-04-11T15:55:32+08:00",
-        "last_action_state": "OWNER_RECONCILE",
-        "last_action_reason": "task already nudged 2 times with no fresh checkpoint; stale progress must escalate to owner reconciliation before blocker escalation",
-        "last_action_kind": "query_owner_and_force_reconciliation",
+        "last_escalated_at": "2026-04-12T14:41:52+08:00",
+        "last_action_at": "2026-04-12T14:41:52+08:00",
+        "last_action_state": "BLOCKED_ESCALATE",
+        "last_action_reason": "task exceeded 60-minute wall clock limit (88912s > 3600s)",
+        "last_action_kind": "enforce_max_task_age_then_delete_cron",
         "last_action_payload": {
-          "kind": "OWNER_RECONCILE",
+          "kind": "BLOCKED_ESCALATE",
           "deliver_to": "coding_agent",
           "channel": "discord",
-          "title": "Owner reconciliation for repo-upgrade-20260411-a",
-          "message": "Task repo-upgrade-20260411-a still has stale progress after prior nudges. Query the owner now and reconcile task truth. If the owner forgot to update the ledger, add the missing checkpoint. If blocked, escalate. If completed, write COMPLETED with validation. If the owner admits the work was forgotten/not being done, immediately resume execution or require the owner to resume now.",
+          "title": "⚠️ Blocked escalation for repo-upgrade-20260411-a",
+          "message": "Task repo-upgrade-20260411-a is BLOCKED. step=implement retry={'implement:TIMEOUT': 2} reason=task exceeded 60-minute wall clock limit (88912s > 3600s) safe_next_step=None",
           "facts": {
             "task_id": "repo-upgrade-20260411-a",
-            "status": "RUNNING",
-            "reason": "task already nudged 2 times with no fresh checkpoint; stale progress must escalate to owner reconciliation before blocker escalation",
-            "next_action": "Implement helper scripts",
-            "branches": {
-              "A_IN_PROGRESS_FORGOT_LEDGER": "append missed checkpoint(s), refresh next_action, keep RUNNING",
-              "B_BLOCKED": "write blocker truth and escalate via BLOCKED_ESCALATE",
-              "C_COMPLETED": "write COMPLETED plus validation evidence",
-              "D_NO_REPLY": "seek external evidence before changing task truth",
-              "E_FORGOT_OR_NOT_DOING": "do not only log it; immediately push resume execution / 補做 path"
-            }
+            "current_checkpoint": "implement",
+            "reason": "task exceeded 60-minute wall clock limit (88912s > 3600s)",
+            "blocker": {},
+            "retry_count": {
+              "implement:TIMEOUT": 2
+            },
+            "recent_attempts": [
+              {
+                "at": "2026-04-11T15:25:32+08:00",
+                "state": "NUDGE_MAIN_AGENT",
+                "reason": "task has no fresh checkpoint for 3932s; main agent should resume, post checkpoint, or mark COMPLETED/FAILED/BLOCKED"
+              },
+              {
+                "at": "2026-04-11T15:55:32+08:00",
+                "state": "OWNER_RECONCILE",
+                "reason": "task already nudged 2 times with no fresh checkpoint; stale progress must escalate to owner reconciliation before blocker escalation"
+              },
+              {
+                "at": "2026-04-12T14:41:49+08:00",
+                "state": "BLOCKED_ESCALATE",
+                "reason": "task exceeded 60-minute wall clock limit (88909s > 3600s)"
+              }
+            ],
+            "suspicious_external_jobs": []
           },
-          "monitor_contract": "monitor_only_updates_supervision_metadata",
-          "created_at": "2026-04-11T15:55:32+08:00"
+          "created_at": "2026-04-12T14:41:52+08:00"
         },
         "action_log": [
           {
@@ -107,11 +120,28 @@
             "reason": "task already nudged 2 times with no fresh checkpoint; stale progress must escalate to owner reconciliation before blocker escalation",
             "action": "query_owner_and_force_reconciliation",
             "payload_kind": "OWNER_RECONCILE"
+          },
+          {
+            "at": "2026-04-12T14:41:49+08:00",
+            "state": "BLOCKED_ESCALATE",
+            "reason": "task exceeded 60-minute wall clock limit (88909s > 3600s)",
+            "action": "enforce_max_task_age_then_delete_cron",
+            "payload_kind": "BLOCKED_ESCALATE"
+          },
+          {
+            "at": "2026-04-12T14:41:52+08:00",
+            "state": "BLOCKED_ESCALATE",
+            "reason": "task exceeded 60-minute wall clock limit (88912s > 3600s)",
+            "action": "enforce_max_task_age_then_delete_cron",
+            "payload_kind": "BLOCKED_ESCALATE"
           }
         ],
         "cron_owner": "long-task-monitor",
-        "cron_state": "ACTIVE",
-        "nudge_count": 2
+        "cron_state": "DELETE_REQUESTED",
+        "nudge_count": 2,
+        "retry_count": {
+          "implement:TIMEOUT": 2
+        }
       },
       "validation": [],
       "blocker": null,
@@ -187,23 +217,22 @@
         "renotify_interval_sec": 900,
         "last_nudge_at": null,
         "last_escalated_at": "2026-04-11T10:50:00+08:00",
-        "last_action_at": "2026-04-11T15:55:32+08:00",
+        "last_action_at": "2026-04-12T14:41:52+08:00",
         "last_action_state": "STOP_AND_DELETE",
-        "last_action_reason": "seg03 upstream job failed; escalation already sent, monitor cron should self-delete",
+        "last_action_reason": "seg03 upstream job failed; escalation already sent",
         "last_action_kind": "delete_monitor_cron",
         "last_action_payload": {
           "kind": "STOP_AND_DELETE",
           "deliver_to": "long-task-monitor",
           "channel": "discord",
           "title": "Stop monitor for render-20260411-b",
-          "message": "Task render-20260411-b is terminal or no longer requires supervision. Delete/disable the monitor cron now.",
+          "message": "Task render-20260411-b is terminal or no longer requires supervision. Delete cron now.",
           "facts": {
             "task_id": "render-20260411-b",
-            "status": "BLOCKED",
-            "reason": "seg03 upstream job failed; escalation already sent, monitor cron should self-delete"
+            "reason": "seg03 upstream job failed; escalation already sent",
+            "status": "BLOCKED"
           },
-          "monitor_contract": "monitor_only_updates_supervision_metadata",
-          "created_at": "2026-04-11T15:55:32+08:00"
+          "created_at": "2026-04-12T14:41:52+08:00"
         },
         "action_log": [
           {
@@ -219,10 +248,25 @@
             "reason": "seg03 upstream job failed; escalation already sent, monitor cron should self-delete",
             "action": "delete_monitor_cron",
             "payload_kind": "STOP_AND_DELETE"
+          },
+          {
+            "at": "2026-04-12T14:41:49+08:00",
+            "state": "STOP_AND_DELETE",
+            "reason": "seg03 upstream job failed; escalation already sent",
+            "action": "delete_monitor_cron",
+            "payload_kind": "STOP_AND_DELETE"
+          },
+          {
+            "at": "2026-04-12T14:41:52+08:00",
+            "state": "STOP_AND_DELETE",
+            "reason": "seg03 upstream job failed; escalation already sent",
+            "action": "delete_monitor_cron",
+            "payload_kind": "STOP_AND_DELETE"
           }
         ],
         "cron_owner": "long-task-monitor",
-        "cron_state": "DELETE_REQUESTED"
+        "cron_state": "DELETE_REQUESTED",
+        "retry_count": {}
       },
       "validation": [],
       "blocker": {
@@ -303,7 +347,7 @@
         "renotify_interval_sec": 900,
         "last_nudge_at": null,
         "last_escalated_at": null,
-        "last_action_at": "2026-04-11T15:55:32+08:00",
+        "last_action_at": "2026-04-12T14:41:52+08:00",
         "last_action_state": "STOP_AND_DELETE",
         "last_action_reason": "task status is terminal (COMPLETED); monitor cron should self-delete",
         "last_action_kind": "delete_monitor_cron",
@@ -312,14 +356,13 @@
           "deliver_to": "long-task-monitor",
           "channel": "discord",
           "title": "Stop monitor for pkg-20260411-c",
-          "message": "Task pkg-20260411-c is terminal or no longer requires supervision. Delete/disable the monitor cron now.",
+          "message": "Task pkg-20260411-c is terminal or no longer requires supervision. Delete cron now.",
           "facts": {
             "task_id": "pkg-20260411-c",
-            "status": "COMPLETED",
-            "reason": "task status is terminal (COMPLETED); monitor cron should self-delete"
+            "reason": "task status is terminal (COMPLETED); monitor cron should self-delete",
+            "status": "COMPLETED"
           },
-          "monitor_contract": "monitor_only_updates_supervision_metadata",
-          "created_at": "2026-04-11T15:55:32+08:00"
+          "created_at": "2026-04-12T14:41:52+08:00"
         },
         "action_log": [
           {
@@ -335,10 +378,25 @@
             "reason": "task status is terminal (COMPLETED); monitor cron should self-delete",
             "action": "delete_monitor_cron",
             "payload_kind": "STOP_AND_DELETE"
+          },
+          {
+            "at": "2026-04-12T14:41:49+08:00",
+            "state": "STOP_AND_DELETE",
+            "reason": "task status is terminal (COMPLETED); monitor cron should self-delete",
+            "action": "delete_monitor_cron",
+            "payload_kind": "STOP_AND_DELETE"
+          },
+          {
+            "at": "2026-04-12T14:41:52+08:00",
+            "state": "STOP_AND_DELETE",
+            "reason": "task status is terminal (COMPLETED); monitor cron should self-delete",
+            "action": "delete_monitor_cron",
+            "payload_kind": "STOP_AND_DELETE"
           }
         ],
         "cron_owner": "long-task-monitor",
-        "cron_state": "DELETE_REQUESTED"
+        "cron_state": "DELETE_REQUESTED",
+        "retry_count": {}
       },
       "validation": [
         "unzip -t /tmp/pkg-20260411-c/build.zip passed"

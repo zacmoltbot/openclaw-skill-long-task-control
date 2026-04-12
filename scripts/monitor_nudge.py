@@ -21,7 +21,9 @@ FAILURE_TYPES = {
     "EXECUTION_ERROR": "EXECUTION_ERROR",
     "EXTERNAL_WAIT": "EXTERNAL_WAIT",
     "MISSING_EXTERNAL_EVIDENCE": "MISSING_EXTERNAL_EVIDENCE",
+    "STEP_COMPLETED_BUT_STALLING": "STEP_COMPLETED_BUT_STALLING",
 }
+STALLING_AFTER_SEC = 300  # one check interval; nudge faster for step-completion stalls
 MAX_RETRY_COUNT = 3
 MAX_TASK_AGE_SEC = 3600
 PENDING_EXTERNAL_STATES = {"SUBMITTED", "PENDING", "RUNNING", "RETRYING", "SWITCHED_WORKFLOW"}
@@ -202,6 +204,28 @@ def has_pending_external_return(task):
     for entry in action_log[-5:]:
         entry_at = parse_ts(entry.get("at"))
         if entry_at and (now - entry_at).total_seconds() < 3600 and entry.get("failure_type") == FAILURE_TYPES["EXTERNAL_WAIT"]:
+            return True
+    return False
+
+
+def is_workflow_step_terminal(workflow, step_id):
+    """Return True if the named step has a terminal state in the workflow list."""
+    if not step_id or not workflow:
+        return False
+    for step in workflow:
+        if step.get("id") == step_id or step.get("step_id") == step_id:
+            state = str(step.get("state", "")).upper()
+            return state in {"DONE", "COMPLETED", "FAILED", "BLOCKED"}
+    return False
+
+
+def has_external_job_with_evidence(task):
+    """Return True if the task has at least one external job with provider evidence."""
+    for job in task.get("external_jobs", []):
+        state = str(job.get("status", "")).upper()
+        if state not in PENDING_EXTERNAL_STATES and not job.get("pending_external"):
+            continue
+        if collect_provider_evidence(job):
             return True
     return False
 
@@ -485,6 +509,30 @@ def evaluate_task(task, now):
             candidates.append({"state": "OWNER_RECONCILE", "reason": f"task already nudged {nudge_count} times with no fresh checkpoint", "action": "query_owner_and_force_reconciliation"})
         else:
             candidates.append({"state": "NUDGE_MAIN_AGENT", "reason": f"task has no fresh checkpoint for {last_progress_age}s; main agent should resume / checkpoint / close loop", "action": "send_execution_nudge" if should_renotify else "nudge_already_sent_wait_for_interval"})
+
+    # GAP-1 fix: "step completed but next step hasn't started" stall detection.
+    # When the current checkpoint's workflow sub-state is terminal (DONE/COMPLETED/FAILED/BLOCKED),
+    # no new checkpoint arrives within one check interval, and no external job is legitimately pending,
+    # the task has stalled mid-stream.  This fires on the 5-min cadence regardless of nudge thresholds.
+    if status in ACTIVE_STATUSES and not pending_external and not progress_is_fresh:
+        current_step_id = task.get("current_checkpoint")
+        workflow = task.get("workflow", [])
+        if is_workflow_step_terminal(workflow, current_step_id):
+            new_count = increment_retry(monitoring, current_step_id, FAILURE_TYPES["STEP_COMPLETED_BUT_STALLING"])
+            if new_count >= MAX_RETRY_COUNT:
+                candidates.append({
+                    "state": "BLOCKED_ESCALATE",
+                    "reason": f"step '{current_step_id}' reached terminal sub-state but task has not advanced for {last_progress_age}s; step stalling after {new_count} checks",
+                    "action": "send_blocked_escalation_then_delete_cron",
+                    "failure_type": FAILURE_TYPES["STEP_COMPLETED_BUT_STALLING"],
+                })
+            else:
+                candidates.append({
+                    "state": "NUDGE_MAIN_AGENT",
+                    "reason": f"step '{current_step_id}' done but task stalled; no new checkpoint in {last_progress_age}s; advance to next step or write BLOCKED",
+                    "action": "send_execution_nudge",
+                    "failure_type": FAILURE_TYPES["STEP_COMPLETED_BUT_STALLING"],
+                })
 
     if not candidates:
         if status in ACTIVE_STATUSES and (progress_is_fresh or pending_external):
