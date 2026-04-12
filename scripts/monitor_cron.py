@@ -9,6 +9,7 @@ ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_LEDGER = ROOT / "state" / "long-task-ledger.example.json"
 DEFAULT_CRON_DIR = ROOT / "state" / "monitor-crons"
 MONITOR_SCRIPT = ROOT / "scripts" / "monitor_nudge.py"
+OPS_SCRIPT = ROOT / "scripts" / "openclaw_ops.py"
 
 
 def now_iso():
@@ -96,10 +97,36 @@ def cmd_remove(args):
     print(json.dumps({"ok": True, "task_id": args.task_id, "removed": existed, "cron_file": str(cron_path)}, ensure_ascii=False, indent=2))
 
 
+
+
+def ack_delivery(ledger_path: Path, task_id: str, update_id: str, *, delivered_via: str, note: str | None = None):
+    cmd = [
+        "python3", str(OPS_SCRIPT), "--ledger", str(ledger_path), "ack-delivery", task_id, update_id,
+        "--delivered-via", delivered_via,
+    ]
+    if note:
+        cmd.extend(["--note", note])
+    return json.loads(subprocess.run(cmd, check=True, text=True, capture_output=True).stdout)
+
+
+def push_pending_updates(ledger_path: Path, task_id: str):
+    ledger = load_ledger(ledger_path)
+    task = find_task(ledger, task_id)
+    reporting = task.get("reporting", {})
+    pushed = []
+    for update in list(reporting.get("pending_updates", [])):
+        if update.get("delivered"):
+            continue
+        ack_delivery(ledger_path, task_id, update["update_id"], delivered_via="monitor.delivery_push", note="Simulated monitor delivery push")
+        pushed.append(update["update_id"])
+    return pushed
+
 def cmd_run_once(args):
     cron_path = cron_file(args.cron_dir, args.task_id)
     if not cron_path.exists():
         raise SystemExit(f"Monitor cron not installed for {args.task_id}: {cron_path}")
+
+    delivery_push_ids = push_pending_updates(args.ledger, args.task_id)
 
     proc = subprocess.run(
         ["python3", str(MONITOR_SCRIPT), "--ledger", str(args.ledger), "--apply-supervision"],
@@ -128,6 +155,8 @@ def cmd_run_once(args):
         "report": report,
         "cron_removed": cron_removed,
         "cron_file": str(cron_path),
+        "delivery_push_count": len(delivery_push_ids),
+        "delivery_push_update_ids": delivery_push_ids,
     }, ensure_ascii=False, indent=2))
 
 

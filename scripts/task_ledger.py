@@ -7,6 +7,21 @@ from pathlib import Path
 from reporting_contract import acknowledge_update, ensure_reporting, maybe_queue_checkpoint_update, maybe_queue_external_update
 
 DEFAULT_LEDGER = Path("state/long-task-ledger.example.json")
+TRANSIENT_FAILURE_TYPES = {
+    "TIMEOUT",
+    "DOWNLOAD_TIMEOUT",
+    "DOWNLOAD_INCOMPLETE",
+    "TRANSIENT_NETWORK",
+    "EXTERNAL_WAIT",
+    "EXECUTION_ERROR",
+}
+HARD_FAILURE_TYPES = {
+    "PERMISSION_DENIED",
+    "INVALID_INPUT",
+    "UNSUPPORTED",
+    "AUTH_REQUIRED",
+}
+KNOWN_FAILURE_TYPES = sorted(TRANSIENT_FAILURE_TYPES | HARD_FAILURE_TYPES | {"MISSING_EXTERNAL_EVIDENCE", "STEP_COMPLETED_BUT_STALLING"})
 OWNER_REPLY_CHOICES = {
     "A_IN_PROGRESS_FORGOT_LEDGER",
     "B_BLOCKED",
@@ -50,6 +65,8 @@ SUPERVISION_ALLOWED_KEYS = {
     "retry_count",
     "cron_install_error",
     "install_signal",
+    "resume_requests",
+    "gap1_nudged_steps",
 }
 EXTERNAL_JOB_STATES = {
     "SUBMITTED",
@@ -177,6 +194,78 @@ def mark_owner_response(task, reply_kind, responded_at):
     monitoring["owner_response_at"] = responded_at
     monitoring["owner_response_kind"] = reply_kind
     return monitoring
+
+
+def ensure_resume_requests(task):
+    monitoring = task.setdefault("monitoring", {})
+    monitoring.setdefault("resume_requests", [])
+    return monitoring["resume_requests"]
+
+
+def latest_resume_request(task, resume_token=None):
+    requests = ensure_resume_requests(task)
+    if resume_token:
+        for item in reversed(requests):
+            if item.get("resume_token") == resume_token:
+                return item
+        return None
+    for item in reversed(requests):
+        if not item.get("acknowledged_at"):
+            return item
+    return requests[-1] if requests else None
+
+
+def ack_resume_request(task, *, resume_token=None, outcome=None, checkpoint=None, facts=None):
+    req = latest_resume_request(task, resume_token=resume_token)
+    if not req:
+        return None
+    at = now_iso()
+    req["acknowledged_at"] = at
+    if outcome:
+        req["resume_outcome"] = outcome
+        req["resume_outcome_at"] = at
+    if checkpoint:
+        req["acknowledged_checkpoint"] = checkpoint
+    if facts:
+        req.setdefault("ack_facts", {}).update(facts)
+    task.setdefault("monitoring", {})["last_resume_request_at"] = req.get("requested_at", at)
+    return req
+
+
+def record_failure_attempt(task, step_id, failure_type):
+    if not failure_type:
+        return None
+    monitoring = task.setdefault("monitoring", {})
+    counts = monitoring.setdefault("retry_count", {})
+    key = f"{step_id}:{failure_type}"
+    counts[key] = int(counts.get(key, 0) or 0) + 1
+    return counts[key]
+
+
+def sync_workflow_state(task, *, current_checkpoint=None, kind=None, status=None):
+    workflow = task.get("workflow") or []
+    if not workflow:
+        return
+    step_id = current_checkpoint or task.get("current_checkpoint")
+    ids = [step.get("id") for step in workflow]
+    if step_id not in ids:
+        return
+    idx = ids.index(step_id)
+    for i, step in enumerate(workflow):
+        if i < idx and str(step.get("state", "")).upper() not in {"FAILED", "BLOCKED"}:
+            step["state"] = "DONE"
+        elif i > idx and str(step.get("state", "")).upper() == "RUNNING":
+            step["state"] = "PENDING"
+    current = workflow[idx]
+    if kind == "BLOCKED" or status == "BLOCKED":
+        current["state"] = "BLOCKED"
+    elif kind == "COMPLETED" or status == "COMPLETED":
+        current["state"] = "DONE"
+        for later in workflow[idx + 1:]:
+            if str(later.get("state", "")).upper() == "RUNNING":
+                later["state"] = "PENDING"
+    else:
+        current["state"] = "RUNNING"
 
 
 def ensure_external_job(task, provider, job_id, workflow=None, app=None):
@@ -324,6 +413,8 @@ def cmd_init(args):
             "cron_state": "ACTIVE",
             "retry_count": {},
             "install_signal": "NOT_REQUESTED",
+            "resume_requests": [],
+            "gap1_nudged_steps": [],
         },
         "validation": [],
         "blocker": None,
@@ -346,6 +437,11 @@ def cmd_checkpoint(args):
     task["status"] = args.status or task.get("status", "RUNNING")
     if args.current_checkpoint:
         task["current_checkpoint"] = args.current_checkpoint
+    sync_workflow_state(task, current_checkpoint=args.current_checkpoint, kind=args.kind, status=task.get("status"))
+    failure_type = entry_facts.get("failure_type")
+    if failure_type and failure_type in TRANSIENT_FAILURE_TYPES:
+        record_failure_attempt(task, args.current_checkpoint or task.get("current_checkpoint") or "unknown", failure_type)
+    ack_resume_request(task, resume_token=args.resume_token, outcome=args.kind, checkpoint=args.current_checkpoint or task.get("current_checkpoint"), facts={"summary": args.summary})
     if args.next_action:
         task["next_action"] = args.next_action
     if args.artifact:
@@ -369,14 +465,22 @@ def cmd_block(args):
     ledger = load_ledger(args.ledger)
     task = ensure_task(ledger, args.task_id)
     task["status"] = "BLOCKED"
+    block_facts = parse_fact(args.fact)
     task["blocker"] = {
         "reason": args.reason,
         "need": args.need or [],
         "safe_next_step": args.safe_next_step,
     }
-    append_checkpoint(task, kind="BLOCKED", summary=args.reason, facts=parse_fact(args.fact))
+    if block_facts.get("failure_type"):
+        task["blocker"]["failure_type"] = block_facts["failure_type"]
+    append_checkpoint(task, kind="BLOCKED", summary=args.reason, facts=block_facts)
     if args.current_checkpoint:
         task["current_checkpoint"] = args.current_checkpoint
+    sync_workflow_state(task, current_checkpoint=args.current_checkpoint, kind="BLOCKED", status="BLOCKED")
+    failure_type = block_facts.get("failure_type")
+    if failure_type and failure_type in TRANSIENT_FAILURE_TYPES:
+        record_failure_attempt(task, args.current_checkpoint or task.get("current_checkpoint") or "unknown", failure_type)
+    ack_resume_request(task, resume_token=args.resume_token, outcome="BLOCKED", checkpoint=args.current_checkpoint or task.get("current_checkpoint"), facts={"reason": args.reason})
     if args.next_action:
         task["next_action"] = args.next_action
     maybe_queue_checkpoint_update(
@@ -455,6 +559,10 @@ def cmd_owner_reply(args):
         append_checkpoint(task, kind="CHECKPOINT", summary=summary, facts=facts)
         if args.current_checkpoint:
             task["current_checkpoint"] = args.current_checkpoint
+        sync_workflow_state(task, current_checkpoint=args.current_checkpoint, kind="CHECKPOINT", status="RUNNING")
+        ack_resume_request(task, resume_token=args.resume_token, outcome="CHECKPOINT", checkpoint=args.current_checkpoint or task.get("current_checkpoint"), facts={"owner_reply_kind": reply_kind})
+        sync_workflow_state(task, current_checkpoint=args.current_checkpoint, kind="CHECKPOINT", status="RUNNING")
+        ack_resume_request(task, resume_token=args.resume_token, outcome="CHECKPOINT", checkpoint=args.current_checkpoint or task.get("current_checkpoint"), facts={"owner_reply_kind": reply_kind})
         if args.next_action:
             task["next_action"] = args.next_action
         queued_update = maybe_queue_checkpoint_update(
@@ -475,11 +583,15 @@ def cmd_owner_reply(args):
             "need": args.need or [],
             "safe_next_step": args.safe_next_step,
         }
+        if facts.get("failure_type"):
+            task["blocker"]["failure_type"] = facts["failure_type"]
         task.setdefault("heartbeat", {})["watchdog_state"] = "BLOCKED_ESCALATE"
         summary = args.summary or f"Owner confirmed blocker: {args.reason}"
         append_checkpoint(task, kind="BLOCKED", summary=summary, facts=facts)
         if args.current_checkpoint:
             task["current_checkpoint"] = args.current_checkpoint
+        sync_workflow_state(task, current_checkpoint=args.current_checkpoint, kind="BLOCKED", status="BLOCKED")
+        ack_resume_request(task, resume_token=args.resume_token, outcome="BLOCKED", checkpoint=args.current_checkpoint or task.get("current_checkpoint"), facts={"owner_reply_kind": reply_kind})
         task["next_action"] = args.next_action or args.safe_next_step
         queued_update = maybe_queue_checkpoint_update(
             task,
@@ -499,6 +611,8 @@ def cmd_owner_reply(args):
         append_checkpoint(task, kind="COMPLETED", summary=summary, facts=facts)
         if args.current_checkpoint:
             task["current_checkpoint"] = args.current_checkpoint
+        sync_workflow_state(task, current_checkpoint=args.current_checkpoint, kind="COMPLETED", status="COMPLETED")
+        ack_resume_request(task, resume_token=args.resume_token, outcome="COMPLETED", checkpoint=args.current_checkpoint or task.get("current_checkpoint"), facts={"owner_reply_kind": reply_kind})
         if args.artifact:
             task.setdefault("artifacts", []).extend(args.artifact)
         if args.validation:
@@ -579,12 +693,9 @@ def cmd_external_job(args):
         next_action=args.next_action,
     )
     if args.state == "FAILED":
-        monitoring = task.setdefault("monitoring", {})
         current_step = args.current_checkpoint or task.get("current_checkpoint") or "unknown"
         failure_type = args.failure_type or "EXTERNAL_WAIT"
-        key = f"{current_step}:{failure_type}"
-        counts = monitoring.setdefault("retry_count", {})
-        counts[key] = int(counts.get(key, 0) or 0) + 1
+        record_failure_attempt(task, current_step, failure_type)
     maybe_queue_external_update(
         task,
         state=args.state,
@@ -646,6 +757,7 @@ def build_parser():
     cp_p.add_argument("--next-action")
     cp_p.add_argument("--fact", action="append")
     cp_p.add_argument("--artifact", action="append")
+    cp_p.add_argument("--resume-token")
     cp_p.set_defaults(func=cmd_checkpoint)
 
     block_p = sp.add_parser("block")
@@ -656,6 +768,7 @@ def build_parser():
     block_p.add_argument("--current-checkpoint")
     block_p.add_argument("--next-action")
     block_p.add_argument("--fact", action="append")
+    block_p.add_argument("--resume-token")
     block_p.set_defaults(func=cmd_block)
 
     hb_p = sp.add_parser("heartbeat")
@@ -684,6 +797,7 @@ def build_parser():
     owner_p.add_argument("--fact", action="append")
     owner_p.add_argument("--note")
     owner_p.add_argument("--message-ref")
+    owner_p.add_argument("--resume-token")
     owner_p.set_defaults(func=cmd_owner_reply)
 
     ack_p = sp.add_parser("ack-delivery")
@@ -702,7 +816,7 @@ def build_parser():
     ext_p.add_argument("--summary", required=True)
     ext_p.add_argument("--workflow")
     ext_p.add_argument("--app")
-    ext_p.add_argument("--failure-type", choices=["EXTERNAL_WAIT", "EXECUTION_ERROR"])
+    ext_p.add_argument("--failure-type", choices=KNOWN_FAILURE_TYPES)
     ext_p.add_argument("--current-checkpoint")
     ext_p.add_argument("--next-action")
     ext_p.add_argument("--fact", action="append")

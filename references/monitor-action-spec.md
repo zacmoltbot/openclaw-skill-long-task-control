@@ -307,9 +307,9 @@ owner / scheduler next step：
 - supervision-only ledger writes
 - `action_payload` 產生
 - `DELETE_REQUESTED` marker
-- **【新】** retry-count tracking：`monitoring.retry_count` dict，per-step per-failure-type，3 次同樣失敗 → immediate BLOCKED_ESCALATE
+- **【新】** retry-count tracking：`monitoring.retry_count` dict，per-step per-failure-type；`DOWNLOAD_TIMEOUT` / `DOWNLOAD_INCOMPLETE` / `TRANSIENT_NETWORK` / `EXECUTION_ERROR` / `TIMEOUT` / `EXTERNAL_WAIT` 這類 transient failure 必須先走 retry-first：第 1、2 次只准 nudge owner retry/resume，第 3 次同樣失敗才可 BLOCKED_ESCALATE
 - **【新】** smart stale detection：外部 task 回傳 pending（RunningHub queue/pending）或 progress_at 仍在更新中 → 不觸發 STALE_PROGRESS / HEARTBEAT_DUE
-- **【新】** GAP-1 step stall detection：current step 的 workflow sub-state 達到 terminal（DONE/COMPLETED/FAILED/BLOCKED）但 task 沒有推進到下一個 step，也沒有新 checkpoint → 馬上 NUDGE_MAIN_AGENT（第一個檢查），下一個 tick 直接 BLOCKED_ESCALATE（一發升高，不重複 nudge）；適用於完全無 external jobs 的 task
+- **【新】** GAP-1 step stall detection：current step 的 workflow sub-state 達到 terminal（DONE/COMPLETED/FAILED/BLOCKED）但 task 沒有推進到下一個 step，也沒有新 checkpoint → 馬上 NUDGE_MAIN_AGENT（第一個檢查），下一個 tick 直接 BLOCKED_ESCALATE（一發升高，不重複 nudge）；狀態必須持久化在 `monitoring.gap1_nudged_steps[]`，不可只靠 prompt 記憶；適用於完全無 external jobs 的 task
 - **【新】** 5 分鐘 monitoring interval（從 10 分鐘改為 5 分鐘）
 - **【新】** BLOCKED_ESCALATE notification 一次交代清楚：step / retry 次數 / 嘗試了什麼 / 為什麼失敗 / 建議下一步
 - **【新】** 新 nudge delivery 架構：NUDGE_MAIN_AGENT / OWNER_RECONCILE 用 sessions_send 直接喚醒 owner agent（不走 Discord）；BLOCKED_ESCALATE / milestone 才發 Discord

@@ -18,13 +18,25 @@ STATE_PRIORITY = [
 ]
 FAILURE_TYPES = {
     "TIMEOUT": "TIMEOUT",
+    "DOWNLOAD_TIMEOUT": "DOWNLOAD_TIMEOUT",
+    "DOWNLOAD_INCOMPLETE": "DOWNLOAD_INCOMPLETE",
+    "TRANSIENT_NETWORK": "TRANSIENT_NETWORK",
     "EXECUTION_ERROR": "EXECUTION_ERROR",
     "EXTERNAL_WAIT": "EXTERNAL_WAIT",
     "MISSING_EXTERNAL_EVIDENCE": "MISSING_EXTERNAL_EVIDENCE",
     "STEP_COMPLETED_BUT_STALLING": "STEP_COMPLETED_BUT_STALLING",
 }
+TRANSIENT_FAILURE_TYPES = {
+    FAILURE_TYPES["TIMEOUT"],
+    FAILURE_TYPES["DOWNLOAD_TIMEOUT"],
+    FAILURE_TYPES["DOWNLOAD_INCOMPLETE"],
+    FAILURE_TYPES["TRANSIENT_NETWORK"],
+    FAILURE_TYPES["EXECUTION_ERROR"],
+    FAILURE_TYPES["EXTERNAL_WAIT"],
+}
 STALLING_AFTER_SEC = 300  # one check interval; nudge faster for step-completion stalls
 MAX_RETRY_COUNT = 3
+MIN_RETRY_BEFORE_ESCALATE = 2
 MAX_TASK_AGE_SEC = 3600
 PENDING_EXTERNAL_STATES = {"SUBMITTED", "PENDING", "RUNNING", "RETRYING", "SWITCHED_WORKFLOW"}
 PROVIDER_EVIDENCE_KEYS = {
@@ -76,6 +88,7 @@ SUPERVISION_ALLOWED_PATHS = {
     "monitoring.install_signal",
     "monitoring.cron_install_error",
     "monitoring.gap1_nudged_steps",
+    "monitoring.resume_requests",
 }
 
 
@@ -269,6 +282,12 @@ def save_ledger(path: Path, ledger):
     path.write_text(json.dumps(ledger, ensure_ascii=False, indent=2) + "\n")
 
 
+def build_resume_token(task, chosen, now_iso_value):
+    step = task.get("current_checkpoint") or "unknown"
+    safe = now_iso_value.replace(":", "").replace("-", "")
+    return f"{task.get('task_id')}:{step}:{chosen['state']}:{safe}"
+
+
 def build_action_payload(task, chosen, now_iso_value):
     task_id = task.get("task_id")
     owner = task.get("owner")
@@ -277,25 +296,34 @@ def build_action_payload(task, chosen, now_iso_value):
     blocker = task.get("blocker") or {}
     retry_count = task.get("monitoring", {}).get("retry_count", {})
     if state == "NUDGE_MAIN_AGENT":
+        resume_token = build_resume_token(task, chosen, now_iso_value)
         return {
             "kind": state,
+            "delivery": "sessions_send",
             "deliver_to": owner,
             "channel": channel,
             "title": f"Execution nudge for {task_id}",
             "message": f"Task {task_id} has stale progress. Resume / rebuild-safe-step / reconcile ledger truth. next_action={task.get('next_action')}",
-            "facts": {"task_id": task_id, "reason": chosen["reason"], "next_action": task.get("next_action")},
+            "facts": {"task_id": task_id, "current_step": task.get("current_checkpoint"), "reason": chosen["reason"], "next_action": task.get("next_action"), "resume_token": resume_token},
+            "resume_token": resume_token,
+            "resume_token": resume_token,
             "created_at": now_iso_value,
         }
     if state == "OWNER_RECONCILE":
+        resume_token = build_resume_token(task, chosen, now_iso_value)
         return {
             "kind": state,
+            "delivery": "sessions_send",
             "deliver_to": owner,
             "channel": channel,
             "title": f"Owner reconciliation for {task_id}",
             "message": f"Task {task_id} needs owner reconciliation. Backfill checkpoint / resume / or close with BLOCKED|COMPLETED truth.",
             "facts": {
                 "task_id": task_id,
+                "current_step": task.get("current_checkpoint"),
                 "reason": chosen["reason"],
+                "next_action": task.get("next_action"),
+                "resume_token": resume_token,
                 "suspicious_external_jobs": chosen.get("suspicious_external_jobs", []),
                 "required_provider_evidence": sorted(PROVIDER_EVIDENCE_KEYS),
                 "branches": {
@@ -355,11 +383,41 @@ def apply_supervision_update(task, report, now_iso_value):
     monitoring["last_action_payload"] = report.get("action_payload")
     if "retry_count" in report:
         monitoring["retry_count"] = report["retry_count"]
+    if "gap1_nudged_steps" in report:
+        monitoring["gap1_nudged_steps"] = report["gap1_nudged_steps"]
     if report["state"] == "NUDGE_MAIN_AGENT" and report["action"] == "send_execution_nudge":
         monitoring["nudge_count"] = int(monitoring.get("nudge_count", 0) or 0) + 1
         monitoring["last_nudge_at"] = now_iso_value
         monitoring["last_resume_request_at"] = now_iso_value
+        payload = report.get("action_payload") or {}
+        resume_token = payload.get("resume_token")
+        if resume_token:
+            requests = monitoring.setdefault("resume_requests", [])
+            if not any(item.get("resume_token") == resume_token for item in requests):
+                requests.append({
+                    "resume_token": resume_token,
+                    "requested_at": now_iso_value,
+                    "request_kind": report["state"],
+                    "current_step": report.get("current_step"),
+                    "reason": report.get("reason"),
+                    "next_action": report.get("next_action"),
+                    "delivery": payload.get("delivery", "sessions_send"),
+                })
     elif report["state"] == "OWNER_RECONCILE":
+        payload = report.get("action_payload") or {}
+        resume_token = payload.get("resume_token")
+        if resume_token:
+            requests = monitoring.setdefault("resume_requests", [])
+            if not any(item.get("resume_token") == resume_token for item in requests):
+                requests.append({
+                    "resume_token": resume_token,
+                    "requested_at": now_iso_value,
+                    "request_kind": report["state"],
+                    "current_step": report.get("current_step"),
+                    "reason": report.get("reason"),
+                    "next_action": report.get("next_action"),
+                    "delivery": payload.get("delivery", "sessions_send"),
+                })
         monitoring["owner_query_at"] = now_iso_value
         monitoring["last_reconcile_at"] = now_iso_value
         monitoring["reconcile_count"] = int(monitoring.get("reconcile_count", 0) or 0) + 1
@@ -471,20 +529,28 @@ def evaluate_task(task, now):
                 "suspicious_external_jobs": suspicious_jobs,
             })
 
+    transient_counts = {ft: get_retry_count(monitoring, current_step, ft) for ft in TRANSIENT_FAILURE_TYPES}
+    max_transient_retry = max(transient_counts.values()) if transient_counts else 0
+    blocker_failure_type = str((blocker or {}).get("failure_type") or "").upper()
+
     if status == "BLOCKED":
         timeout_count = get_retry_count(monitoring, current_step, FAILURE_TYPES["TIMEOUT"])
         exec_count = get_retry_count(monitoring, current_step, FAILURE_TYPES["EXECUTION_ERROR"])
         ext_count = get_retry_count(monitoring, current_step, FAILURE_TYPES["EXTERNAL_WAIT"])
         missing_evidence_count = get_retry_count(monitoring, current_step, FAILURE_TYPES["MISSING_EXTERNAL_EVIDENCE"])
-        max_retry = max(timeout_count, exec_count, ext_count, missing_evidence_count)
-        if monitoring.get("last_escalated_at"):
+        max_retry = max(timeout_count, exec_count, ext_count, missing_evidence_count, max_transient_retry)
+        if blocker_failure_type in TRANSIENT_FAILURE_TYPES and max_transient_retry <= MIN_RETRY_BEFORE_ESCALATE:
+            candidates.append({"state": "NUDGE_MAIN_AGENT", "reason": f"transient failure '{blocker_failure_type}' on step '{current_step}' has only retried {max_transient_retry}/{MIN_RETRY_BEFORE_ESCALATE}; retry before BLOCKED escalation", "action": "send_execution_nudge", "failure_type": blocker_failure_type})
+        elif monitoring.get("last_escalated_at"):
             candidates.append({"state": "STOP_AND_DELETE", "reason": f"{(blocker or {}).get('reason') or 'task blocked'}; escalation already sent", "action": "delete_monitor_cron"})
         elif max_retry >= MAX_RETRY_COUNT:
-            candidates.append({"state": "BLOCKED_ESCALATE", "reason": f"retry limit reached on step '{current_step}' (timeouts={timeout_count}, exec_errors={exec_count}, ext_waits={ext_count}, weak_external_claims={missing_evidence_count})", "action": "send_blocked_escalation_then_delete_cron"})
-        elif last_progress_age is not None and last_progress_age >= blocked_escalate_after_sec:
-            candidates.append({"state": "BLOCKED_ESCALATE", "reason": f"{(blocker or {}).get('reason') or 'task blocked'}; blocked for {last_progress_age}s", "action": "send_blocked_escalation_then_delete_cron"})
+            candidates.append({"state": "BLOCKED_ESCALATE", "reason": f"retry limit reached on step '{current_step}' (timeouts={timeout_count}, exec_errors={exec_count}, ext_waits={ext_count}, weak_external_claims={missing_evidence_count}, transient={max_transient_retry})", "action": "send_blocked_escalation_then_delete_cron"})
+        elif last_progress_age is not None and last_progress_age >= blocked_escalate_after_sec and max_transient_retry > MIN_RETRY_BEFORE_ESCALATE:
+            candidates.append({"state": "BLOCKED_ESCALATE", "reason": f"{(blocker or {}).get('reason') or 'task blocked'}; blocked for {last_progress_age}s after retry-first contract satisfied", "action": "send_blocked_escalation_then_delete_cron"})
+        elif max_transient_retry > MIN_RETRY_BEFORE_ESCALATE:
+            candidates.append({"state": "BLOCKED_ESCALATE", "reason": f"{(blocker or {}).get('reason') or 'task blocked'}; retry-first contract satisfied, escalate once then stop", "action": "send_blocked_escalation_then_delete_cron"})
         else:
-            candidates.append({"state": "BLOCKED_ESCALATE", "reason": f"{(blocker or {}).get('reason') or 'task blocked'}; blocked tasks escalate once then stop", "action": "send_blocked_escalation_then_delete_cron"})
+            candidates.append({"state": "BLOCKED_ESCALATE", "reason": f"{(blocker or {}).get('reason') or 'task blocked'}; non-transient blocker escalates once then stop", "action": "send_blocked_escalation_then_delete_cron"})
 
     if status in ACTIVE_STATUSES and not activation.get("announced"):
         candidates.append({"state": "NUDGE_MAIN_AGENT", "reason": "activation record missing while task is active", "action": "remind_main_agent_to_activate_and_resume"})
@@ -505,7 +571,8 @@ def evaluate_task(task, now):
         else:
             candidates.append({"state": "HEARTBEAT_DUE", "reason": f"no heartbeat for {last_heartbeat_age}s (> expected_interval_sec={expected_interval})", "action": "send_lightweight_supervision_reminder"})
 
-    if status in ACTIVE_STATUSES and last_progress_age is not None and last_progress_age > nudge_after_sec and not (pending_external or progress_is_fresh or suspicious_jobs):
+    gap1_nudged_steps = set(monitoring.get("gap1_nudged_steps", []))
+    if status in ACTIVE_STATUSES and last_progress_age is not None and last_progress_age > nudge_after_sec and not (pending_external or progress_is_fresh or suspicious_jobs) and current_step not in gap1_nudged_steps:
         if nudge_count >= max_nudges or (nudge_count >= escalate_after_nudges and should_renotify):
             candidates.append({"state": "OWNER_RECONCILE", "reason": f"task already nudged {nudge_count} times with no fresh checkpoint", "action": "query_owner_and_force_reconciliation"})
         else:

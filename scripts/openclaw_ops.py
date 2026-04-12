@@ -182,12 +182,16 @@ def format_notification(task, report):
     task_id = report["task_id"]
     next_action = report.get("next_action") or task.get("next_action")
     if state == "NUDGE_MAIN_AGENT":
+        resume_token = facts.get("resume_token")
+        current_step = facts.get("current_step") or report.get("current_step")
         return "\n".join([
             "【long-task-control / execution nudge】",
             f"task_id={task_id}",
+            f"current_step={current_step}",
             f"state={state}",
             f"reason={report['reason']}",
             f"next_action={next_action}",
+            f"resume_token={resume_token}",
             "請 main agent 立刻回來續行，先自救：resume / rebuild-safe-step / reconcile 缺漏 checkpoint；真的推不動才標記 BLOCKED。",
         ])
     if state == "OWNER_RECONCILE":
@@ -197,8 +201,11 @@ def format_notification(task, report):
         lines = [
             "【long-task-control / owner reconcile】",
             f"task_id={task_id}",
+            f"current_step={facts.get('current_step') or report.get('current_step')}",
             f"state={state}",
             f"reason={report['reason']}",
+            f"next_action={facts.get('next_action') or next_action}",
+            f"resume_token={facts.get('resume_token')}",
         ]
         if suspicious_jobs:
             lines.append("弱證據 external pending claim，請先補 provider evidence：")
@@ -448,6 +455,8 @@ def cmd_record_update(args):
             cmd.extend(["--need", item])
         for key, value in facts.items():
             cmd.extend(["--fact", f"{key}={value}"])
+        if args.resume_token:
+            cmd.extend(["--resume-token", args.resume_token])
         if args.current_checkpoint:
             cmd.extend(["--current-checkpoint", args.current_checkpoint])
         if args.next_action:
@@ -466,6 +475,8 @@ def cmd_record_update(args):
             cmd.extend(["--fact", f"{key}={value}"])
         for item in outputs:
             cmd.extend(["--artifact", item])
+        if args.resume_token:
+            cmd.extend(["--resume-token", args.resume_token])
         if args.current_checkpoint:
             cmd.extend(["--current-checkpoint", args.current_checkpoint])
         if args.next_action:
@@ -807,6 +818,16 @@ def cmd_remove_monitor(args):
     print(json.dumps({"ok": True, "task_id": args.task_id, "job_id": job_id, "removed": removed, "removal_mode": removal_mode}, ensure_ascii=False, indent=2))
 
 
+def cmd_ack_delivery(args):
+    result = run(
+        "python3", str(TASK_LEDGER), "--ledger", str(args.ledger), "ack-delivery", args.task_id, args.update_id,
+        "--delivered-via", args.delivered_via,
+        *( ["--message-ref", args.message_ref] if args.message_ref else [] ),
+        *( ["--note", args.note] if args.note else [] ),
+    )
+    print(result.stdout.strip())
+
+
 def cmd_preview_tick(args):
     run_json = json.loads(run("python3", str(MONITOR_NUDGE), "--ledger", str(args.ledger), "--apply-supervision").stdout)
     ledger = load_ledger(args.ledger)
@@ -954,7 +975,16 @@ def build_parser():
     record_p.add_argument("--completed-checkpoint", action="append")
     record_p.add_argument("--tried", action="append")
     record_p.add_argument("--need", action="append")
+    record_p.add_argument("--resume-token")
     record_p.set_defaults(func=cmd_record_update)
+
+    ack_p = sp.add_parser("ack-delivery")
+    ack_p.add_argument("task_id")
+    ack_p.add_argument("update_id")
+    ack_p.add_argument("--delivered-via", default="message.send")
+    ack_p.add_argument("--message-ref")
+    ack_p.add_argument("--note")
+    ack_p.set_defaults(func=cmd_ack_delivery)
 
     preview_p = sp.add_parser("preview-tick")
     preview_p.add_argument("task_id")

@@ -223,6 +223,8 @@ Use when there has been no real checkpoint for too long. This is a pre-gate warn
 
 ### Retry-count tracking
 
+The monitor tracks per-step, per-failure-type retry counts in `monitoring.retry_count`. Resume nudges are also durable: every `sessions_send` nudge/reconcile writes a `monitoring.resume_requests[]` entry with `resume_token`, `current_step`, `reason`, `next_action`, `requested_at`, and later `acknowledged_at` / `resume_outcome` when owner truth comes back through `record-update` / `owner-reply` / `block`.
+
 The monitor tracks per-step, per-failure-type retry counts in `monitoring.retry_count`:
 
 ```json
@@ -263,7 +265,7 @@ Expected owner-reconciliation branches:
 
 Use later, not early. Enter this state only when the task is already `BLOCKED`, or when evidence shows the task cannot continue safely without external input/approval/fix **after** the recovery path was tried or ruled out. Recovery path means: resume execution, rebuild/restart the stuck step if safe, reconcile missing ledger truth, or require the main agent to補做. Escalate with blocker facts instead of repeatedly nudging.
 
-**Retry-count path (new):** If the same step fails the same way 3 times (per `retry_count`), monitor escalates immediately — no wall-clock wait required.
+**Retry-first contract (updated):** transient failures (`DOWNLOAD_TIMEOUT`, `DOWNLOAD_INCOMPLETE`, `TRANSIENT_NETWORK`, `EXECUTION_ERROR`, `TIMEOUT`, `EXTERNAL_WAIT`) must be retried at least 2 times first. The first two blocked/stall evaluations for the same `step_id + failure_type` route back to `NUDGE_MAIN_AGENT` for retry/resume. The 3rd same failure is the first time monitor may escalate.
 
 **Enhanced notification:** The `BLOCKED_ESCALATE` message must include in one shot: (1) which step is stuck, (2) retry history, (3) what was tried, (4) why it is now deemed unrecoverable, (5) recommended next steps for the requester.
 

@@ -181,6 +181,13 @@ Allowed lifecycle states:
 
 Monitor stale detection must consult this structure first. 只有「pending state + provider evidence contract 成立」才可視為 legitimate external wait。若 ledger 只有 owner 自己寫的 pending claim、但缺 provider evidence，monitor 必須先進 `OWNER_RECONCILE` 要 owner 補證據；多次 reconcile 仍補不出來才 escalation / stop cron.
 
+### Resume contract fields
+
+- `monitoring.resume_requests[]`
+- each item should carry at least: `resume_token`, `request_kind`, `current_step`, `reason`, `next_action`, `requested_at`, `delivery`
+- owner-side truth write (`record-update`, `owner-reply`, `block`) should acknowledge the matching request with `acknowledged_at`, `resume_outcome`, `resume_outcome_at`, and optional `acknowledged_checkpoint`
+- goal: make it machine-verifiable whether owner only got nudged, or actually resumed and wrote ledger truth
+
 ### Reporting delivery fields
 
 `ledger truth`、`monitor supervision`、`user-visible status update` 要分開，但必須被同一套 durable contract 綁住。
@@ -204,7 +211,7 @@ Monitor stale detection must consult this structure first. 只有「pending stat
 - `delivered`
 - `delivered_at` / `message_ref`（delivery 完成後）
 
-規則：owner 一旦寫進可見進度點，就必須同時產生 `pending_updates[]`；之後只有在實際 requester-visible delivery 完成後，才可用 `ack-delivery` 將該 obligation 轉入 `delivered_updates[]`。
+規則：owner 一旦寫進可見進度點，就必須同時產生 `pending_updates[]`；monitor 每個 tick 都必須先嘗試 delivery push 所有 `delivered=false` 的項目，成功後立刻 `ack-delivery`。若 send 失敗但有已送達證據，可 best-effort ack；否則保留 pending 到下一 tick。
 
 ### Recommended monitor fields
 
