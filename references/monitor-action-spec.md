@@ -76,13 +76,16 @@ Repo 內目前由兩個機制保證這件事：
 - activation 缺失
 - monitor 判斷 owner/main agent 應回來續行或關閉 task
 
-payload contract：
+**Delivery 方式（已更新）：** 不再發 Discord，而是用 `sessions_send` 直接喚醒 owner agent（main session: `agent:main:discord:channel:1484432523781083197`）。
+
+payload contract（仍保留供 preview-tick / format_notification 使用，實際 delivery 由 cron_prompt 決定）：
 
 ```json
 {
   "kind": "NUDGE_MAIN_AGENT",
   "deliver_to": "main-agent",
-  "channel": "discord",
+  "delivery": "sessions_send",
+  "session_key": "agent:main:discord:channel:1484432523781083197",
   "title": "Execution nudge for <task_id>",
   "message": "Resume execution, post a real checkpoint, or write terminal truth",
   "facts": {
@@ -92,6 +95,17 @@ payload contract：
     "next_action": "..."
   }
 }
+```
+
+sessions_send 發送的實際訊息格式（由 cron_prompt 構造）：
+```
+【long-task-control / execution nudge】
+task_id=<task_id>
+Task stalled at step=<current_step>.
+請 main agent 立刻回來續行，先自救：
+  - resume / rebuild-safe-step / reconcile 缺漏 checkpoint
+  - 若真的無法自救，回報 BLOCKED
+next_action=<next_action>
 ```
 
 monitor side effects：
@@ -114,13 +128,16 @@ owner next step：
 - active task stale progress 在 prior nudges 後仍持續
 - monitor 需要先 query owner，避免把「忘了更新 ledger」誤判成 blocked/failed
 
-payload contract：
+**Delivery 方式（已更新）：** 不再發 Discord，而是用 `sessions_send` 直接喚醒 owner agent（main session: `agent:main:discord:channel:1484432523781083197`）。
+
+payload contract（仍保留供 preview-tick / format_notification 使用）：
 
 ```json
 {
   "kind": "OWNER_RECONCILE",
   "deliver_to": "main-agent",
-  "channel": "discord",
+  "delivery": "sessions_send",
+  "session_key": "agent:main:discord:channel:1484432523781083197",
   "title": "Owner reconciliation for <task_id>",
   "message": "Query the owner now and reconcile task truth",
   "facts": {
@@ -136,6 +153,19 @@ payload contract：
     }
   }
 }
+```
+
+sessions_send 發送的實際訊息格式（由 cron_prompt 構造）：
+```
+【long-task-control / owner reconcile】
+task_id=<task_id>
+任務處於落後狀態，請儘快回報你所處的 branch：
+  - A_IN_PROGRESS_FORGOT_LEDGER：還在跑但忘了更新 ledger，請補 checkpoint
+  - B_BLOCKED：任務被 block，請寫 BLOCKED checkpoint
+  - C_COMPLETED：任務已完成，請寫 COMPLETED checkpoint
+  - D_NO_REPLY：無法確認，先找外部 evidence
+  - E_FORGOT_OR_NOT_DOING：忘了或沒在做，請立刻補做
+reason=<reason>
 ```
 
 monitor side effects：
@@ -279,9 +309,11 @@ owner / scheduler next step：
 - `DELETE_REQUESTED` marker
 - **【新】** retry-count tracking：`monitoring.retry_count` dict，per-step per-failure-type，3 次同樣失敗 → immediate BLOCKED_ESCALATE
 - **【新】** smart stale detection：外部 task 回傳 pending（RunningHub queue/pending）或 progress_at 仍在更新中 → 不觸發 STALE_PROGRESS / HEARTBEAT_DUE
-- **【新】** GAP-1 step stall detection：current step 的 workflow sub-state 達到 terminal（DONE/COMPLETED/FAILED/BLOCKED）但 task 沒有推進到下一個 step，也沒有新 checkpoint → 馬上 NUDGE_MAIN_AGENT（第一個檢查），3 次後 BLOCKED_ESCALATE；適用於完全無 external jobs 的 task
+- **【新】** GAP-1 step stall detection：current step 的 workflow sub-state 達到 terminal（DONE/COMPLETED/FAILED/BLOCKED）但 task 沒有推進到下一個 step，也沒有新 checkpoint → 馬上 NUDGE_MAIN_AGENT（第一個檢查），下一個 tick 直接 BLOCKED_ESCALATE（一發升高，不重複 nudge）；適用於完全無 external jobs 的 task
 - **【新】** 5 分鐘 monitoring interval（從 10 分鐘改為 5 分鐘）
 - **【新】** BLOCKED_ESCALATE notification 一次交代清楚：step / retry 次數 / 嘗試了什麼 / 為什麼失敗 / 建議下一步
+- **【新】** 新 nudge delivery 架構：NUDGE_MAIN_AGENT / OWNER_RECONCILE 用 sessions_send 直接喚醒 owner agent（不走 Discord）；BLOCKED_ESCALATE / milestone 才發 Discord
+- **【新】** Delivery push 先於狀態評估執行，確保 user update 不漏接
 - demo E2E test 驗證 stale -> owner query -> owner reply -> resume / blocked / completed routing
 
 ## 6. Owner reply ingestion
@@ -317,7 +349,7 @@ python3 scripts/task_ledger.py --ledger state/long-task-ledger.json owner-reply 
 
 ### 被動 Delivery Push（重要）
 
-每次 monitor tick（5 分鐘）都必須主動檢查 ledger 中 `reporting.pending_updates[]` 是否有 `delivered=false` 的項目。若有，**monitor 會馬上用 `message.send` 推到 Discord**，不需要等 main agent 主動來問。
+每次 monitor tick（5 分鐘）都必須主動檢查 ledger 中 `reporting.pending_updates[]` 是否有 `delivered=false` 的項目。若有，**monitor 會馬上用 `message.send` 推到 Discord**，不需要等 main agent 主動來問。 Delivery push 在**每次 tick 都先於狀態評估執行**，不受 notify flag 限制。
 
 具體流程（每次 tick）：
 1. 執行 `preview-tick`，解析 `pending_user_updates_deliverable_count`
@@ -328,11 +360,25 @@ python3 scripts/task_ledger.py --ledger state/long-task-ledger.json owner-reply 
 
 這個機制補足了「你不來問，我就不報」的缺口。所有 `pending_user_update` 都會被 monitor 被動送達 Discord。
 
+### 新 nudge delivery 架構（已實作）
+
+**核心問題：** Monitor 原本發 NUDGE/RECONCILE 到 Discord，但 owner agent 在 main session 不會一直盯著 Discord；Discord 訊息也無法喚醒 owner agent；重複 Discord nudge 還會 spam user。
+
+**新架構：**
+- `NUDGE_MAIN_AGENT` / `OWNER_RECONCILE` → `sessions_send` 直接喚醒 owner agent（main session: `agent:main:discord:channel:1484432523781083197`），不发 Discord
+- `BLOCKED_ESCALATE` / `COMPLETED` / milestone checkpoints → 才用 `message.send` 發 Discord 通知 user
+- GAP-1 fix：同一個 step 已 NUDGE 過，next tick 直接 BLOCKED_ESCALATE，不再重複 NUDGE
+
+**實際行為：**
+1. Task stall detected → NUDGE_MAIN_AGENT → sessions_send 喚醒 owner agent
+2. Next tick: same step still stalled → BLOCKED_ESCALATE → message.send 發 Discord（一次交代清楚 blocker）
+3. Owner agent 收到 sessions_send 被喚醒 → 可以及時干預，不需要等 Discord 被動看到
+
 ### 尚未實作（部分已補足）
 
-- ~~真實對 Discord / message bus 送提醒（目前由 cron agent 调用 message.send 處理）~~ → **已補足**：被動 delivery push 機制由 monitor cron 主動執行，不再依賴 main agent 主動觸發
+- ~~真實對 Discord / message bus 送提醒（目前由 cron agent 调用 message.send 處理）~~ → **已補足**：被動 delivery push 機制由 monitor cron 主動執行，不再依賴 main agent 主動觸發；NUDGE/RECONCILE 改用 sessions_send 直接喚醒 owner agent
 - 真實安裝 / 刪除 crontab entry（透過 openclaw cron add/rm 處理）
 - 多 owner routing / retry queue
 - cross-process locking（retry_count 目前存在 ledger supervision metadata 中，跨 cron tick 持久化）
 
-所以目前狀態是：**repo 內已可測 end-to-end wiring（含被動 delivery push / retry-count tracking / smart stale / owner reply ingestion / auto-routing）；系統 cron deletion 仍保留為 integration layer。**
+所以目前狀態是：**repo 內已可測 end-to-end wiring（含 sessions_send nudge / 被動 delivery push / GAP-1 one-shot escalate / retry-count tracking / smart stale / owner reply ingestion / auto-routing）；系統 cron deletion 仍保留為 integration layer。**

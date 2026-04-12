@@ -119,28 +119,60 @@ def cron_prompt(ledger_path: Path, task_id: str, requester_channel: str, session
 ⚠️ 被動 Delivery Push（重要）：
 每次 tick 必須主動檢查 ledger 中 `reporting.pending_updates[]` 是否有 `delivered=false` 的項目。若有，馬上用 `message.send` 推到 Discord channel `{requester_channel}`，不需要等 main agent 主動來問。成功發送後，更新 ledger (`delivered=true`)。
 
+⚠️ 新 nudge delivery 架構（重要）：
+- NUDGE_MAIN_AGENT / OWNER_RECONCILE → 用 sessions_send 直接喚醒 owner agent（main session: `{session_key}`），不是發 Discord
+- BLOCKED_ESCALATE / COMPLETED / milestone checkpoints → 才用 message.send 發 Discord 通知 user
+- 這樣確保 owner agent 被喚醒續行，不靠 Discord 訊息被動等待
+
 嚴格步驟：
 1) exec：python3 {ROOT / 'scripts' / 'openclaw_ops.py'} --ledger {ledger_path} preview-tick {task_id}
-2) 解析 JSON，只使用該命令回傳的 state / notify / notification / remove_monitor / reason / pending_user_updates_deliverable。
-3) 被動 delivery push（每次 tick 必定執行）：
-   - 若 `pending_user_updates_deliverable_count > 0`，對每一筆 `pending_user_updates` 中 `delivered=false` 的項目：
+2) 解析 JSON，只使用該命令回傳的 state / notify / notification / remove_monitor / reason / pending_user_updates_deliverable / next_action / current_step / retry_count。
+3) 【delivery push，先於狀態評估】（每次 tick 必定執行，即使 state 是 OK）：
+   - 若 `pending_user_updates_deliverable_count > 0`，對每一筆 `pending_updates` 中 `delivered=false` 的項目：
      (a) 用 `message.send --channel {requester_channel} --message "<update['status_block']>"` 發送到 Discord
      (b) 若 message.send 回傳成功，exec：`python3 {ROOT / 'scripts' / 'openclaw_ops.py'} --ledger {ledger_path} ack-delivery {task_id} <update_id> --delivered-via message.send`
      (c) 若 message.send 回傳失敗但訊息已出現在 channel，視為 delivered=true，仍更新 ledger
-   - 這層 delivery push 不需要 main agent 主動觸發；monitor 自己被動執行，確保 user update 不會「你不來問就不報」。
-4) 依 state 分流（僅在 notify=true 時發 Discord，delivery push 不受此限制）：
+   - delivery push 不受 notify flag 限制；保證 user update 一定被被動發出。
+4) 依 state 分流：
    - OK（含 noop_external_wait）：不要發 Discord；輸出 1 行 summary 即可。
    - HEARTBEAT_DUE / STALE_PROGRESS：不要發 Discord（這些只是 pre-gate warnings）；輸出 1 行 summary。
-   - NUDGE_MAIN_AGENT / OWNER_RECONCILE：只有在 notify=true 時才用 message.send 發到 Discord channel `{requester_channel}`，內容直接使用 notification；若 message.send 回傳失敗但訊息已出現在 channel，視為 delivered=true，summary 註明 delivery=best_effort。
-   - BLOCKED_ESCALATE：
-     (a) 用 message.send 發到 Discord channel `{requester_channel}`，notification 內容需一次講清楚：哪個 step 卡住、retry 次數、嘗試了什麼、為什麼現在判定失敗、建議下一步。
+   - NUDGE_MAIN_AGENT：【sessions_send 到 owner agent main session，不要發 Discord】
+     (a) 用 sessions_send 工具（tool call，不是 exec），sessionKey=`{session_key}`，發送以下格式的 actionable message：
+         ```
+         【long-task-control / execution nudge】
+         task_id={task_id}
+         Task stalled at step=<current_step>.
+         請 main agent 立刻回來續行，先自救：
+           - resume / rebuild-safe-step / reconcile 缺漏 checkpoint
+           - 若真的無法自救，回報 BLOCKED
+         next_action=<next_action>
+         ```
+     (b) sessions_send 成功後 summary 註明 nudge_via=sessions_send
+     (c) 不要發 message.send 到 Discord；owner agent 收到 sessions_send 就會被喚醒
+   - OWNER_RECONCILE：【sessions_send 到 owner agent main session，不要發 Discord】
+     (a) 用 sessions_send 工具（tool call），sessionKey=`{session_key}`，發送以下格式：
+         ```
+         【long-task-control / owner reconcile】
+         task_id={task_id}
+         任務處於落後狀態，請儘快回報你所處的 branch：
+           - A_IN_PROGRESS_FORGOT_LEDGER：還在跑但忘了更新 ledger，請補 checkpoint
+           - B_BLOCKED：任務被 block，請寫 BLOCKED checkpoint
+           - C_COMPLETED：任務已完成，請寫 COMPLETED checkpoint
+           - D_NO_REPLY：無法確認，先找外部 evidence
+           - E_FORGOT_OR_NOT_DOING：忘了或沒在做，請立刻補做
+         reason=<reason>
+         ```
+     (b) sessions_send 成功後 summary 註明 reconcile_via=sessions_send
+   - BLOCKED_ESCALATE：【發 Discord，不要 sessions_send】
+     (a) 用 message.send 發到 Discord channel `{requester_channel}`，內容一次交代清楚：
+         - 哪個 step 卡住、retry 次數、嘗試了什麼、為什麼現在判定失敗、建議下一步
      (b) 發完後立即 exec：python3 {ROOT / 'scripts' / 'openclaw_ops.py'} --ledger {ledger_path} remove-monitor {task_id}
    - STOP_AND_DELETE：不要再發 Discord；直接 exec：python3 {ROOT / 'scripts' / 'openclaw_ops.py'} --ledger {ledger_path} remove-monitor {task_id}
-5) message.send 內容必須簡短、fact-based；BLOCKED_ESCALATE 的 exception：可以稍長但要一次把 blocker 交代清楚，不要分多次補述。
+5) message.send 內容必須簡短、fact-based；BLOCKED_ESCALATE 的 exception：可以稍長但要一次把 blocker 交代清楚。
 6) remove-monitor 是 idempotent cleanup；若 job 已不存在但 ledger 成功標成 DELETED，也算 cron_removed=yes。
-7) 這個 cron job 綁定的 main session key 是 `{session_key}`；NUDGE_MAIN_AGENT 文案要明確寫「請 main agent 先自救：resume / rebuild-safe-step / reconcile 缺漏 checkpoint」，只有真的無法自救才等 BLOCKED_ESCALATE。
+7) 這個 cron job 綁定的 main session key 是 `{session_key}`；所有 NUDGE / RECONCILE 訊息都透過 sessions_send 直接喚醒 owner agent。
 
-輸出限制：最後只輸出一小段 JSON summary，包含 task_id、state、notified、cron_removed、delivery、pending_delivered。"""
+輸出限制：最後只輸出一小段 JSON summary，包含 task_id、state、nudge_via、reconcile_via、notified_discord、cron_removed、delivery_push_count。"""
 
 
 def format_notification(task, report):
@@ -260,6 +292,143 @@ def validate_outputs(outputs):
         else:
             results.append(f"artifact_exists[{raw}]=false")
     return results
+
+
+EXECUTOR_SESSION_KEY_PREFIX = "agent:executor:long-task:"
+
+
+def executor_session_key(task_id: str) -> str:
+    return f"{EXECUTOR_SESSION_KEY_PREFIX}{task_id}"
+
+
+def executor_prompt(ledger_path: Path, task_id: str):
+    """
+    Generate the executor agent prompt.
+
+    The executor is an OpenClaw subagent that:
+    1. Reads the task ledger to find the current step
+    2. Executes the next pending workflow step
+    3. Writes a CHECKPOINT to the ledger
+    4. Repeats until the workflow is done
+    5. Writes COMPLETED when finished
+
+    The executor is auto-resuming: it reads the ledger's current_checkpoint
+    and starts from the next pending step. If step-01 is DONE and step-02 is
+    RUNNING, it starts step-02 immediately.
+    """
+    return f"""你是 long-task-control 的 executor agent。你的職責：讀取 task ledger，執行下一個待做的步驟，寫入 checkpoint，重複直到 workflow 完成。
+
+⚠️ 核心原則：
+- 你只執行「下一個可做的步驟」，不是整個 task
+- 每個步驟完成後，馬上寫 checkpoint 再繼續
+- Auto-resume：讀 ledger 的 current_checkpoint，如果 step-01 DONE、step-02 RUNNING，就從 step-02 繼續
+- 任一步驟失敗 → 寫 BLOCKED checkpoint，附上 blocker reason 和 need，馬上停下來等外部修復
+
+執行循環：
+1. exec: python3 {ROOT / 'scripts' / 'executor_engine.py'} --ledger {ledger_path} preview {task_id}
+2. 解析 JSON，看 action 欄位：
+   - "execute_step" → 執行它（見下）
+   - "workflow_complete" → 寫 COMPLETED checkpoint，輸出 "EXECUTOR_DONE"，结束
+   - "already_completed" / "terminal_state" → 輸出 "EXECUTOR_DONE"，结束
+   - "blocked" → 輸出 "EXECUTOR_BLOCKED"，结束
+3. 執行步驟（"execute_step"）：
+   a. 決定這步要做什麼（從 ledger 的 workflow[] / next_action / goal 推斷）
+   b. 實際執行（shell command / API call / file operation 等）
+   c. 成功後，exec: python3 {ROOT / 'scripts' / 'task_ledger.py'} --ledger {ledger_path} checkpoint {task_id} --kind CHECKPOINT --summary "<描述這步完成了什麼>" --current-checkpoint <step-id> --next-action "<下一步做什麼>"
+   d. 用 --fact 附上關鍵 output evidence（file path、job id、output URL 等）
+   e. 如果有 artifact，用 --artifact 標記
+4. 回到步驟 1（ledger 更新過，current_checkpoint 已前進）
+
+重要：
+- 每次只做一個 step，不要一口氣做很多
+- 每個 step 完成後馬上寫 checkpoint，這樣萬一中斷，下一次啟動會從斷點繼續
+- 如果 external job（RunningHub 等）需要等待，用 external-job command 寫 pending 狀態，不要 block 在那裡等
+- 完成整個 workflow → 寫 COMPLETED checkpoint，狀態 block 要包含所有 completed steps 和 output artifacts
+- 輸出 "EXECUTOR_DONE" 表示整個 task 完成
+- 如果 task 被 BLOCK → 馬上停止，輸出 "EXECUTOR_BLOCKED"
+
+輸出格式（每輪）：
+  {{"executed": "<step-id>", "summary": "<做了什麼>", "next": "<下一步或 EXECUTOR_DONE/EXECUTOR_BLOCKED>"}}
+"""
+
+
+def cmd_executor_preview(args):
+    """Preview what the executor would do for a task without executing."""
+    result = run(
+        "python3",
+        str(ROOT / "scripts" / "executor_engine.py"),
+        "--ledger", str(args.ledger),
+        "preview",
+        args.task_id,
+        check=True,
+    )
+    print(result.stdout.strip())
+
+
+def cmd_run_executor(args):
+    """Spawn an executor subagent for a task. The executor drives the task to completion."""
+    ledger = load_ledger(args.ledger)
+    task = find_task(ledger, args.task_id)
+    if not task:
+        raise SystemExit(f"Task not found: {args.task_id}")
+
+    task_id = args.task_id
+    name = f"long-task executor {task_id} @ {datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
+    session_key = executor_session_key(task_id)
+    prompt = executor_prompt(args.ledger, task_id)
+
+    # The executor runs as a cron job with a long timeout that wakes every 5 minutes.
+    # Each tick: read ledger → execute next step → write checkpoint → exit.
+    # The monitor cron watches the executor and handles GAP-1 / stalled escalation.
+    # If the executor completes all steps, it writes COMPLETED and the monitor stops.
+    add_cmd = [
+        "openclaw", "cron", "add",
+        "--json",
+        "--name", name,
+        "--agent", args.agent,
+        "--session", "isolated",
+        "--session-key", session_key,
+        "--channel", DEFAULT_CHANNEL,
+        "--wake", "now",
+        "--message", prompt,
+        "--timeout-seconds", str(args.timeout_seconds),
+        "--thinking", args.thinking,
+        "--model", args.model,
+    ]
+    if args.every:
+        add_cmd.extend(["--every", args.every])
+    else:
+        add_cmd.extend(["--cron", args.cron_expr or "*/5 * * * *", "--tz", args.tz or DEFAULT_TIMEZONE])
+    if args.light_context:
+        add_cmd.append("--light-context")
+
+    if args.dry_run:
+        payload = {
+            "id": f"dry-run-executor-{task_id}",
+            "name": name,
+            "sessionKey": session_key,
+            "message": prompt,
+        }
+    else:
+        payload = _run_cron_add_with_retry(add_cmd, args.ledger, args.task_id, disabled=False)
+
+    # Record executor metadata in the task
+    monitoring = task.setdefault("monitoring", {})
+    monitoring["executor_cron_job_id"] = payload.get("id")
+    monitoring["executor_cron_name"] = name
+    monitoring["executor_session_key"] = session_key
+    monitoring["executor_state"] = "ACTIVE"
+    monitoring["executor_installed_at"] = now_iso()
+    save_ledger(args.ledger, ledger)
+
+    print(json.dumps({
+        "ok": True,
+        "task_id": task_id,
+        "job": payload,
+        "session_key": session_key,
+        "prompt_preview": prompt[:500] + "...",
+        "note": "Executor cron installed. It will wake every 5 min, execute the next pending step, write checkpoint, and exit. Monitor cron watches for stalls (GAP-1) and escalates if the executor stalls.",
+    }, ensure_ascii=False, indent=2))
 
 
 def cmd_record_update(args):
@@ -790,6 +959,25 @@ def build_parser():
     preview_p = sp.add_parser("preview-tick")
     preview_p.add_argument("task_id")
     preview_p.set_defaults(func=cmd_preview_tick)
+
+    # Executor commands
+    executor_preview_p = sp.add_parser("executor-preview")
+    executor_preview_p.add_argument("task_id")
+    executor_preview_p.set_defaults(func=cmd_executor_preview)
+
+    run_executor_p = sp.add_parser("run-executor")
+    run_executor_p.add_argument("task_id")
+    run_executor_p.add_argument("--agent", default=DEFAULT_AGENT)
+    run_executor_p.add_argument("--every", default="5m")
+    run_executor_p.add_argument("--cron-expr")
+    run_executor_p.add_argument("--tz", default=DEFAULT_TIMEZONE)
+    run_executor_p.add_argument("--timeout-seconds", type=int, default=300)
+    run_executor_p.add_argument("--thinking", default="medium")
+    run_executor_p.add_argument("--model", default="minimax/MiniMax-M2.7")
+    run_executor_p.add_argument("--light-context", action="store_true")
+    run_executor_p.add_argument("--dry-run", action="store_true")
+    run_executor_p.set_defaults(func=cmd_run_executor)
+
     return p
 
 

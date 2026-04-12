@@ -75,6 +75,7 @@ SUPERVISION_ALLOWED_PATHS = {
     "monitoring.retry_count",
     "monitoring.install_signal",
     "monitoring.cron_install_error",
+    "monitoring.gap1_nudged_steps",
 }
 
 
@@ -513,26 +514,35 @@ def evaluate_task(task, now):
     # GAP-1 fix: "step completed but next step hasn't started" stall detection.
     # When the current checkpoint's workflow sub-state is terminal (DONE/COMPLETED/FAILED/BLOCKED),
     # no new checkpoint arrives within one check interval, and no external job is legitimately pending,
-    # the task has stalled mid-stream.  This fires on the 5-min cadence regardless of nudge thresholds.
+    # the task has stalled mid-stream.
+    #
+    # One-shot escalation: NUDGE once → immediately escalate on next tick.
+    # Track nudged steps in `gap1_nudged_steps` set. If step already nudged → escalate now.
+    # This prevents the "nudge storm" of repeated NUDGE_MAIN_AGENT every tick.
     if status in ACTIVE_STATUSES and not pending_external and not progress_is_fresh:
         current_step_id = task.get("current_checkpoint")
         workflow = task.get("workflow", [])
         if is_workflow_step_terminal(workflow, current_step_id):
-            new_count = increment_retry(monitoring, current_step_id, FAILURE_TYPES["STEP_COMPLETED_BUT_STALLING"])
-            if new_count >= MAX_RETRY_COUNT:
+            gap1_nudged_steps = set(monitoring.get("gap1_nudged_steps", []))
+            if current_step_id in gap1_nudged_steps:
+                # Already nudged for this step's GAP-1 → escalate immediately (one-shot escalation)
                 candidates.append({
                     "state": "BLOCKED_ESCALATE",
-                    "reason": f"step '{current_step_id}' reached terminal sub-state but task has not advanced for {last_progress_age}s; step stalling after {new_count} checks",
+                    "reason": f"step '{current_step_id}' already nudged but still stalled; one-shot escalation fired",
                     "action": "send_blocked_escalation_then_delete_cron",
                     "failure_type": FAILURE_TYPES["STEP_COMPLETED_BUT_STALLING"],
                 })
             else:
+                # First detection for this step → NUDGE once, record in set
+                gap1_nudged_steps.add(current_step_id)
+                monitoring["gap1_nudged_steps"] = sorted(gap1_nudged_steps)
                 candidates.append({
                     "state": "NUDGE_MAIN_AGENT",
                     "reason": f"step '{current_step_id}' done but task stalled; no new checkpoint in {last_progress_age}s; advance to next step or write BLOCKED",
                     "action": "send_execution_nudge",
                     "failure_type": FAILURE_TYPES["STEP_COMPLETED_BUT_STALLING"],
                 })
+                # Record that we've nudged for this step (supervision metadata, written by apply_supervision_update)
 
     if not candidates:
         if status in ACTIVE_STATUSES and (progress_is_fresh or pending_external):
@@ -562,6 +572,7 @@ def evaluate_task(task, now):
         "suspicious_external_jobs": suspicious_jobs,
         "failure_type": chosen.get("failure_type"),
         "external_evidence_ok": external_eval["has_legit_pending"],
+        "gap1_nudged_steps": list(monitoring.get("gap1_nudged_steps", [])),
     }
 
 
