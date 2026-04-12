@@ -9,7 +9,7 @@ from typing import Any
 
 from reporting_contract import ensure_reporting
 
-STATE_CHOICES = ["STARTED", "CHECKPOINT", "BLOCKED", "COMPLETED"]
+STATE_CHOICES = ["STARTED", "STEP_PROGRESS", "STEP_COMPLETED", "BLOCKED", "TASK_COMPLETED"]
 
 ROOT = Path(__file__).resolve().parent.parent
 TASK_LEDGER = ROOT / "scripts" / "task_ledger.py"
@@ -24,7 +24,7 @@ DEFAULT_MONITOR_EVERY = "5m"
 ACTIVATION_TEMPLATE = """ACTIVATED
 - skill: long-task-control
 - announcement: 目前這個 task 會採用 long-task-control SKILL 執行
-- reporting: 我會用 checkpoint / blocker / completed 這類可驗證狀態回報進度；有新事實才更新，不用模糊的「還在跑」敘述
+- reporting: 我會用 STEP_PROGRESS / STEP_COMPLETED / BLOCKED / TASK_COMPLETED 這類可驗證 observed truth 回報；有新事實才更新，不用模糊的「還在跑」敘述
 - next: 接著建立 task record，開始第一個可驗證步驟
 {task_note}""".strip()
 
@@ -121,7 +121,7 @@ def cron_prompt(ledger_path: Path, task_id: str, requester_channel: str, session
 
 ⚠️ 新 nudge delivery 架構（重要）：
 - NUDGE_MAIN_AGENT / OWNER_RECONCILE → 用 sessions_send 直接喚醒 owner agent（main session: `{session_key}`），不是發 Discord
-- BLOCKED_ESCALATE / COMPLETED / milestone checkpoints → 才用 message.send 發 Discord 通知 user
+- BLOCKED_ESCALATE / TASK_COMPLETED / milestone step-complete updates → 才用 message.send 發 Discord 通知 user
 - 這樣確保 owner agent 被喚醒續行，不靠 Discord 訊息被動等待
 
 嚴格步驟：
@@ -157,7 +157,7 @@ def cron_prompt(ledger_path: Path, task_id: str, requester_channel: str, session
          任務處於落後狀態，請儘快回報你所處的 branch：
            - A_IN_PROGRESS_FORGOT_LEDGER：還在跑但忘了更新 ledger，請補 checkpoint
            - B_BLOCKED：任務被 block，請寫 BLOCKED checkpoint
-           - C_COMPLETED：任務已完成，請寫 COMPLETED checkpoint
+           - C_COMPLETED：任務已完成，請寫 TASK_COMPLETED truth
            - D_NO_REPLY：無法確認，先找外部 evidence
            - E_FORGOT_OR_NOT_DOING：忘了或沒在做，請立刻補做
          reason=<reason>
@@ -194,7 +194,7 @@ def format_notification(task, report):
             f"resume_token={resume_token}",
             "請 main agent 立刻回來續行，先自救：resume / rebuild-safe-step / reconcile 缺漏 checkpoint；真的推不動才標記 BLOCKED。",
         ])
-    if state == "OWNER_RECONCILE":
+    if state in {"OWNER_RECONCILE", "TRUTH_INCONSISTENT"}:
         branches = facts.get("branches") or {}
         suspicious_jobs = facts.get("suspicious_external_jobs") or []
         required_provider_evidence = facts.get("required_provider_evidence") or []
@@ -246,7 +246,7 @@ def render_status_block(state, task_id, *, goal=None, checkpoint=None, workflow_
                         outputs=None, completed=None, validation=None, blocker=None, tried=None,
                         need=None, next_action=None):
     lines = [state, f"- task_id: {task_id}"]
-    if goal and state in {"STARTED", "COMPLETED"}:
+    if goal and state in {"STARTED", "TASK_COMPLETED"}:
         lines.append(f"- goal: {goal}")
     if checkpoint:
         lines.append(f"- checkpoint: {checkpoint}")
@@ -259,10 +259,10 @@ def render_status_block(state, task_id, *, goal=None, checkpoint=None, workflow_
         for key, value in facts.items():
             lines.append(f"  - {key}={value}")
     if outputs:
-        lines.append("- output artifacts:" if state == "COMPLETED" else "- outputs:")
+        lines.append("- output artifacts:" if state == "TASK_COMPLETED" else "- outputs:")
         for item in outputs:
             lines.append(f"  - {item}")
-    if completed and state == "COMPLETED":
+    if completed and state == "TASK_COMPLETED":
         lines.append("- completed checkpoints:")
         for item in completed:
             lines.append(f"  - {item}")
@@ -270,11 +270,11 @@ def render_status_block(state, task_id, *, goal=None, checkpoint=None, workflow_
         lines.append("- tried:")
         for item in tried:
             lines.append(f"  - {item}")
-    if validation and state == "COMPLETED":
+    if validation and state == "TASK_COMPLETED":
         lines.append("- validation:")
         for item in validation:
             lines.append(f"  - {item}")
-    if state == "COMPLETED":
+    if state == "TASK_COMPLETED":
         lines.append("- background items still running:")
         lines.append("  - none")
     if blocker and state == "BLOCKED":
@@ -284,7 +284,7 @@ def render_status_block(state, task_id, *, goal=None, checkpoint=None, workflow_
         for item in need:
             lines.append(f"  - {item}")
     if next_action:
-        lines.append(f"- {'handoff' if state == 'COMPLETED' else 'next'}: {next_action}")
+        lines.append(f"- {'handoff' if state == 'TASK_COMPLETED' else 'next'}: {next_action}")
     return "\n".join(lines)
 
 
@@ -315,9 +315,9 @@ def executor_prompt(ledger_path: Path, task_id: str):
     The executor is an OpenClaw subagent that:
     1. Reads the task ledger to find the current step
     2. Executes the next pending workflow step
-    3. Writes a CHECKPOINT to the ledger
+    3. Writes STEP_PROGRESS / STEP_COMPLETED truth to the ledger
     4. Repeats until the workflow is done
-    5. Writes COMPLETED when finished
+    5. Writes TASK_COMPLETED when finished
 
     The executor is auto-resuming: it reads the ledger's current_checkpoint
     and starts from the next pending step. If step-01 is DONE and step-02 is
@@ -335,13 +335,13 @@ def executor_prompt(ledger_path: Path, task_id: str):
 1. exec: python3 {ROOT / 'scripts' / 'executor_engine.py'} --ledger {ledger_path} preview {task_id}
 2. 解析 JSON，看 action 欄位：
    - "execute_step" → 執行它（見下）
-   - "workflow_complete" → 寫 COMPLETED checkpoint，輸出 "EXECUTOR_DONE"，结束
+   - "workflow_complete" → 寫 TASK_COMPLETED truth，輸出 "EXECUTOR_DONE"，结束
    - "already_completed" / "terminal_state" → 輸出 "EXECUTOR_DONE"，结束
    - "blocked" → 輸出 "EXECUTOR_BLOCKED"，结束
 3. 執行步驟（"execute_step"）：
    a. 決定這步要做什麼（從 ledger 的 workflow[] / next_action / goal 推斷）
    b. 實際執行（shell command / API call / file operation 等）
-   c. 成功後，exec: python3 {ROOT / 'scripts' / 'task_ledger.py'} --ledger {ledger_path} checkpoint {task_id} --kind CHECKPOINT --summary "<描述這步完成了什麼>" --current-checkpoint <step-id> --next-action "<下一步做什麼>"
+   c. 成功後，exec: python3 {ROOT / 'scripts' / 'task_ledger.py'} --ledger {ledger_path} checkpoint {task_id} --event-type STEP_COMPLETED --summary "<描述這步完成了什麼>" --current-checkpoint <step-id> --next-action "<下一步做什麼>"
    d. 用 --fact 附上關鍵 output evidence（file path、job id、output URL 等）
    e. 如果有 artifact，用 --artifact 標記
 4. 回到步驟 1（ledger 更新過，current_checkpoint 已前進）
@@ -350,7 +350,7 @@ def executor_prompt(ledger_path: Path, task_id: str):
 - 每次只做一個 step，不要一口氣做很多
 - 每個 step 完成後馬上寫 checkpoint，這樣萬一中斷，下一次啟動會從斷點繼續
 - 如果 external job（RunningHub 等）需要等待，用 external-job command 寫 pending 狀態，不要 block 在那裡等
-- 完成整個 workflow → 寫 COMPLETED checkpoint，狀態 block 要包含所有 completed steps 和 output artifacts
+- 完成整個 workflow → 寫 TASK_COMPLETED truth，狀態 block 要包含所有 completed steps 和 output artifacts
 - 輸出 "EXECUTOR_DONE" 表示整個 task 完成
 - 如果 task 被 BLOCK → 馬上停止，輸出 "EXECUTOR_BLOCKED"
 
@@ -387,7 +387,7 @@ def cmd_run_executor(args):
     # The executor runs as a cron job with a long timeout that wakes every 5 minutes.
     # Each tick: read ledger → execute next step → write checkpoint → exit.
     # The monitor cron watches the executor and handles GAP-1 / stalled escalation.
-    # If the executor completes all steps, it writes COMPLETED and the monitor stops.
+    # If the executor completes all steps, it writes TASK_COMPLETED and the monitor stops.
     add_cmd = [
         "openclaw", "cron", "add",
         "--json",
@@ -442,7 +442,7 @@ def cmd_record_update(args):
     facts = parse_key_values(args.fact)
     outputs = args.output or []
     validation = list(args.validation or [])
-    if args.state == "COMPLETED" and outputs:
+    if args.state == "TASK_COMPLETED" and outputs:
         validation.extend(validate_outputs(outputs))
 
     if args.state == "BLOCKED":
@@ -462,19 +462,32 @@ def cmd_record_update(args):
         if args.next_action:
             cmd.extend(["--next-action", args.next_action])
         ledger_result = run(*cmd)
-    else:
-        status = "COMPLETED" if args.state == "COMPLETED" else (args.status or "RUNNING")
-        summary = args.summary or f"{args.state} recorded via execution wrapper"
+    elif args.state == "STARTED":
         cmd = [
             "python3", str(TASK_LEDGER), "--ledger", str(args.ledger), "checkpoint", args.task_id,
-            "--kind", args.state,
-            "--summary", summary,
-            "--status", status,
+            "--event-type", "STEP_PROGRESS",
+            "--summary", args.summary,
+        ]
+        for key, value in facts.items():
+            cmd.extend(["--fact", f"{key}={value}"])
+        if args.current_checkpoint:
+            cmd.extend(["--current-checkpoint", args.current_checkpoint])
+        if args.next_action:
+            cmd.extend(["--next-action", args.next_action])
+        ledger_result = run(*cmd)
+    else:
+        event_type = args.state
+        cmd = [
+            "python3", str(TASK_LEDGER), "--ledger", str(args.ledger), "checkpoint", args.task_id,
+            "--event-type", event_type,
+            "--summary", args.summary,
         ]
         for key, value in facts.items():
             cmd.extend(["--fact", f"{key}={value}"])
         for item in outputs:
             cmd.extend(["--artifact", item])
+        for item in validation:
+            cmd.extend(["--validation", item])
         if args.resume_token:
             cmd.extend(["--resume-token", args.resume_token])
         if args.current_checkpoint:
@@ -482,11 +495,6 @@ def cmd_record_update(args):
         if args.next_action:
             cmd.extend(["--next-action", args.next_action])
         ledger_result = run(*cmd)
-        if args.state == "COMPLETED" and validation:
-            ledger = load_ledger(args.ledger)
-            task = find_task(ledger, args.task_id)
-            task.setdefault("validation", []).extend(validation)
-            save_ledger(args.ledger, ledger)
 
     ledger = load_ledger(args.ledger)
     task = find_task(ledger, args.task_id)
@@ -717,9 +725,10 @@ def cmd_activate_task(args):
         "prompt_preview": prompt,
         "suggested_owner_updates": {
             "started": f"python3 scripts/openclaw_ops.py --ledger {args.ledger} record-update STARTED {args.task_id} --summary '<what actually started>' --current-checkpoint <step-id> --next-action '<next real action>' --fact key=value",
-            "checkpoint": f"python3 scripts/openclaw_ops.py --ledger {args.ledger} record-update CHECKPOINT {args.task_id} --summary '<what verifiably changed>' --current-checkpoint <step-id> --next-action '<next real action>' --fact key=value",
-            "blocked": f"python3 scripts/openclaw_ops.py --ledger {args.ledger} record-update BLOCKED {args.task_id} --summary '<blocker>' --current-checkpoint <step-id> --need '<required unblock action>' --next-action '<safe next step>'",
-            "completed": f"python3 scripts/openclaw_ops.py --ledger {args.ledger} record-update COMPLETED {args.task_id} --summary '<completion evidence>' --current-checkpoint <step-id> --output <file> --fact key=value",
+            "step_progress": f"python3 scripts/openclaw_ops.py --ledger {args.ledger} record-update STEP_PROGRESS {args.task_id} --summary '<what did you actually observe changing>' --current-checkpoint <step-id> --next-action '<next real action>' --fact key=value",
+            "step_completed": f"python3 scripts/openclaw_ops.py --ledger {args.ledger} record-update STEP_COMPLETED {args.task_id} --summary '<which step actually completed>' --current-checkpoint <step-id> --next-action '<next real action>' --fact key=value",
+            "blocked": f"python3 scripts/openclaw_ops.py --ledger {args.ledger} record-update BLOCKED {args.task_id} --summary '<observed blocker>' --current-checkpoint <step-id> --need '<required unblock action>' --next-action '<safe next step>' --fact failure_type=<observed failure>",
+            "task_completed": f"python3 scripts/openclaw_ops.py --ledger {args.ledger} record-update TASK_COMPLETED {args.task_id} --summary '<completion evidence>' --current-checkpoint <step-id> --output <file> --fact key=value",
         },
     }, ensure_ascii=False, indent=2))
 
@@ -833,7 +842,7 @@ def cmd_preview_tick(args):
     ledger = load_ledger(args.ledger)
     task = find_task(ledger, args.task_id)
     report = next(item for item in run_json["reports"] if item["task_id"] == args.task_id)
-    notify = report["state"] in {"NUDGE_MAIN_AGENT", "OWNER_RECONCILE", "BLOCKED_ESCALATE"}
+    notify = report["state"] in {"NUDGE_MAIN_AGENT", "OWNER_RECONCILE", "TRUTH_INCONSISTENT", "BLOCKED_ESCALATE"}
     reporting = ensure_reporting(task)
     pending = reporting.get("pending_updates", [])
     deliverable = [u for u in pending if not u.get("delivered")]
@@ -849,6 +858,8 @@ def cmd_preview_tick(args):
         "pending_user_updates": pending,
         "pending_user_updates_deliverable": [u["update_id"] for u in deliverable],
         "pending_user_updates_deliverable_count": len(deliverable),
+        "truth_state": report.get("truth_state"),
+        "inconsistencies": report.get("inconsistencies", []),
     }, ensure_ascii=False, indent=2))
 
 
