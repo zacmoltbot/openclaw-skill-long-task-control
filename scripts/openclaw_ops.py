@@ -357,7 +357,8 @@ def run_init_task(args):
     task.setdefault("message", {})["requester_channel"] = args.requester_channel or task.get("channel")
     task["message"]["nudge_channel"] = args.nudge_channel or task.get("channel")
     task["message"]["nudge_target"] = args.nudge_target or args.requester_channel or task.get("channel")
-    task.setdefault("monitoring", {})["cron_state"] = "PENDING_INSTALL"
+    # NOTE: do NOT write cron_state here — let the caller write ACTIVE only after
+    # 'openclaw cron add' succeeds, or INSTALL_FAILED if it fails after retry.
     save_ledger(args.ledger, ledger)
     return result.stdout.strip(), task
 
@@ -388,8 +389,8 @@ def cmd_render_prompt(args):
 
 
 def _run_cron_add_with_retry(add_cmd, ledger_path, task_id, disabled):
-    """Run 'openclaw cron add', retry once after 3-5s on failure, update ledger on final failure."""
-    import time, random
+    """Run 'openclaw cron add', retry once after 3-5s on failure, write INSTALL_FAILED to ledger on final failure."""
+    import time, random, sys
     shell_cmd = " ".join(shlex.quote(part) for part in add_cmd)
     proc = run(shell_cmd, shell=True, check=False)
     if proc.returncode != 0:
@@ -399,12 +400,21 @@ def _run_cron_add_with_retry(add_cmd, ledger_path, task_id, disabled):
         proc = run(shell_cmd, shell=True, check=False)
         if proc.returncode != 0:
             # retry also failed — mark ledger as INSTALL_FAILED
+            err_msg = f"exit={proc.returncode}; stderr={proc.stderr[:500]}"
             ledger = load_ledger(ledger_path)
             task = find_task(ledger, task_id)
             task.setdefault("monitoring", {})["cron_state"] = "INSTALL_FAILED"
-            task.setdefault("monitoring", {})["cron_install_error"] = f"exit={proc.returncode}; stderr={proc.stderr[:500]}"
+            task.setdefault("monitoring", {})["cron_install_error"] = err_msg
             save_ledger(ledger_path, ledger)
-            raise SystemExit(f"openclaw cron add failed even after retry (exit={proc.returncode})\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}")
+            # Emit a structured error block on stderr so main agent can parse it
+            sys.stderr.write(
+                f"INSTALL_FAILED task_id={task_id} "
+                f"reason=cron_add_failed_after_retry "
+                f"exit_code={proc.returncode} "
+                f"stderr={shlex.quote(proc.stderr[:200].strip())}\n"
+            )
+            sys.stderr.flush()
+            raise SystemExit(1)  # non-zero exit, ledger already updated above
     return parse_json_from_mixed_output(proc.stdout)
 
 
@@ -432,6 +442,8 @@ def cmd_activate_task(args):
         dry_run=args.dry_run,
     )
 
+    # Reload ledger: run_init_task no longer writes cron_state (PENDING_INSTALL was removed),
+    # so we need a fresh task reference after init completes.
     ledger = load_ledger(args.ledger)
     task = find_task(ledger, args.task_id)
     requester_channel = install_ns.requester_channel or task.get("message", {}).get("nudge_target") or task.get("channel")
