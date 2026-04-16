@@ -138,9 +138,6 @@ python3 scripts/openclaw_ops.py --ledger state/long-task-ledger.json bootstrap-t
   --next-action "Start step-01"
 ```
 
-## What changed through the recent live RunningHub tests
-
-The recent Eko / RunningHub live tests pushed LTC from monitor/control-plane MVP into a more real execution product.
 
 ### Proven working now
 
