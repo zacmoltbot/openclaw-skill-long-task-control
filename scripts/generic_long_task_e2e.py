@@ -84,11 +84,10 @@ def main():
 
         checkpoint = run_json(
             'python3', str(OPENCLAW_OPS), '--ledger', str(ledger), 'record-update', 'STEP_COMPLETED', task_id,
-            '--summary', 'Artifact build finished',
-            '--current-checkpoint', 'step-02',
-            '--next-action', 'Validate output and handoff',
-            '--fact', 'artifact_build=done',
-            '--fact', f'artifact_path={artifact}',
+            '--summary', 'Input inspection finished',
+            '--current-checkpoint', 'step-01',
+            '--next-action', 'Build the artifact',
+            '--fact', 'input_inspection=done',
         )
         assert checkpoint['task_status'] == 'RUNNING'
 
@@ -100,13 +99,32 @@ def main():
             'python3', str(TASK_LEDGER), '--ledger', str(ledger), 'owner-reply', task_id,
             '--reply', 'A',
             '--summary', 'Owner confirms work continued and ledger is now backfilled',
-            '--current-checkpoint', 'step-03',
-            '--next-action', 'Publish completion with validation evidence',
+            '--current-checkpoint', 'step-02',
+            '--next-action', 'Finish the final validation step',
             '--fact', 'backfill=true',
         )
         task = task_from(ledger, task_id)
         assert task['monitoring']['owner_response_kind'] == 'A_IN_PROGRESS_FORGOT_LEDGER'
         assert task['status'] == 'RUNNING'
+
+        build_done = run_json(
+            'python3', str(OPENCLAW_OPS), '--ledger', str(ledger), 'record-update', 'STEP_COMPLETED', task_id,
+            '--summary', 'Artifact build finished',
+            '--current-checkpoint', 'step-02',
+            '--next-action', 'Validate output and handoff',
+            '--fact', 'artifact_build=done',
+            '--fact', f'artifact_path={artifact}',
+        )
+        assert build_done['task_status'] == 'RUNNING'
+
+        final_step = run_json(
+            'python3', str(OPENCLAW_OPS), '--ledger', str(ledger), 'record-update', 'STEP_COMPLETED', task_id,
+            '--summary', 'Final validation step finished',
+            '--current-checkpoint', 'step-03',
+            '--next-action', 'Publish completion with validation evidence',
+            '--fact', 'validation_step=done',
+        )
+        assert final_step['task_status'] == 'RUNNING'
 
         completed = run_json(
             'python3', str(OPENCLAW_OPS), '--ledger', str(ledger), 'record-update', 'TASK_COMPLETED', task_id,

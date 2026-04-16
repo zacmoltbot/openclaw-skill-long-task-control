@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+state/jobs/
+state/long-task-ledger.json
+.DS_Store

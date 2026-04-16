@@ -10,9 +10,9 @@ from task_ledger import PENDING_EXTERNAL_STATES, PROVIDER_EVIDENCE_KEYS, project
 TERMINAL_STATUSES = {"COMPLETED", "FAILED", "ABANDONED"}
 STATE_PRIORITY = [
     "STOP_AND_DELETE",
-    "BLOCKED_ESCALATE",
     "TRUTH_INCONSISTENT",
     "OWNER_RECONCILE",
+    "BLOCKED_ESCALATE",
     "NUDGE_MAIN_AGENT",
     "STALE_PROGRESS",
     "HEARTBEAT_DUE",
@@ -136,6 +136,13 @@ def build_action_payload(task, chosen, now_iso_value):
                 "inconsistencies": derived.get("inconsistencies", []),
                 "suspicious_external_jobs": derived.get("suspicious_external_jobs", []),
                 "required_provider_evidence": sorted(PROVIDER_EVIDENCE_KEYS),
+                "branches": {
+                    "A_IN_PROGRESS_FORGOT_LEDGER": "還在做，只是忘了補 ledger；請立刻補真實 checkpoint",
+                    "B_BLOCKED": "已確認卡住；請寫 BLOCKED truth 與具體 unblock need",
+                    "C_COMPLETED": "其實已完成；請補 TASK_COMPLETED truth 與 validation evidence",
+                    "D_NO_REPLY": "目前無法確認；先找外部 evidence，不要猜測 task truth",
+                    "E_FORGOT_OR_NOT_DOING": "承認沒做或忘了做；請立刻 resume 並補做",
+                },
             },
             "resume_token": resume_token,
             "created_at": now_iso_value,
@@ -253,7 +260,7 @@ def evaluate_task(task, now):
     cfg = monitoring_config(task)
     status = task.get("status")
     current_step = derived.get("current_step") or task.get("current_checkpoint") or "unknown"
-    last_progress_age = age_seconds(now, first_non_null(derived.get("last_observed_progress_at"), hb.get("last_progress_at"), task.get("last_checkpoint_at")))
+    last_progress_age = age_seconds(now, first_non_null(task.get("last_checkpoint_at"), derived.get("last_observed_progress_at"), hb.get("last_progress_at")))
     last_heartbeat_age = age_seconds(now, hb.get("last_heartbeat_at"))
     last_nudge_age = age_seconds(now, monitoring.get("last_nudge_at"))
     should_renotify = last_nudge_age is None or last_nudge_age >= cfg["renotify_interval_sec"]
@@ -264,6 +271,10 @@ def evaluate_task(task, now):
     if status == "BLOCKED" and monitoring.get("last_escalated_at"):
         candidates.append({"state": "STOP_AND_DELETE", "reason": "blocked escalation already delivered", "action": "delete_monitor_cron"})
 
+    user_facing = derived.get("user_facing") or {}
+    outcome_status = user_facing.get("outcome_status")
+    outcome_artifacts = user_facing.get("artifacts") or []
+
     if derived.get("truth_state") == "INCONSISTENT":
         candidates.append({
             "state": "TRUTH_INCONSISTENT",
@@ -272,14 +283,21 @@ def evaluate_task(task, now):
             "message": "Observed truth is inconsistent. First observe the real world and backfill truth; do not guess pending/OK from partial data.",
         })
 
+    if outcome_status == "PARTIAL_SUCCESS":
+        candidates.append({
+            "state": "OWNER_RECONCILE",
+            "reason": "outputs already exist, so reconcile to a user-facing partial-success/success result before surfacing control-plane interruption noise",
+            "action": "request_result_reconcile",
+            "message": "Useful outputs already exist. Reconcile the task from the user/result point of view first: report partial success or success with the produced artifacts, then mention any interruption/cleanup issue honestly.",
+        })
+
     if status in TERMINAL_STATUSES:
         inconsistencies = derived.get("inconsistencies", [])
         # "completed_but_steps_not_done" is an informational marker (steps were skipped),
         # not a real recoverable inconsistency. For monitoring purposes, treat terminal
         # tasks with only this inconsistency as clean terminal → STOP_AND_DELETE.
         non_step_inconsistencies = [i for i in inconsistencies if i != "task:completed_but_steps_not_done" and not i.startswith("task:completed")]
-        if non_step_inconsistencies or derived.get("truth_state") != "INCONSISTENT":
-            # Only real inconsistencies block STOP_AND_DELETE
+        if non_step_inconsistencies or derived.get("truth_state") == "INCONSISTENT":
             candidates.append({"state": "TRUTH_INCONSISTENT", "reason": f"task status is terminal ({status}) but has unresolved inconsistencies", "action": "request_owner_reconcile_then_delete"})
         else:
             candidates.append({"state": "STOP_AND_DELETE", "reason": f"task status is terminal ({status})", "action": "delete_monitor_cron"})
@@ -345,6 +363,8 @@ def evaluate_task(task, now):
         "inconsistencies": derived.get("inconsistencies", []),
         "suspicious_external_jobs": derived.get("suspicious_external_jobs", []),
         "retry_count": monitoring.get("retry_count", {}),
+        "user_facing": user_facing,
+        "outcome_artifact_count": len(outcome_artifacts),
     }
 
 

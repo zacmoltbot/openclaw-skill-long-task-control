@@ -1,36 +1,62 @@
 # OpenClaw-native runbook
 
-Use this runbook when you want `long-task-control` to operate as a real OpenClaw workflow instead of a repo-local demo.
+Use this runbook when you want `long-task-control` to behave like a real OpenClaw workflow instead of a repo-local demo.
+
+## Canonical flow
+
+The canonical skill path is now **execution-first**:
+
+1. `bootstrap-task`
+2. auto `init-execution-job`
+3. auto first `runner_engine.py run-loop` tick with execution ownership
+4. monitor stays in the supervision lane: nudge / reconcile / blocked escalate / cleanup
+
+For the generic path, encode executable workflow steps directly in `--workflow` using `:: key=value` parts, for example:
+
+```bash
+--workflow "Build draft :: shell=python3 build.py --out /tmp/draft.txt :: expect=/tmp/draft.txt"
+```
+
+If a step has no executable semantics, the generic path must block honestly instead of fake-completing.
+
+That means `bootstrap-task` is no longer just “activation + monitor install”. It is the productized entrypoint that starts execution by default.
 
 ## Goal
 
 Turn one long-running task into connected OpenClaw-native pieces:
 
-1. **activation message in the live session**
-2. **durable ledger entry on disk**
-3. **executor subagent** that drives the task step by step
-4. **monitor cron** that watches the executor and handles GAP-1 / delivery push
-5. **message-driven nudge / reconcile / blocked-escalate / auto-cleanup flow**
+1. activation message in the live session
+2. durable ledger entry on disk
+3. generic execution-plane job derived from the workflow
+4. first execution tick started automatically
+5. monitor cron for supervision / recovery / cleanup
+6. message-driven delivery / nudge / reconcile / blocked-escalate / cleanup flow
 
 The integration helper is `scripts/openclaw_ops.py`.
 
-## Executor + Monitor Architecture
+## Canonical architecture
 
-```
-Executor subagent (cron)
-  └─ reads ledger → executes next step → writes CHECKPOINT → repeats
+```text
+bootstrap-task
+  ├─ activation + TASK START
+  ├─ ledger init
+  ├─ install monitor cron
+  ├─ derive generic execution job
+  └─ start first runner tick with execution ownership
        │
-       └─ monitor cron watches executor's ledger progress
-            ├─ GAP-1: step done but next hasn't started → nudge once → escalate
-            ├─ delivery push: pending_user_updates → Discord (passive every tick)
-            └─ STOP_AND_DELETE when task is COMPLETED / escalated
+       ├─ runner_engine.py run-loop advances items
+       ├─ executor_engine.py executes one item at a time
+       ├─ execution_bridge.py syncs observed lifecycle back into ledger/reporting
+       └─ monitor cron supervises the ledger truth
+            ├─ passive delivery push
+            ├─ nudge / reconcile when owner stalls
+            ├─ blocked escalation when self-recovery is exhausted
+            └─ STOP_AND_DELETE on terminal state
 ```
 
-The monitor observes the executor, not the other way around. If the executor stalls, the monitor GAP-1 kicks in. The executor auto-resumes from the ledger's `current_checkpoint`.
+The monitor is **not** the primary execution owner. The execution plane is.
 
-## Activation lifecycle
-
-### Preferred default: bootstrap + executor
+## Preferred default: one command boots and starts execution
 
 ```bash
 python3 scripts/openclaw_ops.py --ledger state/long-task-ledger.json bootstrap-task <task_id> \
@@ -41,32 +67,65 @@ python3 scripts/openclaw_ops.py --ledger state/long-task-ledger.json bootstrap-t
   --workflow "Validate and handoff" \
   --next-action "Start checkpoint 1" \
   --message-ref "discord:msg:<activation-message-id>"
-
-# Then spawn the executor subagent:
-python3 scripts/openclaw_ops.py --ledger state/long-task-ledger.json run-executor <task_id>
 ```
 
-`bootstrap-task` creates the ledger and installs the monitor cron. `run-executor` installs the executor cron that drives the workflow.
+Default bootstrap behavior now does all of this:
 
-Treat these as the canonical OpenClaw-native entrypoint for multi-stage tasks:
-- `bootstrap-task`: bundles activation block, `TASK START` block, ledger init, monitor cron install
-- `run-executor`: spawns the executor subagent that auto-resumes and executes each step
+- creates the durable ledger task
+- installs the monitor cron
+- derives `<task_id>-job` under `state/jobs/`
+- runs the first `runner_engine.py run-loop` tick automatically
+- acquires execution ownership via runner lock / `--execution-owner`
+- starts writing execution truth back into ledger/reporting immediately
 
-### Advanced / manual split-phase path
+The JSON response now includes:
 
-Only use this when debugging or custom orchestration requires phase separation.
+- activation block
+- `TASK START` block
+- monitor install result
+- `execution.job`
+- `execution.first_run`
+- follow-up `continue_execution` command
 
-#### Step 1: emit the activation message
+## Continue execution
+
+After bootstrap, keep using the runner as the canonical executor:
+
+```bash
+python3 scripts/runner_engine.py --jobs-root state/jobs run-loop <task_id>-job --execution-owner owner:<task_id>
+```
+
+Use repeated invocations when you want bounded work per tick, or omit `--max-steps` to drain the serial workflow.
+
+## Manual / advanced controls
+
+Use these only when debugging or custom orchestration requires split phases.
+
+### Bootstrap without auto execution
+
+```bash
+python3 scripts/openclaw_ops.py --ledger state/long-task-ledger.json bootstrap-task <task_id> \
+  --goal "<goal>" \
+  --requester-channel <discord-channel-id> \
+  --workflow "Inspect inputs" \
+  --workflow "Run implementation" \
+  --workflow "Validate and handoff" \
+  --next-action "Start checkpoint 1" \
+  --message-ref "discord:msg:<activation-message-id>" \
+  --no-auto-execution
+```
+
+### Split bootstrap from execution start
+
+```bash
+python3 scripts/openclaw_ops.py --ledger state/long-task-ledger.json init-execution-job <task_id>
+python3 scripts/runner_engine.py --jobs-root state/jobs run-loop <task_id>-job --execution-owner owner:<task_id>
+```
+
+### Manual ledger/bootstrap path
 
 ```bash
 python3 scripts/openclaw_ops.py activation --task-note "<short task note>"
-```
-
-Post that block to the requester session/channel before meaningful work starts.
-
-#### Step 2: create the ledger task
-
-```bash
 python3 scripts/openclaw_ops.py --ledger state/long-task-ledger.json init-task <task_id> \
   --goal "<one sentence goal>" \
   --requester-channel <discord-channel-id> \
@@ -74,127 +133,44 @@ python3 scripts/openclaw_ops.py --ledger state/long-task-ledger.json init-task <
   --workflow "Run implementation" \
   --workflow "Validate and handoff" \
   --next-action "Start checkpoint 1" \
-  --message-ref "discord:msg:<activation-message-id>" \
-  --fact channel_id=<discord-channel-id>
-```
-
-This writes:
-
-- activation metadata
-- workflow checkpoints
-- heartbeat / timeout settings
-- requester channel metadata for later nudges
-
-#### Step 3: install the monitor cron
-
-```bash
+  --message-ref "discord:msg:<activation-message-id>"
 python3 scripts/openclaw_ops.py --ledger state/long-task-ledger.json install-monitor <task_id>
 ```
 
-#### Step 4: install the executor (optional — for auto-drive mode)
+Keep this out of the main docs path. It exists for debugging, not as the recommended operating model.
+
+## Legacy / non-canonical path
+
+`run-executor` remains in the repo only as a temporary legacy escape hatch for subagent-driven orchestration experiments.
 
 ```bash
 python3 scripts/openclaw_ops.py --ledger state/long-task-ledger.json run-executor <task_id>
 ```
 
-Use `--dry-run` if you only want to preview the generated job + prompt.
+Do not treat it as the default path. Acceptance and main docs should assume the runner-based execution plane instead.
 
 ## What the monitor cron does
 
-The installed cron job wakes an isolated OpenClaw agent and gives it a strict prompt generated by:
+The installed cron job wakes an isolated OpenClaw agent and uses the prompt from:
 
 ```bash
 python3 scripts/openclaw_ops.py --ledger state/long-task-ledger.json render-monitor-prompt <task_id>
 ```
 
-The prompt tells the cron agent to:
+Per tick it:
 
-1. **PASSIVE DELIVERY PUSH (mandatory, every tick)**: check `reporting.pending_updates[]` for `delivered=false`; send each to Discord via `message.send`; then `ack-delivery`
-2. run `monitor_nudge.py`
-3. read only the selected `task_id`
-4. decide whether to stay quiet, send a reminder, reconcile owner truth, escalate blocked, or delete the cron
-5. use `message.send` for live nudges / reconciles / escalations
-6. call `openclaw_ops.py remove-monitor` for `BLOCKED_ESCALATE` and `STOP_AND_DELETE`
+1. passively delivers any `reporting.pending_updates[]`
+2. runs `monitor_nudge.py`
+3. reads the selected `task_id`
+4. decides whether to stay quiet, nudge, reconcile, escalate blocked, or delete the cron
+5. removes itself on `BLOCKED_ESCALATE` or `STOP_AND_DELETE`
 
-## What the executor subagent does
+## Preview / operate
 
-The executor cron wakes every 5 minutes and:
-
-1. runs `executor_engine.py preview <task_id>` to see what to do next
-2. executes the next pending workflow step
-3. writes a CHECKPOINT via `task_ledger.py checkpoint`
-4. loops until `workflow_complete` or `blocked`
-5. outputs `EXECUTOR_DONE` or `EXECUTOR_BLOCKED`
-
-**Auto-resume**: reads the ledger's `current_checkpoint`; if step-01 is DONE and step-02 is RUNNING, starts step-02 immediately.
-
-## GAP-1: One-shot nudge + escalate
-
-When a step is terminal (DONE/COMPLETED) but the task hasn't advanced to the next step:
-
-1. **First tick**: monitor fires `NUDGE_MAIN_AGENT` (once), records step in `gap1_nudged_steps[]`
-2. **Second tick**: same step still stalled → step already in `gap1_nudged_steps` → immediately `BLOCKED_ESCALATE`, cron stops
-3. No repeat notifications
-
-## Nudge / reconcile / escalate flow
-
-### NUDGE_MAIN_AGENT
-
-The cron sends a concise fact-based message to the requester channel:
-
-- `task_id`
-- state = `NUDGE_MAIN_AGENT`
-- stale reason
-- `next_action`
-- explicit instruction: resume / checkpoint / close the task
-
-### OWNER_RECONCILE
-
-The cron sends a concise owner-reconcile reminder with the A/B/C/D/E branches:
-
-- `A_IN_PROGRESS_FORGOT_LEDGER`
-- `B_BLOCKED`
-- `C_COMPLETED`
-- `D_NO_REPLY`
-- `E_FORGOT_OR_NOT_DOING`
-
-The main agent then uses:
-
-```bash
-python3 scripts/task_ledger.py --ledger state/long-task-ledger.json owner-reply <task_id> --reply <A|B|C|D|E> ...
-```
-
-### BLOCKED_ESCALATE
-
-The cron sends the blocker payload to the requester channel, then removes its own cron via:
-
-```bash
-python3 scripts/openclaw_ops.py --ledger state/long-task-ledger.json remove-monitor <task_id>
-```
-
-### STOP_AND_DELETE
-
-For `COMPLETED`, `FAILED`, `ABANDONED`, or post-escalated `BLOCKED`, the cron removes itself and writes `monitoring.cron_state=DELETED`.
-
-## Operational commands
-
-### Preview one monitor tick without a live cron job
+### Preview one monitor tick
 
 ```bash
 python3 scripts/openclaw_ops.py --ledger state/long-task-ledger.json preview-tick <task_id>
-```
-
-This is useful during testing because it shows:
-
-- the computed monitor state
-- the exact notification text the cron would send
-- whether the cron would remove itself
-- `pending_user_updates_deliverable_count`
-
-### Preview what the executor would do next
-
-```bash
-python3 scripts/openclaw_ops.py --ledger state/long-task-ledger.json executor-preview <task_id>
 ```
 
 ### Remove a monitor manually
@@ -203,37 +179,45 @@ python3 scripts/openclaw_ops.py --ledger state/long-task-ledger.json executor-pr
 python3 scripts/openclaw_ops.py --ledger state/long-task-ledger.json remove-monitor <task_id>
 ```
 
-### Install monitor but avoid creating a real OpenClaw job
+### Install monitor without a real OpenClaw job
 
 ```bash
 python3 scripts/openclaw_ops.py --ledger state/long-task-ledger.json install-monitor <task_id> --dry-run
 ```
 
-## End-to-end smoke test
+## End-to-end acceptance
 
-Run:
+Canonical skill path:
+
+```bash
+python3 scripts/skill_live_acceptance_e2e.py
+```
+
+Execution-plane MVP bridge/regression:
+
+```bash
+python3 scripts/execution_plane_mvp_e2e.py
+```
+
+OpenClaw-native monitor-oriented regression:
 
 ```bash
 python3 scripts/openclaw_native_e2e.py
 ```
 
-This test proves:
+## What the canonical acceptance proves
 
-1. activation block is generated
-2. ledger init writes requester-channel metadata
-3. OpenClaw monitor install can create a real cron job
-4. stale progress produces `NUDGE_MAIN_AGENT`
-5. GAP-1 one-shot nudge → escalate flow
-6. passive delivery push fires correctly
-7. owner reply `E` forces resume-required path
-8. owner reply `C` closes the task as `COMPLETED`
-9. terminal cleanup removes the real OpenClaw cron job and marks the ledger as deleted
+1. `bootstrap-task` returns activation + `TASK START`
+2. `bootstrap-task` auto-derives the execution job
+3. `bootstrap-task` auto-starts the first runner tick and obtains execution ownership
+4. progress lands in ledger/reporting without hand-written job specs
+5. later `run-loop` invocations continue from persisted on-disk state
+6. terminal completion drives monitor cleanup state (`STOP_AND_DELETE`)
 
 ## Recommended real-world pattern
 
 - main agent runs `bootstrap-task` as the default entrypoint
 - main agent posts the returned activation + `TASK START` blocks
-- main agent spawns `run-executor` to auto-drive the workflow
-- executor writes checkpoints as it advances
-- monitor cron watches executor: GAP-1 nudge if step stalled, passive delivery push every tick
-- terminal completion / blocked escalation removes both crons
+- bootstrap auto-starts execution through the runner
+- owner/orchestrator re-invokes `runner_engine.py run-loop` as needed
+- monitor supervises truth and cleanup; it does not own the main execution path

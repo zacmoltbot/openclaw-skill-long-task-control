@@ -86,6 +86,7 @@ def main():
             "python3", str(LEDGER_TOOL), "--ledger", str(ledger), "owner-reply", task_id,
             "--reply", "E",
             "--summary", "Owner admitted the task was forgotten; resume now",
+            "--current-checkpoint", "step-01",
             "--next-action", "Resume execution now and publish checkpoint 2",
             "--fact", "owner_statement=forgot_to_do_it",
         )
@@ -94,11 +95,33 @@ def main():
         assert task["monitoring"]["owner_response_kind"] == "E_FORGOT_OR_NOT_DOING"
 
         run(
-            "python3", str(LEDGER_TOOL), "--ledger", str(ledger), "owner-reply", task_id,
-            "--reply", "C",
+            "python3", str(OPS), "--ledger", str(ledger), "record-update", "STEP_COMPLETED", task_id,
+            "--summary", "Step 1 completed after resume",
+            "--current-checkpoint", "step-01",
+            "--next-action", "Run checkpoint 2",
+            "--fact", "step_01=done",
+        )
+        run(
+            "python3", str(OPS), "--ledger", str(ledger), "record-update", "STEP_COMPLETED", task_id,
+            "--summary", "Step 2 completed",
+            "--current-checkpoint", "step-02",
+            "--next-action", "Run checkpoint 3",
+            "--fact", "step_02=done",
+        )
+        run(
+            "python3", str(OPS), "--ledger", str(ledger), "record-update", "STEP_COMPLETED", task_id,
+            "--summary", "Step 3 completed",
+            "--current-checkpoint", "step-03",
+            "--next-action", "Publish task completion",
+            "--fact", "step_03=done",
+        )
+        run(
+            "python3", str(OPS), "--ledger", str(ledger), "record-update", "TASK_COMPLETED", task_id,
             "--summary", "Owner confirmed the task is complete",
+            "--current-checkpoint", "step-03",
+            "--next-action", "None",
             "--validation", "artifact_exists=true",
-            "--artifact", str(tmp / "artifact.txt"),
+            "--output", str(tmp / "artifact.txt"),
         )
         preview_3 = run_json("python3", str(OPS), "--ledger", str(ledger), "preview-tick", task_id)
         assert preview_3["state"] == "STOP_AND_DELETE"

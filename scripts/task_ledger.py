@@ -3,6 +3,7 @@ import argparse
 import json
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 from reporting_contract import acknowledge_update, ensure_reporting, maybe_queue_external_update
 
@@ -91,6 +92,8 @@ OBSERVED_FAILURE_TYPES = {
     "DOWNLOAD_INCOMPLETE",
     "TRANSIENT_NETWORK",
     "EXECUTION_ERROR",
+    "EXECUTION_INTERRUPTED",
+    "EXECUTION_PARTIAL_FAILURE",
     "EXTERNAL_WAIT",
     "PERMISSION_DENIED",
     "INVALID_INPUT",
@@ -171,6 +174,46 @@ def extract_provider_evidence(facts=None, seed=None):
     return merged
 
 
+def parse_expected_artifacts_from_workflow_step(step: dict[str, Any]) -> list[str]:
+    raw_title = str(step.get("title") or "").strip()
+    if not raw_title:
+        return []
+    artifacts: list[str] = []
+    for chunk in [part.strip() for part in raw_title.split("::")][1:]:
+        if "=" not in chunk:
+            continue
+        key, value = chunk.split("=", 1)
+        key = key.strip().lower().replace("-", "_")
+        value = value.strip()
+        if not value:
+            continue
+        if key in {"artifact", "output"}:
+            artifacts.append(value)
+        elif key in {"artifacts", "outputs", "expect", "expect_artifacts"}:
+            artifacts.extend([v.strip() for v in value.split("|") if v.strip()])
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for value in artifacts:
+        if value not in seen:
+            deduped.append(value)
+            seen.add(value)
+    return deduped
+
+
+def discover_existing_workflow_artifacts(task: dict[str, Any]) -> list[str]:
+    discovered: list[str] = []
+    seen: set[str] = set()
+    for step in task.get("workflow") or []:
+        for path_str in parse_expected_artifacts_from_workflow_step(step):
+            path = Path(path_str).expanduser()
+            if path.exists():
+                resolved = str(path)
+                if resolved not in seen:
+                    discovered.append(resolved)
+                    seen.add(resolved)
+    return discovered
+
+
 def ensure_task_shape(task):
     task.setdefault("observations", [])
     task.setdefault("workflow", [])
@@ -185,6 +228,9 @@ def ensure_task_shape(task):
     task.setdefault("observed", {})
     task.setdefault("derived", {})
     task.setdefault("checkpoints", [])
+    task.setdefault("runs", [])
+    task.setdefault("run_counter", 1)
+    task.setdefault("active_run_id", "run-01")
     ensure_reporting(task)
     task["heartbeat"].setdefault("watchdog_state", "OK")
     task["heartbeat"].setdefault("expected_interval_sec", 300)
@@ -367,6 +413,157 @@ def ack_resume_request(task, *, resume_token=None, outcome=None, checkpoint=None
     return req
 
 
+def active_run_snapshot(task):
+    ensure_task_shape(task)
+    return {
+        "run_id": task.get("active_run_id") or f"run-{int(task.get('run_counter', 1) or 1):02d}",
+        "status": task.get("status"),
+        "current_checkpoint": task.get("current_checkpoint"),
+        "last_checkpoint_at": task.get("last_checkpoint_at"),
+        "next_action": task.get("next_action"),
+        "heartbeat": json.loads(json.dumps(task.get("heartbeat", {}))),
+        "observed": json.loads(json.dumps(task.get("observed", {}))),
+        "observations": json.loads(json.dumps(task.get("observations", []))),
+        "checkpoints": json.loads(json.dumps(task.get("checkpoints", []))),
+        "external_jobs": json.loads(json.dumps(task.get("external_jobs", []))),
+        "downloads": json.loads(json.dumps(task.get("downloads", []))),
+        "artifacts": json.loads(json.dumps(task.get("artifacts", []))),
+        "validation": json.loads(json.dumps(task.get("validation", []))),
+        "blocker": json.loads(json.dumps(task.get("blocker"))),
+        "derived": json.loads(json.dumps(task.get("derived", {}))),
+    }
+
+
+def archive_active_run(task, *, terminal_status=None, ended_at=None, reason=None):
+    ensure_task_shape(task)
+    snapshot = active_run_snapshot(task)
+    snapshot["started_at"] = task.get("created_at")
+    snapshot["ended_at"] = ended_at or now_iso()
+    if terminal_status:
+        snapshot["status"] = terminal_status
+    if reason:
+        snapshot["end_reason"] = reason
+    runs = task.setdefault("runs", [])
+    runs[:] = [run for run in runs if run.get("run_id") != snapshot["run_id"]]
+    runs.append(snapshot)
+    return snapshot
+
+
+def reset_active_run(task, *, run_id, started_at, summary, facts=None, current_checkpoint=None, next_action=None):
+    ensure_task_shape(task)
+    checkpoint = current_checkpoint or (task.get("workflow") or [{}])[0].get("id")
+    task["active_run_id"] = run_id
+    task["status"] = "RUNNING"
+    task["current_checkpoint"] = checkpoint
+    task["last_checkpoint_at"] = started_at
+    task["next_action"] = next_action or task.get("next_action")
+    task["heartbeat"] = {
+        "expected_interval_sec": task.get("heartbeat", {}).get("expected_interval_sec", 300),
+        "timeout_sec": task.get("heartbeat", {}).get("timeout_sec", 1800),
+        "last_progress_at": started_at,
+        "last_heartbeat_at": started_at,
+        "watchdog_state": "OK",
+    }
+    task["observed"] = {
+        "steps": {},
+        "task_completion": None,
+        "block": None,
+        "owner": {},
+        "external_jobs": {},
+        "downloads": {},
+    }
+    task["observations"] = []
+    task["checkpoints"] = []
+    task["external_jobs"] = []
+    task["downloads"] = []
+    task["artifacts"] = []
+    task["validation"] = []
+    task["blocker"] = None
+    task["derived"] = {}
+    monitoring = task.setdefault("monitoring", {})
+    monitoring["nudge_count"] = 0
+    monitoring["reconcile_count"] = 0
+    monitoring["resume_requests"] = []
+    monitoring["action_log"] = []
+    append_observation(task, event_type="STARTED", summary=summary, facts=facts or {}, step_id=checkpoint, status="RUNNING")
+    if checkpoint:
+        set_step_observation(task, checkpoint, state="IN_PROGRESS", summary=summary, facts=facts or {}, at=started_at)
+    task["checkpoints"].append({
+        "at": started_at,
+        "kind": "STARTED",
+        "summary": summary,
+        "facts": facts or {},
+        "run_id": run_id,
+    })
+    return task
+
+
+def derive_user_facing_outcome(task: dict[str, Any], workflow_states: list[dict[str, Any]], *, completed_task: dict[str, Any] | None, blocked_task: dict[str, Any] | None, inconsistencies: list[str], pending_external: bool) -> dict[str, Any]:
+    recorded_artifacts = [str(item) for item in task.get("artifacts") or [] if nonempty(item)]
+    discovered_artifacts = discover_existing_workflow_artifacts(task)
+    all_artifacts: list[str] = []
+    seen: set[str] = set()
+    for value in [*recorded_artifacts, *discovered_artifacts]:
+        if value not in seen:
+            all_artifacts.append(value)
+            seen.add(value)
+
+    done_steps = [step["id"] for step in workflow_states if step.get("state") == "DONE"]
+    non_done_steps = [step["id"] for step in workflow_states if step.get("state") != "DONE"]
+    interruption_like = False
+    blocker = task.get("blocker") or {}
+    failure_type = str(blocker.get("failure_type") or "").upper()
+    if failure_type in {"EXECUTION_INTERRUPTED", "EXECUTION_PARTIAL_FAILURE", "DOWNLOAD_INCOMPLETE", "DOWNLOAD_TIMEOUT", "EXTERNAL_WAIT"}:
+        interruption_like = True
+
+    outcome_status = "IN_PROGRESS"
+    headline = "Task is still in progress"
+    honesty_notes: list[str] = []
+
+    if completed_task and not non_done_steps:
+        outcome_status = "SUCCESS"
+        headline = completed_task.get("summary") or "Task completed with observed evidence"
+    elif completed_task and non_done_steps and all_artifacts:
+        outcome_status = "PARTIAL_SUCCESS"
+        headline = completed_task.get("summary") or "Task completed with partial outputs"
+        honesty_notes.append(f"Some workflow steps are not marked DONE in control-plane history: {', '.join(non_done_steps)}")
+        honesty_notes.append("Do not present this run as full success; existing outputs should be framed as partial success")
+    elif completed_task and non_done_steps:
+        outcome_status = "FAILED"
+        headline = completed_task.get("summary") or "Task completion claim conflicts with unfinished workflow steps"
+        honesty_notes.append(f"Some workflow steps are not marked DONE in control-plane history: {', '.join(non_done_steps)}")
+    elif blocked_task and all_artifacts:
+        outcome_status = "PARTIAL_SUCCESS"
+        headline = blocked_task.get("summary") or "Outputs exist, but execution/control-plane did not finish cleanly"
+        honesty_notes.append("User-facing result should foreground existing outputs before interruption noise")
+        if interruption_like:
+            honesty_notes.append(f"Control-plane interruption observed: {failure_type}")
+        if non_done_steps:
+            honesty_notes.append(f"Remaining or unconfirmed steps: {', '.join(non_done_steps)}")
+    elif blocked_task:
+        outcome_status = "BLOCKED"
+        headline = blocked_task.get("summary") or blocker.get("reason") or "Task is blocked"
+    elif task.get("status") == "FAILED":
+        outcome_status = "FAILED"
+        headline = blocker.get("reason") or "Task failed"
+    elif pending_external:
+        outcome_status = "IN_PROGRESS"
+        headline = "Task is waiting on legitimate external work"
+
+    return {
+        "outcome_status": outcome_status,
+        "headline": headline,
+        "done_steps": done_steps,
+        "remaining_steps": non_done_steps,
+        "artifacts": all_artifacts,
+        "recorded_artifacts": recorded_artifacts,
+        "discovered_artifacts": discovered_artifacts,
+        "control_plane_status": task.get("status"),
+        "control_plane_truth_state": "INCONSISTENT" if inconsistencies else "CONSISTENT",
+        "honesty_notes": honesty_notes,
+    }
+
+
 def project_task(task):
     ensure_task_shape(task)
     workflow = task.get("workflow") or []
@@ -478,6 +675,14 @@ def project_task(task):
         "owner_reply_kind": owner.get("last_reply_kind"),
         "last_observed_progress_at": latest_step_event_at,
     })
+    derived["user_facing"] = derive_user_facing_outcome(
+        task,
+        workflow_states,
+        completed_task=completed_task,
+        blocked_task=blocked_task,
+        inconsistencies=inconsistencies,
+        pending_external=pending_external,
+    )
     return task
 
 
@@ -507,6 +712,28 @@ def queue_step_update(task, event_type, summary, checkpoint, facts=None, outputs
                             checkpoint=checkpoint, facts=facts, outputs=outputs, next_action=next_action,
                             blocker=blocker)
     return None
+
+
+def mark_terminal_cleanup(task, *, terminal_status, reason=None):
+    heartbeat = task.setdefault("heartbeat", {})
+    monitoring = task.setdefault("monitoring", {})
+    at = now_iso()
+    cleanup_reason = reason or f"task status is terminal ({terminal_status})"
+    heartbeat["watchdog_state"] = "STOP_AND_DELETE"
+    monitoring["last_action_at"] = at
+    monitoring["last_action_state"] = "STOP_AND_DELETE"
+    monitoring["last_action_reason"] = cleanup_reason
+    monitoring["last_action_kind"] = "delete_monitor_cron"
+    monitoring["last_action_payload"] = {
+        "kind": "STOP_AND_DELETE",
+        "facts": {
+            "task_id": task.get("task_id"),
+            "status": terminal_status,
+            "reason": cleanup_reason,
+        },
+        "created_at": at,
+    }
+    return at
 
 
 def cmd_list(args):
@@ -540,6 +767,9 @@ def cmd_init(args):
             "message_ref": args.message_ref,
         },
         "workflow": workflow,
+        "run_counter": 1,
+        "active_run_id": "run-01",
+        "runs": [],
         "current_checkpoint": workflow[0]["id"] if workflow else None,
         "heartbeat": {
             "expected_interval_sec": args.expected_interval_sec,
@@ -580,14 +810,16 @@ def cmd_init(args):
         "notes": args.note or [],
         "checkpoints": [],
     }
-    append_observation(task, event_type="STARTED", summary=args.summary or "Task initialized", facts=parse_fact(args.fact), step_id=task["current_checkpoint"], status="RUNNING")
+    start_facts = parse_fact(args.fact)
+    append_observation(task, event_type="STARTED", summary=args.summary or "Task initialized", facts=start_facts, step_id=task["current_checkpoint"], status="RUNNING")
     if task["current_checkpoint"]:
-        set_step_observation(task, task["current_checkpoint"], state="IN_PROGRESS", summary="Task initialized", facts=parse_fact(args.fact), at=started_at)
+        set_step_observation(task, task["current_checkpoint"], state="IN_PROGRESS", summary="Task initialized", facts=start_facts, at=started_at)
     task["checkpoints"].append({
         "at": started_at,
         "kind": "STARTED",
         "summary": args.summary or "Task initialized",
-        "facts": parse_fact(args.fact),
+        "facts": start_facts,
+        "run_id": task["active_run_id"],
     })
     project_task(task)
     ledger.setdefault("tasks", []).append(task)
@@ -602,31 +834,38 @@ def cmd_checkpoint(args):
     step_id = args.current_checkpoint or task.get("current_checkpoint")
     facts = parse_fact(args.fact)
     event_type = args.event_type
+    event_at = now_iso()
+
+    task["current_checkpoint"] = step_id
+    task["last_checkpoint_at"] = event_at
+    task.setdefault("heartbeat", {})["last_progress_at"] = event_at
+    task["heartbeat"]["last_heartbeat_at"] = event_at
 
     if event_type == "STEP_PROGRESS":
         append_observation(task, event_type="STEP_PROGRESS", summary=args.summary, facts=facts, step_id=step_id, status="RUNNING")
-        set_step_observation(task, step_id, state="IN_PROGRESS", summary=args.summary, facts=facts)
-        task["checkpoints"].append({"at": now_iso(), "kind": "STEP_PROGRESS", "summary": args.summary, "facts": facts})
+        set_step_observation(task, step_id, state="IN_PROGRESS", summary=args.summary, facts=facts, at=event_at)
+        task["checkpoints"].append({"at": event_at, "kind": "STEP_PROGRESS", "summary": args.summary, "facts": facts})
         task["status"] = "RUNNING"
     elif event_type == "STEP_COMPLETED":
         append_observation(task, event_type="STEP_COMPLETED", summary=args.summary, facts=facts, step_id=step_id, status="COMPLETED")
-        set_step_observation(task, step_id, state="COMPLETED", summary=args.summary, facts=facts)
-        task["checkpoints"].append({"at": now_iso(), "kind": "STEP_COMPLETED", "summary": args.summary, "facts": facts})
+        set_step_observation(task, step_id, state="COMPLETED", summary=args.summary, facts=facts, at=event_at)
+        task["checkpoints"].append({"at": event_at, "kind": "STEP_COMPLETED", "summary": args.summary, "facts": facts})
         task["status"] = "RUNNING"
         queue_step_update(task, "STEP_COMPLETED", args.summary, step_id, facts=facts, outputs=args.artifact, next_action=args.next_action or task.get("next_action"))
     elif event_type == "TASK_COMPLETED":
         append_observation(task, event_type="TASK_COMPLETED", summary=args.summary, facts=facts, step_id=step_id, status="COMPLETED")
         task.setdefault("observed", {})["task_completion"] = {
-            "completed_at": now_iso(),
+            "completed_at": event_at,
             "summary": args.summary,
             "facts": facts,
         }
-        task["checkpoints"].append({"at": now_iso(), "kind": "TASK_COMPLETED", "summary": args.summary, "facts": facts})
+        task["checkpoints"].append({"at": event_at, "kind": "TASK_COMPLETED", "summary": args.summary, "facts": facts})
         task["status"] = "COMPLETED"
         if args.validation:
             task.setdefault("validation", []).extend(args.validation)
         if args.artifact:
             task.setdefault("artifacts", []).extend(args.artifact)
+        mark_terminal_cleanup(task, terminal_status="COMPLETED")
         queue_step_update(task, "TASK_COMPLETED", args.summary, step_id, facts=facts, outputs=args.artifact, next_action=args.next_action or "None")
     else:
         raise SystemExit(f"Unsupported event_type for checkpoint: {event_type}")
@@ -650,10 +889,15 @@ def cmd_block(args):
         raise SystemExit(f"Unknown observed failure_type: {facts['failure_type']}")
     step_id = args.current_checkpoint or task.get("current_checkpoint")
     summary = args.reason
+    blocked_at = now_iso()
+    task["current_checkpoint"] = step_id
+    task["last_checkpoint_at"] = blocked_at
+    task.setdefault("heartbeat", {})["last_progress_at"] = blocked_at
+    task["heartbeat"]["last_heartbeat_at"] = blocked_at
     append_observation(task, event_type="BLOCKED_CONFIRMED", summary=summary, facts=facts, step_id=step_id, status="BLOCKED")
-    set_step_observation(task, step_id, state="BLOCKED", summary=summary, facts=facts)
+    set_step_observation(task, step_id, state="BLOCKED", summary=summary, facts=facts, at=blocked_at)
     task.setdefault("observed", {})["block"] = {
-        "blocked_at": now_iso(),
+        "blocked_at": blocked_at,
         "summary": summary,
         "facts": facts,
         "step_id": step_id,
@@ -668,6 +912,10 @@ def cmd_block(args):
     if facts.get("failure_type"):
         task["blocker"]["failure_type"] = facts["failure_type"]
     task["status"] = "BLOCKED"
+    # A confirmed block supersedes any earlier terminal-completed claim.
+    # Keep observations/history, but clear the active completed snapshot so derived truth
+    # cannot become completed_and_blocked for the same control-plane state.
+    task.get("observed", {}).pop("task_completion", None)
     task["checkpoints"].append({"at": now_iso(), "kind": "BLOCKED_CONFIRMED", "summary": summary, "facts": facts})
     ack_resume_request(task, resume_token=args.resume_token, outcome="BLOCKED_CONFIRMED", checkpoint=step_id, facts={"reason": args.reason})
     task["next_action"] = args.next_action or args.safe_next_step
@@ -776,6 +1024,7 @@ def cmd_owner_reply(args):
         if args.validation:
             task.setdefault("validation", []).extend(args.validation)
         task["next_action"] = args.next_action or "None"
+        mark_terminal_cleanup(task, terminal_status="COMPLETED")
         ack_resume_request(task, resume_token=args.resume_token, outcome="TASK_COMPLETED", checkpoint=step_id, facts={"owner_reply_kind": reply_kind})
         queue_step_update(task, "TASK_COMPLETED", summary, step_id, facts=facts, outputs=args.artifact, next_action=task.get("next_action"))
     elif reply_kind == "D_NO_REPLY":
@@ -784,19 +1033,48 @@ def cmd_owner_reply(args):
             task["next_action"] = args.next_action
         ack_resume_request(task, resume_token=args.resume_token, outcome="OWNER_REPLY_RECORDED", checkpoint=args.current_checkpoint or task.get("current_checkpoint"), facts={"owner_reply_kind": reply_kind})
     elif reply_kind == "E_FORGOT_OR_NOT_DOING":
-        summary = args.summary or "Owner admitted task was not progressing and explicitly resumed execution"
-        step_id = args.current_checkpoint or task.get("current_checkpoint")
-        append_observation(task, event_type="OWNER_RESUMED", summary=summary, facts={"owner_reply_kind": reply_kind, "resume_required": "true", **facts}, step_id=step_id, status="RUNNING")
-        set_step_observation(task, step_id, state="IN_PROGRESS", summary=summary, facts=facts)
-        task["status"] = "RUNNING"
-        task["blocker"] = None
-        task.setdefault("observed", {})["block"] = None
+        old_run_id = task.get("active_run_id")
+        old_status = task.get("status") or "ABANDONED"
+        summary = args.summary or "Owner admitted task was not progressing; a fresh run was started instead of patching the old one"
+        task.setdefault("notes", []).append(f"Owner reply {reply_kind} closed {old_run_id} and requested a fresh run")
+        archive_active_run(task, terminal_status=old_status if old_status in TASK_STATUSES else "ABANDONED", reason="owner forgot or was not doing the work")
+        task["run_counter"] = int(task.get("run_counter", 1) or 1) + 1
+        new_run_id = f"run-{task['run_counter']:02d}"
+        step_id = args.current_checkpoint or (task.get("workflow") or [{}])[0].get("id")
+        reset_active_run(task, run_id=new_run_id, started_at=responded_at, summary=summary, facts={"owner_reply_kind": reply_kind, "resume_required": "true", "rerun_from": old_run_id, **facts}, current_checkpoint=step_id, next_action=args.next_action or "Resume execution immediately and publish observed truth before any further state claims")
+        append_observation(task, event_type="OWNER_RESUMED", summary=summary, facts={"owner_reply_kind": reply_kind, "resume_required": "true", "rerun_from": old_run_id, **facts}, step_id=step_id, status="RUNNING")
         task["next_action"] = args.next_action or "Resume execution immediately and publish observed truth before any further state claims"
-        ack_resume_request(task, resume_token=args.resume_token, outcome="OWNER_RESUMED", checkpoint=step_id, facts={"owner_reply_kind": reply_kind})
+        ack_resume_request(task, resume_token=args.resume_token, outcome="OWNER_RESUMED", checkpoint=step_id, facts={"owner_reply_kind": reply_kind, "new_run_id": new_run_id})
 
     project_task(task)
     save_ledger(args.ledger, ledger)
     print(f"Recorded owner reply {reply_kind} for {args.task_id}")
+
+
+def cmd_rerun(args):
+    ledger = load_ledger(args.ledger)
+    task = ensure_task(ledger, args.task_id)
+    ensure_task_shape(task)
+    facts = parse_fact(args.fact)
+    rerun_at = now_iso()
+    previous = archive_active_run(task, terminal_status=args.previous_status or task.get("status") or "ABANDONED", ended_at=rerun_at, reason=args.reason)
+    task["run_counter"] = int(task.get("run_counter", 1) or 1) + 1
+    new_run_id = f"run-{task['run_counter']:02d}"
+    summary = args.summary or f"Fresh run started after: {args.reason}"
+    reset_active_run(task, run_id=new_run_id, started_at=rerun_at, summary=summary, facts={"rerun_from": previous.get("run_id"), **facts}, current_checkpoint=args.current_checkpoint, next_action=args.next_action or task.get("next_action"))
+    task.setdefault("notes", []).append(f"{new_run_id} created from {previous.get('run_id')} because: {args.reason}")
+    project_task(task)
+    save_ledger(args.ledger, ledger)
+    print(json.dumps({
+        "ok": True,
+        "task_id": args.task_id,
+        "previous_run": previous.get("run_id"),
+        "previous_status": previous.get("status"),
+        "active_run_id": new_run_id,
+        "reason": args.reason,
+        "current_checkpoint": task.get("current_checkpoint"),
+        "next_action": task.get("next_action"),
+    }, ensure_ascii=False, indent=2))
 
 
 def cmd_ack_delivery(args):
@@ -931,6 +1209,16 @@ def build_parser():
     owner_p.add_argument("--message-ref")
     owner_p.add_argument("--resume-token")
     owner_p.set_defaults(func=cmd_owner_reply)
+
+    rerun_p = sp.add_parser("rerun")
+    rerun_p.add_argument("task_id")
+    rerun_p.add_argument("--reason", required=True)
+    rerun_p.add_argument("--summary")
+    rerun_p.add_argument("--current-checkpoint")
+    rerun_p.add_argument("--next-action")
+    rerun_p.add_argument("--previous-status", choices=sorted(TASK_STATUSES))
+    rerun_p.add_argument("--fact", action="append")
+    rerun_p.set_defaults(func=cmd_rerun)
 
     ack_p = sp.add_parser("ack-delivery")
     ack_p.add_argument("task_id")

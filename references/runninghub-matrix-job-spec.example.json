@@ -1,0 +1,32 @@
+{
+  "job_id": "runninghub-matrix-example-001",
+  "kind": "media-batch",
+  "adapter": "runninghub_matrix",
+  "mode": "serial",
+  "items": [
+    {
+      "item_id": "A1-compare",
+      "title": "A1 × 图片对口型",
+      "still_key": "A1",
+      "still_path": "/private/tmp/openclaw/rh-output/review_set_a_1776103589_1.png",
+      "workflow_key": "compare",
+      "workflow_id": "1966867984121729025",
+      "audio_path": "/private/tmp/openclaw/rh-output/eko_refclone_1776070472_1.flac",
+      "output_kind": "video",
+      "meta": {
+        "compare_style_expected": true
+      }
+    },
+    {
+      "item_id": "A1-emotion",
+      "title": "A1 × 数字人带情绪官流版",
+      "still_key": "A1",
+      "still_path": "/private/tmp/openclaw/rh-output/review_set_a_1776103589_1.png",
+      "workflow_key": "emotion",
+      "workflow_id": "2043706004369580034",
+      "audio_path": "/Users/eva/.openclaw/media/inbound/3aced437-c86c-4a26-aeb9-b2d7781ea118",
+      "prompt": "Hey, I am just sitting here at my desk tonight, talking to the camera in a relaxed and natural way.",
+      "output_kind": "video"
+    }
+  ]
+}

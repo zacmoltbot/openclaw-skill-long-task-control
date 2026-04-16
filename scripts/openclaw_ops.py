@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import os
 import shlex
 import subprocess
 from datetime import datetime, timezone
@@ -8,12 +9,15 @@ from pathlib import Path
 from typing import Any
 
 from reporting_contract import ensure_reporting
+from artifact_resolver import resolve_output_variants
 
 STATE_CHOICES = ["STARTED", "STEP_PROGRESS", "STEP_COMPLETED", "BLOCKED", "TASK_COMPLETED"]
 
 ROOT = Path(__file__).resolve().parent.parent
 TASK_LEDGER = ROOT / "scripts" / "task_ledger.py"
 MONITOR_NUDGE = ROOT / "scripts" / "monitor_nudge.py"
+RUNNER_ENGINE = ROOT / "scripts" / "runner_engine.py"
+EXECUTION_BRIDGE = ROOT / "scripts" / "execution_bridge.py"
 DEFAULT_LEDGER = ROOT / "state" / "long-task-ledger.example.json"
 DEFAULT_CHANNEL = "discord"
 DEFAULT_TIMEZONE = "Asia/Taipei"
@@ -65,6 +69,203 @@ def find_task(ledger: dict[str, Any], task_id: str):
         if task.get("task_id") == task_id:
             return task
     raise SystemExit(f"Task not found: {task_id}")
+
+
+def _extract_discord_target_from_session_key(session_key: str | None) -> str | None:
+    if not session_key:
+        return None
+    parts = [part for part in str(session_key).split(":") if part]
+    if len(parts) >= 2 and parts[-2] in {"channel", "user", "thread"} and parts[-1].isdigit():
+        return parts[-1]
+    return None
+
+
+def normalize_delivery_target(channel: str | None, raw_target: str | None, *, task: dict[str, Any] | None = None, session_key: str | None = None) -> dict[str, Any]:
+    channel_name = (channel or DEFAULT_CHANNEL or "discord").strip().lower()
+    candidate = (raw_target or "").strip()
+    result = {
+        "channel": channel_name,
+        "raw_target": raw_target,
+        "target": candidate,
+        "valid": True,
+        "source": "input",
+        "reason": None,
+    }
+    if not candidate:
+        result.update(valid=False, reason="empty_target")
+    elif channel_name != "discord":
+        return result
+    elif candidate.isdigit():
+        return result
+    elif candidate.startswith(("discord:channel:", "discord:user:", "discord:thread:")) and candidate.split(":")[-1].isdigit():
+        result["target"] = candidate.split(":")[-1]
+        result["source"] = "normalized_discord_uri"
+        return result
+    elif (candidate.startswith("<#") or candidate.startswith("<@")) and candidate.endswith(">") and candidate[2:-1].isdigit():
+        result["target"] = candidate[2:-1]
+        result["source"] = "normalized_discord_mention"
+        return result
+    else:
+        fallback = (
+            _extract_discord_target_from_session_key(session_key)
+            or _extract_discord_target_from_session_key((task or {}).get("monitoring", {}).get("openclaw_session_key"))
+            or _extract_discord_target_from_session_key((task or {}).get("monitoring", {}).get("executor_session_key"))
+        )
+        if fallback:
+            result.update(target=fallback, source="session_key_fallback", valid=True, reason="normalized_from_invalid_discord_target")
+            return result
+        result.update(valid=False, reason="invalid_discord_target")
+    return result
+
+
+def requester_target_for(task: dict[str, Any], *, session_key: str | None = None) -> str:
+    message = task.get("message", {})
+    normalized = normalize_delivery_target(
+        task.get("channel") or DEFAULT_CHANNEL,
+        message.get("requester_channel") or message.get("nudge_target") or task.get("channel"),
+        task=task,
+        session_key=session_key,
+    )
+    return normalized["target"]
+
+
+def append_delivery_sink(payload: dict[str, Any]):
+    sink_path = os.environ.get("LTC_DELIVERY_SINK_FILE")
+    if not sink_path:
+        return None
+    sink = Path(sink_path).expanduser()
+    sink.parent.mkdir(parents=True, exist_ok=True)
+    existing = []
+    if sink.exists() and sink.read_text().strip():
+        existing = json.loads(sink.read_text())
+    existing.append(payload)
+    sink.write_text(json.dumps(existing, ensure_ascii=False, indent=2) + "\n")
+    return {"ok": True, "delivery_sink": str(sink), "payload": payload}
+
+
+def render_user_update_message(update: dict[str, Any]) -> str:
+    event_type = update.get("event_type") or "UPDATE"
+    checkpoint = update.get("checkpoint") or "unknown-step"
+    summary = update.get("summary") or ""
+    outputs = [Path(item).name for item in (update.get("outputs") or []) if item]
+    output_preview = ""
+    if outputs:
+        preview = ", ".join(outputs[:2])
+        if len(outputs) > 2:
+            preview += f" 等 {len(outputs)} 個 artifacts"
+        output_preview = f"\n產出：{preview}"
+
+    if event_type == "STEP_COMPLETED":
+        return f"LTC 進度：{checkpoint} 完成\n{summary}{output_preview}".strip()
+    if event_type == "COMPLETED_HANDOFF":
+        return f"LTC 完成：{summary}{output_preview}".strip()
+    if event_type == "BLOCKED_ESCALATE":
+        blocker = update.get("blocker") or {}
+        need = blocker.get("need") or []
+        need_text = f"\n需要：{'; '.join(need[:2])}" if need else ""
+        return f"LTC 卡住：{summary}{need_text}".strip()
+    if event_type == "EXTERNAL_JOB_COMPLETED":
+        return f"LTC 外部工作完成：{summary}{output_preview}".strip()
+    if event_type == "WORKFLOW_SWITCH":
+        return f"LTC 工作流切換：{summary}".strip()
+    return update.get("summary") or update.get("status_block") or ""
+
+
+def send_user_update(task: dict[str, Any], update: dict[str, Any]):
+    target_info = normalize_delivery_target(
+        task.get("channel") or DEFAULT_CHANNEL,
+        task.get("message", {}).get("requester_channel") or task.get("message", {}).get("nudge_target") or task.get("channel"),
+        task=task,
+    )
+    if not target_info.get("valid"):
+        return {
+            "ok": False,
+            "error": f"invalid delivery target: channel={target_info['channel']} raw_target={target_info['raw_target']} reason={target_info['reason']}",
+            "error_code": "INVALID_TARGET",
+        }
+    payload = {
+        "task_id": task.get("task_id"),
+        "update_id": update.get("update_id"),
+        "event_type": update.get("event_type"),
+        "channel": task.get("channel") or DEFAULT_CHANNEL,
+        "target": target_info["target"],
+        "message": render_user_update_message(update),
+    }
+    sink_result = append_delivery_sink(payload)
+    if sink_result is not None:
+        return {"ok": True, "delivered_via": "delivery-sink", "message_ref": f"sink:{update.get('update_id')}", "result": sink_result}
+
+    cmd = [
+        "openclaw", "message", "send",
+        "--channel", payload["channel"],
+        "--target", payload["target"],
+        "--message", payload["message"],
+        "--silent",
+        "--json",
+    ]
+    proc = run(*cmd, check=False)
+    if proc.returncode != 0:
+        return {"ok": False, "error": proc.stderr.strip() or proc.stdout.strip(), "returncode": proc.returncode}
+    result = parse_json_from_mixed_output(proc.stdout)
+    message_ref = result.get("messageId") or result.get("message_id") or result.get("id")
+    return {"ok": True, "delivered_via": "message.send", "message_ref": message_ref, "result": result}
+
+
+def deliver_pending_updates(ledger_path: Path, task_id: str, *, delivered_via: str | None = None, note: str | None = None):
+    ledger = load_ledger(ledger_path)
+    task = find_task(ledger, task_id)
+    reporting = ensure_reporting(task)
+    delivered = []
+    failed = []
+    for update in list(reporting.get("pending_updates", [])):
+        if update.get("delivered"):
+            continue
+        send_result = send_user_update(task, update)
+        if send_result.get("ok") and delivered_via:
+            send_result["delivered_via"] = delivered_via
+            send_result.setdefault("message_ref", f"{delivered_via}:{update.get('update_id')}")
+        if not send_result.get("ok"):
+            failed.append({
+                "update_id": update.get("update_id"),
+                "error": send_result.get("error"),
+                "error_code": send_result.get("error_code"),
+                "returncode": send_result.get("returncode"),
+            })
+            continue
+        ack_cmd = [
+            "python3", str(TASK_LEDGER), "--ledger", str(ledger_path), "ack-delivery", task_id, update["update_id"],
+            "--delivered-via", send_result["delivered_via"],
+        ]
+        if send_result.get("message_ref"):
+            ack_cmd.extend(["--message-ref", str(send_result["message_ref"])])
+        ack_note = note
+        if note and send_result["delivered_via"] == "delivery-sink":
+            ack_note = f"{note}; simulated delivery sink"
+        elif note is None and send_result["delivered_via"] == "delivery-sink":
+            ack_note = "Simulated delivery sink"
+        elif ack_note is None and delivered_via and delivered_via != "message.send":
+            ack_note = f"Synthetic delivery flush via {delivered_via}"
+        if ack_note:
+            ack_cmd.extend(["--note", ack_note])
+        ack_proc = run(*ack_cmd)
+        delivered.append({
+            "update_id": update["update_id"],
+            "delivered_via": send_result["delivered_via"],
+            "message_ref": send_result.get("message_ref"),
+            "ack": parse_json_from_mixed_output(ack_proc.stdout),
+        })
+    refreshed = load_ledger(ledger_path)
+    refreshed_task = find_task(refreshed, task_id)
+    refreshed_reporting = ensure_reporting(refreshed_task)
+    return {
+        "ok": True,
+        "task_id": task_id,
+        "delivered_count": len(delivered),
+        "delivered_update_ids": [item["update_id"] for item in delivered],
+        "pending_remaining": len(refreshed_reporting.get("pending_updates", [])),
+        "delivered_total": len(refreshed_reporting.get("delivered_updates", [])),
+        "failures": failed,
+    }
 
 
 def parse_key_values(items):
@@ -129,8 +330,8 @@ def cron_prompt(ledger_path: Path, task_id: str, requester_channel: str, session
 2) 解析 JSON，只使用該命令回傳的 state / notify / notification / remove_monitor / reason / pending_user_updates_deliverable / next_action / current_step / retry_count。
 3) 【delivery push，先於狀態評估】（每次 tick 必定執行，即使 state 是 OK）：
    - 若 `pending_user_updates_deliverable_count > 0`，對每一筆 `pending_updates` 中 `delivered=false` 的項目：
-     (a) 用 `message.send --channel {requester_channel} --message "<update['status_block']>"` 發送到 Discord
-     (b) 若 message.send 回傳成功，exec：`python3 {ROOT / 'scripts' / 'openclaw_ops.py'} --ledger {ledger_path} ack-delivery {task_id} <update_id> --delivered-via message.send`
+     (a) 先 exec：`python3 {ROOT / 'scripts' / 'openclaw_ops.py'} --ledger {ledger_path} flush-pending-updates {task_id} --delivered-via message.send`
+     (b) flush-pending-updates 會使用 sanitized user-facing message（不是 raw status_block）逐筆 delivery，並自動 ack-delivery
      (c) 若 message.send 回傳失敗但訊息已出現在 channel，視為 delivered=true，仍更新 ledger
    - delivery push 不受 notify flag 限制；保證 user update 一定被被動發出。
 4) 依 state 分流：
@@ -372,6 +573,123 @@ def cmd_executor_preview(args):
     print(result.stdout.strip())
 
 
+def parse_workflow_step_contract(step: dict[str, Any]) -> dict[str, Any]:
+    raw_title = str(step.get("title") or "").strip()
+    if not raw_title:
+        return {"title": step.get("id") or "unnamed-step"}
+    parts = [part.strip() for part in raw_title.split("::")]
+    item: dict[str, Any] = {"title": parts[0]}
+    for chunk in parts[1:]:
+        if "=" not in chunk:
+            continue
+        key, value = chunk.split("=", 1)
+        key = key.strip().lower().replace("-", "_")
+        value = value.strip()
+        if key in {"shell", "cwd", "next_action", "generic_manual_mode"}:
+            item[key] = value
+        elif key in {"artifact", "output"}:
+            item.setdefault("expect_artifacts", []).append(value)
+        elif key in {"artifacts", "outputs", "expect", "expect_artifacts"}:
+            item.setdefault("expect_artifacts", []).extend([v.strip() for v in value.split("|") if v.strip()])
+        elif key in {"timeout", "timeout_sec"}:
+            try:
+                item["timeout_sec"] = int(value)
+            except ValueError:
+                item["timeout_sec"] = value
+        else:
+            item[key] = value
+    return item
+
+
+def infer_generic_auto_action(task: dict[str, Any], step: dict[str, Any], parsed: dict[str, Any]) -> dict[str, Any]:
+    if parsed.get("shell") or parsed.get("generic_manual_mode"):
+        return {}
+    haystack = " ".join([
+        str(task.get("task_id") or ""),
+        str(task.get("goal") or ""),
+        str(step.get("id") or ""),
+        str(step.get("title") or ""),
+        str(parsed.get("title") or ""),
+    ]).lower()
+    if "discord" not in haystack:
+        return {}
+    if "target" not in haystack and "requester_channel" not in haystack:
+        return {}
+    if not any(token in haystack for token in ("normalize", "repair", "self-heal", "self heal", "heal", "fix")):
+        return {}
+    return {
+        "generic_manual_mode": "auto_repair",
+        "auto_action": "repair_requester_channel",
+    }
+
+
+
+def build_generic_job_spec(task: dict[str, Any], *, job_id: str, adapter: str):
+    workflow = task.get("workflow") or []
+    items = []
+    for idx, step in enumerate(workflow, start=1):
+        step_id = step.get("id") or f"step-{idx:02d}"
+        parsed = parse_workflow_step_contract(step)
+        inferred = infer_generic_auto_action(task, step, parsed)
+        items.append({
+            "item_id": step_id,
+            "title": parsed.get("title") or step.get("title") or step_id,
+            "checkpoint": step_id,
+            "goal": task.get("goal"),
+            "task_id": task.get("task_id"),
+            "step_index": idx,
+            **{k: v for k, v in parsed.items() if k != "title"},
+            **inferred,
+        })
+    return {
+        "job_id": job_id,
+        "kind": "generic-long-task",
+        "adapter": adapter,
+        "mode": "serial",
+        "bridge": {
+            "ledger": str(task.get("_ledger_path")) if task.get("_ledger_path") else None,
+            "task_id": task.get("task_id"),
+        },
+        "items": items,
+    }
+
+
+def cmd_init_execution_job(args):
+    ledger = load_ledger(args.ledger)
+    task = find_task(ledger, args.task_id)
+    task["_ledger_path"] = str(args.ledger)
+    workflow = task.get("workflow") or []
+    if not workflow:
+        raise SystemExit("Task has no workflow; cannot derive execution job")
+
+    job_id = args.job_id or f"{args.task_id}-job"
+    jobs_root = Path(args.jobs_root)
+    spec = build_generic_job_spec(task, job_id=job_id, adapter=args.adapter)
+    spec_path = jobs_root / job_id / "job-spec.json"
+    spec_path.parent.mkdir(parents=True, exist_ok=True)
+    spec_path.write_text(json.dumps(spec, ensure_ascii=False, indent=2) + "\n")
+
+    init_cmd = [
+        "python3", str(RUNNER_ENGINE), "--jobs-root", str(jobs_root), "init-job", str(spec_path),
+        "--ledger", str(args.ledger), "--task-id", args.task_id,
+    ]
+    init_result = run(*init_cmd)
+    print(json.dumps({
+        "ok": True,
+        "task_id": args.task_id,
+        "job_id": job_id,
+        "jobs_root": str(jobs_root),
+        "spec_path": str(spec_path),
+        "workflow_steps": [step.get("title") for step in workflow],
+        "runner_init": parse_json_from_mixed_output(init_result.stdout),
+        "next_commands": {
+            "status": f"python3 scripts/runner_engine.py --jobs-root {jobs_root} status {job_id}",
+            "run_one": f"python3 scripts/runner_engine.py --jobs-root {jobs_root} run-loop {job_id} --max-steps 1",
+            "run_to_completion": f"python3 scripts/runner_engine.py --jobs-root {jobs_root} run-loop {job_id}",
+        },
+    }, ensure_ascii=False, indent=2))
+
+
 def cmd_run_executor(args):
     """Spawn an executor subagent for a task. The executor drives the task to completion."""
     ledger = load_ledger(args.ledger)
@@ -400,8 +718,9 @@ def cmd_run_executor(args):
         "--message", prompt,
         "--timeout-seconds", str(args.timeout_seconds),
         "--thinking", args.thinking,
-        "--model", args.model,
     ]
+    if args.model:
+        add_cmd.extend(["--model", args.model])
     if args.every:
         add_cmd.extend(["--every", args.every])
     else:
@@ -435,6 +754,43 @@ def cmd_run_executor(args):
         "session_key": session_key,
         "prompt_preview": prompt[:500] + "...",
         "note": "Executor cron installed. It will wake every 5 min, execute the next pending step, write checkpoint, and exit. Monitor cron watches for stalls (GAP-1) and escalates if the executor stalls.",
+    }, ensure_ascii=False, indent=2))
+
+
+def _emit_record_result(args, *, facts, outputs, validation, ledger_result):
+    ledger = load_ledger(args.ledger)
+    task = find_task(ledger, args.task_id)
+    reporting = ensure_reporting(task)
+    pending_update = reporting.get("pending_updates", [])[-1] if reporting.get("pending_updates") else None
+    print(json.dumps({
+        "ok": True,
+        "task_id": args.task_id,
+        "state": args.state,
+        "status_block": render_status_block(
+            args.state,
+            args.task_id,
+            goal=task.get("goal"),
+            checkpoint=getattr(args, "current_checkpoint", None) or task.get("current_checkpoint"),
+            workflow_steps=[step.get("title") for step in task.get("workflow", [])],
+            facts=facts,
+            outputs=outputs,
+            completed=getattr(args, "completed_checkpoint", None),
+            validation=validation,
+            blocker=args.summary if args.state == "BLOCKED" else None,
+            tried=getattr(args, "tried", None),
+            need=getattr(args, "need", None),
+            next_action=getattr(args, "next_action", None) or task.get("next_action"),
+        ),
+        "ledger_stdout": ledger_result.stdout.strip(),
+        "last_checkpoint_at": task.get("last_checkpoint_at"),
+        "current_checkpoint": task.get("current_checkpoint"),
+        "task_status": task.get("status"),
+        "validation": task.get("validation", []),
+        "pending_user_update": pending_update,
+        "ack_delivery_command": (
+            f"python3 scripts/task_ledger.py --ledger {args.ledger} ack-delivery {args.task_id} {pending_update['update_id']} --delivered-via message.send --message-ref <message-ref>"
+            if pending_update else None
+        ),
     }, ensure_ascii=False, indent=2))
 
 
@@ -496,40 +852,75 @@ def cmd_record_update(args):
             cmd.extend(["--next-action", args.next_action])
         ledger_result = run(*cmd)
 
-    ledger = load_ledger(args.ledger)
-    task = find_task(ledger, args.task_id)
-    reporting = ensure_reporting(task)
-    pending_update = reporting.get("pending_updates", [])[-1] if reporting.get("pending_updates") else None
-    print(json.dumps({
-        "ok": True,
-        "task_id": args.task_id,
-        "state": args.state,
-        "status_block": render_status_block(
-            args.state,
-            args.task_id,
-            goal=task.get("goal"),
-            checkpoint=args.current_checkpoint or task.get("current_checkpoint"),
-            workflow_steps=[step.get("title") for step in task.get("workflow", [])],
-            facts=facts,
-            outputs=outputs,
-            completed=args.completed_checkpoint,
-            validation=validation,
-            blocker=args.summary if args.state == "BLOCKED" else None,
-            tried=args.tried,
-            need=args.need,
-            next_action=args.next_action or task.get("next_action"),
-        ),
-        "ledger_stdout": ledger_result.stdout.strip(),
-        "last_checkpoint_at": task.get("last_checkpoint_at"),
-        "current_checkpoint": task.get("current_checkpoint"),
-        "task_status": task.get("status"),
-        "validation": task.get("validation", []),
-        "pending_user_update": pending_update,
-        "ack_delivery_command": (
-            f"python3 scripts/task_ledger.py --ledger {args.ledger} ack-delivery {args.task_id} {pending_update['update_id']} --delivered-via message.send --message-ref <message-ref>"
-            if pending_update else None
-        ),
-    }, ensure_ascii=False, indent=2))
+    _emit_record_result(args, facts=facts, outputs=outputs, validation=validation, ledger_result=ledger_result)
+
+
+
+def _record_reconciled_step_completed(args, *, chosen_path: str, summary: str, extra_facts: dict[str, str] | None = None):
+    facts = parse_key_values(args.fact)
+    facts[args.fact_key] = chosen_path
+    for k, v in (extra_facts or {}).items():
+        facts[k] = v
+    outputs = [chosen_path]
+    validation = []
+    ledger_result = run(
+        "python3", str(TASK_LEDGER), "--ledger", str(args.ledger), "checkpoint", args.task_id,
+        "--event-type", "STEP_COMPLETED",
+        "--summary", summary,
+        "--artifact", chosen_path,
+        *(sum((["--fact", f"{k}={v}"] for k, v in facts.items()), [])),
+        *( ["--current-checkpoint", args.current_checkpoint] if args.current_checkpoint else [] ),
+        *( ["--next-action", args.next_action] if args.next_action else [] ),
+    )
+    args.state = "STEP_COMPLETED"
+    args.summary = summary
+    _emit_record_result(args, facts=facts, outputs=outputs, validation=validation, ledger_result=ledger_result)
+
+
+def cmd_reconcile_before_block(args):
+    resolution = resolve_output_variants(args.expected_path, min_video_bytes=args.min_video_bytes)
+    if resolution.get("resolved"):
+        chosen = resolution["chosen_video"]["path"]
+        summary = args.summary_if_resolved or f"Recovered output from artifact reconcile: {Path(chosen).name}"
+        _record_reconciled_step_completed(args, chosen_path=chosen, summary=summary)
+        return
+
+    args.state = "BLOCKED"
+    args.summary = args.summary_if_blocked or args.summary or f"Expected output not found after reconcile: {args.expected_path}"
+    facts = parse_key_values(args.fact)
+    facts.setdefault("failure_type", "EXTERNAL_WAIT")
+    facts["reconcile_expected_path"] = str(args.expected_path)
+    outputs = []
+    validation = []
+    cmd = [
+        "python3", str(TASK_LEDGER), "--ledger", str(args.ledger), "block", args.task_id,
+        "--reason", args.summary,
+        "--safe-next-step", args.next_action or args.safe_next_step or "Investigate external output and retry",
+    ]
+    for item in args.need or []:
+        cmd.extend(["--need", item])
+    for key, value in facts.items():
+        cmd.extend(["--fact", f"{key}={value}"])
+    if args.current_checkpoint:
+        cmd.extend(["--current-checkpoint", args.current_checkpoint])
+    if args.next_action:
+        cmd.extend(["--next-action", args.next_action])
+    ledger_result = run(*cmd)
+    _emit_record_result(args, facts=facts, outputs=outputs, validation=validation, ledger_result=ledger_result)
+
+
+def cmd_recover_external_success(args):
+    resolution = resolve_output_variants(args.expected_path, min_video_bytes=args.min_video_bytes)
+    if not resolution.get("resolved"):
+        raise SystemExit(f"No recoverable output found for: {args.expected_path}")
+    chosen = resolution["chosen_video"]["path"]
+    summary = args.summary or f"Recovered externally completed output after interrupted owner/executor: {Path(chosen).name}"
+    _record_reconciled_step_completed(
+        args,
+        chosen_path=chosen,
+        summary=summary,
+        extra_facts={"recovered_from_external_truth": "true", "reconcile_expected_path": str(args.expected_path)},
+    )
 
 
 def cmd_activation(args):
@@ -568,9 +959,15 @@ def run_init_task(args):
 
     ledger = load_ledger(args.ledger)
     task = find_task(ledger, args.task_id)
-    task.setdefault("message", {})["requester_channel"] = args.requester_channel or task.get("channel")
+    task.setdefault("message", {})["requester_channel_raw"] = args.requester_channel or task.get("channel")
+    normalized_target = normalize_delivery_target(task.get("channel") or DEFAULT_CHANNEL, args.requester_channel or task.get("channel"), task=task)
+    task["message"]["requester_channel"] = normalized_target["target"]
+    task["message"]["requester_channel_valid"] = normalized_target["valid"]
+    task["message"]["requester_channel_source"] = normalized_target["source"]
+    if normalized_target.get("reason"):
+        task["message"]["requester_channel_reason"] = normalized_target["reason"]
     task["message"]["nudge_channel"] = args.nudge_channel or task.get("channel")
-    task["message"]["nudge_target"] = args.nudge_target or args.requester_channel or task.get("channel")
+    task["message"]["nudge_target"] = args.nudge_target or task["message"]["requester_channel"] or task.get("channel")
     # NOTE: do NOT write cron_state here — let the caller write ACTIVE only after
     # 'openclaw cron add' succeeds, or INSTALL_FAILED if it fails after retry.
     save_ledger(args.ledger, ledger)
@@ -597,8 +994,13 @@ def cmd_init_task(args):
 def cmd_render_prompt(args):
     ledger = load_ledger(args.ledger)
     task = find_task(ledger, args.task_id)
-    requester_channel = args.requester_channel or task.get("message", {}).get("nudge_target") or task.get("channel")
     session_key = session_key_for(task, args.session_key)
+    requester_channel = normalize_delivery_target(
+        task.get("channel") or DEFAULT_CHANNEL,
+        args.requester_channel or task.get("message", {}).get("requester_channel") or task.get("message", {}).get("nudge_target") or task.get("channel"),
+        task=task,
+        session_key=session_key,
+    )["target"]
     print(cron_prompt(args.ledger, args.task_id, requester_channel, session_key))
 
 
@@ -663,8 +1065,20 @@ def cmd_activate_task(args):
     # so we need a fresh task reference after init completes.
     ledger = load_ledger(args.ledger)
     task = find_task(ledger, args.task_id)
-    requester_channel = install_ns.requester_channel or task.get("message", {}).get("nudge_target") or task.get("channel")
     session_key = session_key_for(task, install_ns.session_key)
+    requester_info = normalize_delivery_target(
+        task.get("channel") or DEFAULT_CHANNEL,
+        install_ns.requester_channel or task.get("message", {}).get("requester_channel_raw") or task.get("message", {}).get("requester_channel") or task.get("message", {}).get("nudge_target") or task.get("channel"),
+        task=task,
+        session_key=session_key,
+    )
+    requester_channel = requester_info["target"]
+    task.setdefault("message", {})["requester_channel"] = requester_channel
+    task["message"]["requester_channel_valid"] = requester_info["valid"]
+    task["message"]["requester_channel_source"] = requester_info["source"]
+    if requester_info.get("reason"):
+        task["message"]["requester_channel_reason"] = requester_info["reason"]
+    task["message"]["nudge_target"] = requester_channel
     name = install_ns.name or default_monitor_name(args.task_id)
     prompt = cron_prompt(args.ledger, args.task_id, requester_channel, session_key)
     add_cmd = [
@@ -679,8 +1093,10 @@ def cmd_activate_task(args):
         "--message", prompt,
         "--timeout-seconds", str(install_ns.timeout_seconds),
         "--thinking", install_ns.thinking,
-        "--model", install_ns.model,
+        "--no-deliver",
     ]
+    if install_ns.model:
+        add_cmd.extend(["--model", install_ns.model])
     if install_ns.every:
         add_cmd.extend(["--every", install_ns.every])
     else:
@@ -713,6 +1129,44 @@ def cmd_activate_task(args):
         cron_installed_at=now_iso(),
     )
     save_ledger(args.ledger, ledger)
+
+    execution_job = None
+    execution_start = None
+    if getattr(args, "auto_execution", True):
+        init_exec_ns = argparse.Namespace(
+            ledger=args.ledger,
+            task_id=args.task_id,
+            jobs_root=args.jobs_root,
+            job_id=args.execution_job_id,
+            adapter=args.execution_adapter,
+        )
+        init_cmd = [
+            "python3", str(ROOT / "scripts" / "openclaw_ops.py"), "--ledger", str(args.ledger), "init-execution-job", args.task_id,
+            "--jobs-root", str(args.jobs_root),
+            "--adapter", args.execution_adapter,
+        ]
+        if args.execution_job_id:
+            init_cmd.extend(["--job-id", args.execution_job_id])
+        init_result = run(*init_cmd)
+        execution_job = parse_json_from_mixed_output(init_result.stdout)
+
+        if getattr(args, "auto_start_execution", True):
+            resolved_job_id = execution_job["job_id"]
+            owner = args.execution_owner or f"bootstrap:{resolved_job_id}"
+            run_cmd = [
+                "python3", str(RUNNER_ENGINE), "--jobs-root", str(args.jobs_root), "run-loop", resolved_job_id,
+                "--execution-owner", owner,
+            ]
+            if args.auto_run_max_steps is not None:
+                run_cmd.extend(["--max-steps", str(args.auto_run_max_steps)])
+            run_result = run(*run_cmd)
+            execution_start = parse_json_from_mixed_output(run_result.stdout)
+            execution_start["delivery_flush"] = deliver_pending_updates(
+                args.ledger,
+                args.task_id,
+                note="Canonical execution live-path delivery flush",
+            )
+
     print(json.dumps({
         "ok": True,
         "task_id": args.task_id,
@@ -723,6 +1177,11 @@ def cmd_activate_task(args):
         "init_stdout": init_stdout,
         "job": payload,
         "prompt_preview": prompt,
+        "execution": {
+            "mode": "canonical-execution-first" if getattr(args, "auto_execution", True) else "manual-monitor-only",
+            "job": execution_job,
+            "first_run": execution_start,
+        },
         "suggested_owner_updates": {
             "started": f"python3 scripts/openclaw_ops.py --ledger {args.ledger} record-update STARTED {args.task_id} --summary '<what actually started>' --current-checkpoint <step-id> --next-action '<next real action>' --fact key=value",
             "step_progress": f"python3 scripts/openclaw_ops.py --ledger {args.ledger} record-update STEP_PROGRESS {args.task_id} --summary '<what did you actually observe changing>' --current-checkpoint <step-id> --next-action '<next real action>' --fact key=value",
@@ -730,14 +1189,33 @@ def cmd_activate_task(args):
             "blocked": f"python3 scripts/openclaw_ops.py --ledger {args.ledger} record-update BLOCKED {args.task_id} --summary '<observed blocker>' --current-checkpoint <step-id> --need '<required unblock action>' --next-action '<safe next step>' --fact failure_type=<observed failure>",
             "task_completed": f"python3 scripts/openclaw_ops.py --ledger {args.ledger} record-update TASK_COMPLETED {args.task_id} --summary '<completion evidence>' --current-checkpoint <step-id> --output <file> --fact key=value",
         },
+        "next_commands": {
+            "continue_execution": (
+                f"python3 scripts/runner_engine.py --jobs-root {args.jobs_root} run-loop {(execution_job or {}).get('job_id', args.execution_job_id or f'{args.task_id}-job')} --execution-owner {args.execution_owner or f'owner:{args.task_id}'}"
+                if getattr(args, "auto_execution", True) else None
+            ),
+            "preview_monitor": f"python3 scripts/openclaw_ops.py --ledger {args.ledger} preview-tick {args.task_id}",
+        },
     }, ensure_ascii=False, indent=2))
 
 
 def cmd_install_monitor(args):
     ledger = load_ledger(args.ledger)
     task = find_task(ledger, args.task_id)
-    requester_channel = args.requester_channel or task.get("message", {}).get("nudge_target") or task.get("channel")
     session_key = session_key_for(task, args.session_key)
+    requester_info = normalize_delivery_target(
+        task.get("channel") or DEFAULT_CHANNEL,
+        args.requester_channel or task.get("message", {}).get("requester_channel_raw") or task.get("message", {}).get("requester_channel") or task.get("message", {}).get("nudge_target") or task.get("channel"),
+        task=task,
+        session_key=session_key,
+    )
+    requester_channel = requester_info["target"]
+    task.setdefault("message", {})["requester_channel"] = requester_channel
+    task["message"]["requester_channel_valid"] = requester_info["valid"]
+    task["message"]["requester_channel_source"] = requester_info["source"]
+    if requester_info.get("reason"):
+        task["message"]["requester_channel_reason"] = requester_info["reason"]
+    task["message"]["nudge_target"] = requester_channel
     name = args.name or default_monitor_name(args.task_id)
     prompt = cron_prompt(args.ledger, args.task_id, requester_channel, session_key)
     add_cmd = [
@@ -752,8 +1230,10 @@ def cmd_install_monitor(args):
         "--message", prompt,
         "--timeout-seconds", str(args.timeout_seconds),
         "--thinking", args.thinking,
-        "--model", args.model,
+        "--no-deliver",
     ]
+    if args.model:
+        add_cmd.extend(["--model", args.model])
     if args.every:
         add_cmd.extend(["--every", args.every])
     else:
@@ -827,6 +1307,27 @@ def cmd_remove_monitor(args):
     print(json.dumps({"ok": True, "task_id": args.task_id, "job_id": job_id, "removed": removed, "removal_mode": removal_mode}, ensure_ascii=False, indent=2))
 
 
+def cmd_rerun_task(args):
+    facts = parse_key_values(args.fact)
+    cmd = [
+        "python3", str(TASK_LEDGER), "--ledger", str(args.ledger), "rerun", args.task_id,
+        "--reason", args.reason,
+    ]
+    if args.summary:
+        cmd.extend(["--summary", args.summary])
+    if args.current_checkpoint:
+        cmd.extend(["--current-checkpoint", args.current_checkpoint])
+    if args.next_action:
+        cmd.extend(["--next-action", args.next_action])
+    if args.previous_status:
+        cmd.extend(["--previous-status", args.previous_status])
+    for key, value in facts.items():
+        cmd.extend(["--fact", f"{key}={value}"])
+    result = run(*cmd)
+    payload = parse_json_from_mixed_output(result.stdout)
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
 def cmd_ack_delivery(args):
     result = run(
         "python3", str(TASK_LEDGER), "--ledger", str(args.ledger), "ack-delivery", args.task_id, args.update_id,
@@ -835,6 +1336,20 @@ def cmd_ack_delivery(args):
         *( ["--note", args.note] if args.note else [] ),
     )
     print(result.stdout.strip())
+
+
+
+def cmd_flush_pending_updates(args):
+    result = deliver_pending_updates(args.ledger, args.task_id, delivered_via=args.delivered_via, note=args.note)
+    print(json.dumps({
+        "ok": True,
+        "task_id": args.task_id,
+        "flushed_count": result["delivered_count"],
+        "flushed_update_ids": result["delivered_update_ids"],
+        "pending_remaining": result["pending_remaining"],
+        "delivered_total": result["delivered_total"],
+        "failures": result["failures"],
+    }, ensure_ascii=False, indent=2))
 
 
 def cmd_preview_tick(args):
@@ -860,7 +1375,52 @@ def cmd_preview_tick(args):
         "pending_user_updates_deliverable_count": len(deliverable),
         "truth_state": report.get("truth_state"),
         "inconsistencies": report.get("inconsistencies", []),
+        "user_facing": report.get("user_facing") or task.get("derived", {}).get("user_facing"),
     }, ensure_ascii=False, indent=2))
+
+
+def cmd_resolve_artifact(args):
+    print(json.dumps(resolve_output_variants(args.expected_path, min_video_bytes=args.min_video_bytes), ensure_ascii=False, indent=2))
+
+
+def cmd_reconcile_execution_terminal(args):
+    job_id = args.job_id or f"{args.task_id}-job"
+    job_path = args.jobs_root / job_id / "job.json"
+    if not job_path.exists():
+        raise SystemExit(f"job state not found: {job_path}")
+    job = json.loads(job_path.read_text())
+    status = str(job.get("status") or "").upper()
+    failed = list(job.get("failed") or [])
+    artifacts = [item.get("path") for item in (job.get("artifacts") or []) if item.get("path")]
+    checkpoint = f"step-{len(job.get('items') or []):02d}" if (job.get('items') or []) else "step-00"
+
+    if failed or status in {"FAILED", "BLOCKED"}:
+        cmd = [
+            "python3", str(EXECUTION_BRIDGE), "--ledger", str(args.ledger), "blocked", args.task_id,
+            "--checkpoint", checkpoint,
+            "--summary", f"Execution finished with failed items: {', '.join(failed) if failed else status.lower()}",
+            "--safe-next-step", "Reconcile partial success truth: report existing artifacts, then decide whether to retry missing failed items",
+            "--next-action", "Do not mark SUCCESS; report partial success and missing steps explicitly",
+            "--fact", f"job_id={job_id}",
+            "--fact", f"failed_items={','.join(failed)}",
+            "--fact", "failure_type=EXECUTION_PARTIAL_FAILURE",
+            "--fact", f"artifact_count={len(artifacts)}",
+        ]
+        result = run(*cmd)
+        payload = {"ok": True, "task_id": args.task_id, "job_id": job_id, "reconciled_to": "BLOCKED", "failed": failed, "artifacts": artifacts, "stdout": result.stdout.strip()}
+    else:
+        cmd = [
+            "python3", str(EXECUTION_BRIDGE), "--ledger", str(args.ledger), "task-completed", args.task_id,
+            "--checkpoint", checkpoint,
+            "--summary", f"Execution job completed: {job_id}",
+            "--fact", f"job_id={job_id}",
+            "--fact", f"completed_items={len(job.get('completed') or [])}",
+        ]
+        for art in artifacts:
+            cmd.extend(["--artifact", art])
+        result = run(*cmd)
+        payload = {"ok": True, "task_id": args.task_id, "job_id": job_id, "reconciled_to": "TASK_COMPLETED", "artifacts": artifacts, "stdout": result.stdout.strip()}
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
 
 
 def build_parser():
@@ -910,7 +1470,7 @@ def build_parser():
         parser.add_argument("--tz", default=DEFAULT_TIMEZONE)
         parser.add_argument("--timeout-seconds", type=int, default=240)
         parser.add_argument("--thinking", default="low")
-        parser.add_argument("--model", default="minimax/MiniMax-M2.7")
+        parser.add_argument("--model")
         parser.add_argument("--disabled", action="store_true")
         parser.add_argument("--light-context", action="store_true")
         parser.add_argument("--dry-run", action="store_true")
@@ -931,7 +1491,7 @@ def build_parser():
     activate_p.add_argument("--tz", default=DEFAULT_TIMEZONE)
     activate_p.add_argument("--monitor-timeout-seconds", type=int, default=240)
     activate_p.add_argument("--thinking", default="low")
-    activate_p.add_argument("--model", default="minimax/MiniMax-M2.7")
+    activate_p.add_argument("--model")
     activate_p.add_argument("--disabled", action="store_true")
     activate_p.add_argument("--light-context", action="store_true")
     activate_p.add_argument("--dry-run", action="store_true")
@@ -949,11 +1509,18 @@ def build_parser():
     bootstrap_p.add_argument("--tz", default=DEFAULT_TIMEZONE)
     bootstrap_p.add_argument("--monitor-timeout-seconds", type=int, default=240)
     bootstrap_p.add_argument("--thinking", default="low")
-    bootstrap_p.add_argument("--model", default="minimax/MiniMax-M2.7")
+    bootstrap_p.add_argument("--model")
     bootstrap_p.add_argument("--disabled", action="store_true")
     bootstrap_p.add_argument("--light-context", action="store_true")
     bootstrap_p.add_argument("--dry-run", action="store_true")
-    bootstrap_p.set_defaults(func=cmd_activate_task)
+    bootstrap_p.add_argument("--jobs-root", default=str(ROOT / "state" / "jobs"))
+    bootstrap_p.add_argument("--execution-job-id")
+    bootstrap_p.add_argument("--execution-adapter", default="generic_manual")
+    bootstrap_p.add_argument("--execution-owner")
+    bootstrap_p.add_argument("--auto-run-max-steps", type=int)
+    bootstrap_p.add_argument("--no-auto-execution", dest="auto_execution", action="store_false")
+    bootstrap_p.add_argument("--no-auto-start-execution", dest="auto_start_execution", action="store_false")
+    bootstrap_p.set_defaults(func=cmd_activate_task, auto_execution=True, auto_start_execution=True)
 
     prompt_p = sp.add_parser("render-monitor-prompt")
     prompt_p.add_argument("task_id")
@@ -989,6 +1556,42 @@ def build_parser():
     record_p.add_argument("--resume-token")
     record_p.set_defaults(func=cmd_record_update)
 
+    reconcile_p = sp.add_parser("reconcile-before-block")
+    reconcile_p.add_argument("task_id")
+    reconcile_p.add_argument("expected_path")
+    reconcile_p.add_argument("--current-checkpoint")
+    reconcile_p.add_argument("--next-action")
+    reconcile_p.add_argument("--safe-next-step")
+    reconcile_p.add_argument("--summary")
+    reconcile_p.add_argument("--summary-if-resolved")
+    reconcile_p.add_argument("--summary-if-blocked")
+    reconcile_p.add_argument("--fact", action="append")
+    reconcile_p.add_argument("--need", action="append")
+    reconcile_p.add_argument("--fact-key", default="video_path")
+    reconcile_p.add_argument("--min-video-bytes", type=int, default=500000)
+    reconcile_p.set_defaults(func=cmd_reconcile_before_block)
+
+    recover_p = sp.add_parser("recover-external-success")
+    recover_p.add_argument("task_id")
+    recover_p.add_argument("expected_path")
+    recover_p.add_argument("--current-checkpoint", required=True)
+    recover_p.add_argument("--next-action")
+    recover_p.add_argument("--summary")
+    recover_p.add_argument("--fact", action="append")
+    recover_p.add_argument("--fact-key", default="video_path")
+    recover_p.add_argument("--min-video-bytes", type=int, default=500000)
+    recover_p.set_defaults(func=cmd_recover_external_success)
+
+    rerun_p = sp.add_parser("rerun-task")
+    rerun_p.add_argument("task_id")
+    rerun_p.add_argument("--reason", required=True)
+    rerun_p.add_argument("--summary")
+    rerun_p.add_argument("--current-checkpoint")
+    rerun_p.add_argument("--next-action")
+    rerun_p.add_argument("--previous-status")
+    rerun_p.add_argument("--fact", action="append")
+    rerun_p.set_defaults(func=cmd_rerun_task)
+
     ack_p = sp.add_parser("ack-delivery")
     ack_p.add_argument("task_id")
     ack_p.add_argument("update_id")
@@ -997,9 +1600,33 @@ def build_parser():
     ack_p.add_argument("--note")
     ack_p.set_defaults(func=cmd_ack_delivery)
 
+    flush_p = sp.add_parser("flush-pending-updates")
+    flush_p.add_argument("task_id")
+    flush_p.add_argument("--delivered-via", default="monitor.delivery_push")
+    flush_p.add_argument("--note")
+    flush_p.set_defaults(func=cmd_flush_pending_updates)
+
     preview_p = sp.add_parser("preview-tick")
     preview_p.add_argument("task_id")
     preview_p.set_defaults(func=cmd_preview_tick)
+
+    resolve_artifact_p = sp.add_parser("resolve-artifact")
+    resolve_artifact_p.add_argument("expected_path")
+    resolve_artifact_p.add_argument("--min-video-bytes", type=int, default=500000)
+    resolve_artifact_p.set_defaults(func=cmd_resolve_artifact)
+
+    reconcile_terminal_p = sp.add_parser("reconcile-execution-terminal")
+    reconcile_terminal_p.add_argument("task_id")
+    reconcile_terminal_p.add_argument("--jobs-root", type=Path, default=ROOT / "state" / "jobs")
+    reconcile_terminal_p.add_argument("--job-id")
+    reconcile_terminal_p.set_defaults(func=cmd_reconcile_execution_terminal)
+
+    init_exec_job_p = sp.add_parser("init-execution-job")
+    init_exec_job_p.add_argument("task_id")
+    init_exec_job_p.add_argument("--jobs-root", default=str(ROOT / "state" / "jobs"))
+    init_exec_job_p.add_argument("--job-id")
+    init_exec_job_p.add_argument("--adapter", default="generic_manual")
+    init_exec_job_p.set_defaults(func=cmd_init_execution_job)
 
     # Executor commands
     executor_preview_p = sp.add_parser("executor-preview")
@@ -1014,7 +1641,7 @@ def build_parser():
     run_executor_p.add_argument("--tz", default=DEFAULT_TIMEZONE)
     run_executor_p.add_argument("--timeout-seconds", type=int, default=300)
     run_executor_p.add_argument("--thinking", default="medium")
-    run_executor_p.add_argument("--model", default="minimax/MiniMax-M2.7")
+    run_executor_p.add_argument("--model")
     run_executor_p.add_argument("--light-context", action="store_true")
     run_executor_p.add_argument("--dry-run", action="store_true")
     run_executor_p.set_defaults(func=cmd_run_executor)

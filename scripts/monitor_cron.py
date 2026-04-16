@@ -5,6 +5,8 @@ import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
+FAIL_CLOSED_THRESHOLD = 3
+
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_LEDGER = ROOT / "state" / "long-task-ledger.example.json"
 DEFAULT_CRON_DIR = ROOT / "state" / "monitor-crons"
@@ -110,34 +112,128 @@ def ack_delivery(ledger_path: Path, task_id: str, update_id: str, *, delivered_v
 
 
 def push_pending_updates(ledger_path: Path, task_id: str):
-    ledger = load_ledger(ledger_path)
+    proc = subprocess.run(
+        ["python3", str(OPS_SCRIPT), "--ledger", str(ledger_path), "flush-pending-updates", task_id, "--delivered-via", "monitor.delivery_push", "--note", "Monitor cron delivery flush"],
+        check=True, text=True, capture_output=True,
+    )
+    return json.loads(proc.stdout)
+
+
+def classify_failure(*, stage: str, error: str | None = None, failure: dict | None = None, exc: Exception | None = None):
+    text = (error or "")
+    if failure:
+        text = failure.get("error") or text
+    if exc is not None and not text:
+        text = str(exc)
+    code = (failure or {}).get("error_code") or "RUNTIME_ERROR"
+    lower = text.lower()
+    if "invalid delivery target" in lower or "invalid target" in lower:
+        code = "INVALID_TARGET"
+    elif "cron_add_failed_after_retry" in lower:
+        code = "CONFIG_ERROR"
+    signature = f"{stage}:{code}:{text.strip()[:240]}"
+    return {"stage": stage, "code": code, "error": text.strip(), "signature": signature}
+
+
+def update_failure_policy(task: dict, failure_info: dict):
+    monitoring = task.setdefault("monitoring", {})
+    policy = monitoring.setdefault("fail_closed_policy", {})
+    if policy.get("last_signature") == failure_info["signature"]:
+        policy["repeat_count"] = int(policy.get("repeat_count", 0) or 0) + 1
+    else:
+        policy["repeat_count"] = 1
+    policy["last_signature"] = failure_info["signature"]
+    policy["last_stage"] = failure_info["stage"]
+    policy["last_code"] = failure_info["code"]
+    policy["last_error"] = failure_info["error"]
+    policy["last_failed_at"] = now_iso()
+    return policy
+
+
+def clear_failure_policy(task: dict):
+    task.setdefault("monitoring", {}).pop("fail_closed_policy", None)
+
+
+def stop_monitor_fail_closed(args, task_id: str, *, reason: str, report: dict | None = None, failure_info: dict | None = None):
+    cron_path = cron_file(args.cron_dir, task_id)
+    cron_path.unlink(missing_ok=True)
+    ledger = load_ledger(args.ledger)
     task = find_task(ledger, task_id)
-    reporting = task.get("reporting", {})
-    pushed = []
-    for update in list(reporting.get("pending_updates", [])):
-        if update.get("delivered"):
-            continue
-        ack_delivery(ledger_path, task_id, update["update_id"], delivered_via="monitor.delivery_push", note="Simulated monitor delivery push")
-        pushed.append(update["update_id"])
-    return pushed
+    monitoring = task.setdefault("monitoring", {})
+    monitoring["cron_state"] = "DELETED"
+    monitoring["cron_removed_at"] = now_iso()
+    monitoring["stop_policy"] = "FAIL_CLOSED"
+    monitoring["stop_reason"] = reason
+    if failure_info:
+        monitoring["stop_failure"] = failure_info
+    save_json(args.ledger, ledger)
+    return {
+        "ok": True,
+        "task_id": task_id,
+        "cron_removed": True,
+        "stopped_fail_closed": True,
+        "stop_reason": reason,
+        "failure": failure_info,
+        "report": report,
+        "cron_file": str(cron_path),
+    }
+
 
 def cmd_run_once(args):
     cron_path = cron_file(args.cron_dir, args.task_id)
     if not cron_path.exists():
         raise SystemExit(f"Monitor cron not installed for {args.task_id}: {cron_path}")
 
-    delivery_push_ids = push_pending_updates(args.ledger, args.task_id)
+    delivery_push_ids = []
+    delivery_failures = []
+    report = None
+    try:
+        first_flush = push_pending_updates(args.ledger, args.task_id)
+        delivery_push_ids.extend(first_flush.get("flushed_update_ids", []))
+        delivery_failures.extend(first_flush.get("failures", []))
 
-    proc = subprocess.run(
-        ["python3", str(MONITOR_SCRIPT), "--ledger", str(args.ledger), "--apply-supervision"],
-        check=True,
-        text=True,
-        capture_output=True,
-    )
-    payload = json.loads(proc.stdout)
-    report = next((item for item in payload.get("reports", []) if item.get("task_id") == args.task_id), None)
-    if not report:
-        raise SystemExit(f"Task {args.task_id} not present in monitor output")
+        proc = subprocess.run(
+            ["python3", str(MONITOR_SCRIPT), "--ledger", str(args.ledger), "--apply-supervision"],
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+        payload = json.loads(proc.stdout)
+        report = next((item for item in payload.get("reports", []) if item.get("task_id") == args.task_id), None)
+        if not report:
+            raise RuntimeError(f"Task {args.task_id} not present in monitor output")
+
+        if report["state"] in {"BLOCKED_ESCALATE", "STOP_AND_DELETE"}:
+            final_flush = push_pending_updates(args.ledger, args.task_id)
+            delivery_push_ids.extend(final_flush.get("flushed_update_ids", []))
+            delivery_failures.extend(final_flush.get("failures", []))
+    except Exception as exc:
+        ledger = load_ledger(args.ledger)
+        task = find_task(ledger, args.task_id)
+        failure_info = classify_failure(stage="runtime", exc=exc)
+        policy = update_failure_policy(task, failure_info)
+        save_json(args.ledger, ledger)
+        if int(policy.get("repeat_count", 0) or 0) >= FAIL_CLOSED_THRESHOLD:
+            print(json.dumps(stop_monitor_fail_closed(args, args.task_id, reason="repeated identical monitor runtime/config failure", report=report, failure_info=failure_info), ensure_ascii=False, indent=2))
+            return
+        raise
+
+    ledger = load_ledger(args.ledger)
+    task = find_task(ledger, args.task_id)
+    if delivery_failures:
+        failure_info = classify_failure(stage="delivery", failure=delivery_failures[0])
+        policy = update_failure_policy(task, failure_info)
+        save_json(args.ledger, ledger)
+        stable_blocked = task.get("status") == "BLOCKED" or (report or {}).get("state") == "BLOCKED_ESCALATE"
+        if failure_info["code"] == "INVALID_TARGET" and stable_blocked:
+            print(json.dumps(stop_monitor_fail_closed(args, args.task_id, reason="blocked/terminal task notification target is irreparably invalid", report=report, failure_info=failure_info), ensure_ascii=False, indent=2))
+            return
+        if int(policy.get("repeat_count", 0) or 0) >= FAIL_CLOSED_THRESHOLD:
+            print(json.dumps(stop_monitor_fail_closed(args, args.task_id, reason="repeated identical delivery/config failure with no recovery path", report=report, failure_info=failure_info), ensure_ascii=False, indent=2))
+            return
+    else:
+        clear_failure_policy(task)
+        save_json(args.ledger, ledger)
 
     cron_removed = False
     if report["state"] in {"BLOCKED_ESCALATE", "STOP_AND_DELETE"}:
@@ -149,17 +245,6 @@ def cmd_run_once(args):
         task["monitoring"]["cron_removed_at"] = now_iso()
         save_json(args.ledger, ledger)
 
-    if report["state"] in {"BLOCKED_ESCALATE", "STOP_AND_DELETE"}:
-        cron_path.unlink(missing_ok=True)
-        cron_removed = True
-        ledger = load_ledger(args.ledger)
-        task = find_task(ledger, args.task_id)
-        task.setdefault("monitoring", {})["cron_state"] = "DELETED"
-        task["monitoring"]["cron_removed_at"] = now_iso()
-        save_json(args.ledger, ledger)
-
-    # Handle NUDGE_MAIN_AGENT and OWNER_RECONCILE: actually send the nudge via openclaw agent
-    # Need task for default channel fallback
     ledger = load_ledger(args.ledger)
     task = find_task(ledger, args.task_id)
     owner_session_key = (report.get("action_payload") or {}).get("session_key") or \
@@ -167,13 +252,12 @@ def cmd_run_once(args):
                         f"agent:main:discord:channel:{task.get('channel', 'discord')}"
     nudge_sent = False
     if report["state"] in {"NUDGE_MAIN_AGENT", "OWNER_RECONCILE"}:
-        nudge_msg = (report.get("action_payload") or {}).get("message") or format_fallback_nudge(report, task)
+        nudge_msg = (report.get("action_payload") or {}).get("message") or report.get("reason")
         nudge_result = subprocess.run(
             ["openclaw", "agent", "--to", owner_session_key, "--message", nudge_msg, "--deliver"],
             check=False, text=True, capture_output=True, timeout=30,
         )
         nudge_sent = nudge_result.returncode == 0
-        # Record in monitoring that nudge was sent
         ledger = load_ledger(args.ledger)
         task = find_task(ledger, args.task_id)
         monitoring = task.setdefault("monitoring", {})
@@ -192,6 +276,7 @@ def cmd_run_once(args):
         "cron_file": str(cron_path),
         "delivery_push_count": len(delivery_push_ids),
         "delivery_push_update_ids": delivery_push_ids,
+        "delivery_failures": delivery_failures,
         "nudge_sent": nudge_sent,
         "nudge_sent_via": "openclaw_agent_deliver" if nudge_sent else None,
     }, ensure_ascii=False, indent=2))

@@ -1,47 +1,24 @@
 # Prompt contract
 
-Use this contract when another agent instance loads `long-task-control` and needs the default lifecycle to happen *without remembering extra bootstrap lore*.
+Use this contract when another agent instance loads `long-task-control` and needs the default lifecycle to happen without remembering bootstrap lore.
 
 ## Default contract
 
-If the task is long-running by the detection checklist, treat this lifecycle as the default:
+For a long-running task, the default lifecycle is now:
 
-1. emit `ACTIVATED`
-2. create `TASK START`
-3. initialize the durable ledger
-4. install the monitor cron
-5. spawn the executor subagent (for multi-stage tasks)
-6. use `record-update` for STARTED / CHECKPOINT / BLOCKED / COMPLETED
-7. let monitor drive nudge / reconcile / blocked-escalate / cleanup, with user-centered bias: first push resume / rebuild-safe-step / reconcile / 補做, and only use blocked escalation once self-recovery is no longer viable; if an external job is marked pending/running, require minimum `provider_evidence` (real provider job id / receipt / status handle / artifact handle). A weak pending claim without evidence must enter owner-evidence reconcile first, not be trusted as legitimate external wait
-8. GAP-1 one-shot nudge + escalate: NUDGE once if a step is done but next hasn't started, then immediately BLOCKED_ESCALATE on next tick if still stalled
-9. passive delivery push: monitor checks `pending_updates[]` every tick and sends to Discord without waiting for main agent
-10. remove the monitor on terminal state
+1. run `bootstrap-task`
+2. let `bootstrap-task` auto-create the durable ledger
+3. let `bootstrap-task` install the monitor cron
+4. let `bootstrap-task` auto-derive the generic execution job from the workflow
+5. let `bootstrap-task` auto-run the first `runner_engine.py run-loop` tick with execution ownership
+6. continue execution with `runner_engine.py run-loop` as the canonical execution owner
+7. use `record-update` only when the owner is directly writing observed truth outside the runner bridge
+8. keep the monitor in the supervision lane: nudge / reconcile / blocked-escalate / cleanup
+9. remove the monitor on terminal state
 
-## Executor prompt contract
+## Canonical integration command
 
-When the executor subagent receives the task goal and workflow, it follows this loop:
-
-```
-loop:
-  preview = executor_engine.py preview <task_id>
-  if preview.action == "execute_step":
-    execute the step (shell/API/file operation)
-    task_ledger.py checkpoint <task_id> --kind CHECKPOINT --summary "..." --current-checkpoint <step-id> --next-action "..."
-    goto loop
-  elif preview.action == "workflow_complete":
-    task_ledger.py checkpoint <task_id> --kind COMPLETED --summary "..."
-    output "EXECUTOR_DONE"; exit
-  elif preview.action == "blocked":
-    output "EXECUTOR_BLOCKED"; exit
-  else:
-    output "EXECUTOR_DONE"; exit
-```
-
-Auto-resume: the executor reads the ledger's `current_checkpoint` on each wake and continues from the next pending step. If step-01 is DONE and step-02 is RUNNING, step-02 starts immediately.
-
-## Preferred integration command
-
-Prefer one command instead of manually chaining activation + init + install-monitor:
+Prefer one canonical command instead of manually chaining activation + init + install-monitor + hand-written job spec:
 
 ```bash
 python3 scripts/openclaw_ops.py --ledger state/long-task-ledger.json bootstrap-task <task_id> \
@@ -52,41 +29,63 @@ python3 scripts/openclaw_ops.py --ledger state/long-task-ledger.json bootstrap-t
   --workflow "Validate and handoff" \
   --next-action "Publish the first STARTED update" \
   --message-ref "discord:msg:<activation-message-id>"
-
-# Then spawn the executor:
-python3 scripts/openclaw_ops.py --ledger state/long-task-ledger.json run-executor <task_id>
 ```
 
-The command should be treated as the canonical entrypoint for OpenClaw-native long tasks.
+This canonical path now means:
+
+- activation + `TASK START`
+- durable ledger init
+- monitor install
+- auto `init-execution-job`
+- auto first `run-loop`
+- execution ownership obtained by the runner immediately
+
+Continue with:
+
+```bash
+python3 scripts/runner_engine.py --jobs-root state/jobs run-loop <task_id>-job --execution-owner owner:<task_id>
+```
 
 ## Owner update rule
 
-After bootstrap, do **not** freehand the ledger mutations. Prefer:
+After bootstrap, do **not** freehand ledger mutations. Prefer:
 
 ```bash
-python3 scripts/openclaw_ops.py --ledger state/long-task-ledger.json record-update <STARTED|CHECKPOINT|BLOCKED|COMPLETED> <task_id> ...
+python3 scripts/openclaw_ops.py --ledger state/long-task-ledger.json record-update <STARTED|STEP_PROGRESS|STEP_COMPLETED|BLOCKED|TASK_COMPLETED> <task_id> ...
 ```
 
-This keeps user-visible execution truth and ledger truth bound to the same operation.
+Use this only when truth comes from outside the runner bridge.
 
-Each such command now also creates a durable `pending_user_update` / `reporting.pending_updates[]` obligation. Treat that as mandatory follow-up: after the requester-visible message is actually sent, run `python3 scripts/task_ledger.py --ledger state/long-task-ledger.json ack-delivery <task_id> <update_id> --message-ref <message-ref>`.
+Each such command creates a durable `pending_user_update` obligation. After the requester-visible message is actually sent, run:
+
+```bash
+python3 scripts/task_ledger.py --ledger state/long-task-ledger.json ack-delivery <task_id> <update_id> --message-ref <message-ref>
+```
+
+## Monitor contract
+
+The monitor is a supervisor, not the execution owner.
+
+Per tick it must:
+
+- passively deliver `reporting.pending_updates[]`
+- detect stale / heartbeat / truth-inconsistent states
+- nudge or reconcile the owner when execution stalls
+- escalate blocked only after observed truth justifies it
+- remove itself on terminal state
 
 ## GAP-1: one-shot nudge + escalate
 
-When the monitor detects a step is terminal (DONE/COMPLETED) but the next step hasn't started:
+When the monitor detects a step is terminal but the next step has not started:
 
-1. First tick: `NUDGE_MAIN_AGENT` once; record step in `monitoring.gap1_nudged_steps[]`
-2. Second tick (same step still stalled): immediately `BLOCKED_ESCALATE`; cron deletes itself
-3. No repeat Discord notifications for the same GAP-1 event
+1. first tick: `NUDGE_MAIN_AGENT` once
+2. second tick for the same stalled gap: `BLOCKED_ESCALATE`
+3. no repeated spam for the same gap event
 
-## Passive delivery push
+## Legacy / non-canonical path
 
-Every monitor tick MUST check and send pending updates before deciding state:
-- Check `reporting.pending_updates[]` for `delivered=false`
-- Send each to Discord via `message.send`
-- `ack-delivery` after successful send
-- This is mandatory, not conditional — always execute before state evaluation
+If you explicitly need subagent-driven execution, `run-executor` remains only as a legacy fallback. It is not the main docs path and should not be used for skill acceptance.
 
 ## Advanced / manual path
 
-Only fall back to separate `activation`, `init-task`, `install-monitor`, and `run-executor` commands when you explicitly need split-phase control for debugging or custom orchestration.
+Only fall back to separate `activation`, `init-task`, `install-monitor`, `init-execution-job`, or `run-executor` commands when you explicitly need split-phase debugging or custom orchestration.
