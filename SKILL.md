@@ -1,9 +1,51 @@
 ---
 name: long-task-control
-description: Standardize long-running task control with a strict truth/control split. Use when work spans multiple turns, depends on external async jobs, needs proactive supervision, or must survive owner silence without fabricating state.
+description: Standardize long-running durable task execution with a strict truth/control split. Use when work spans multiple turns, depends on external async jobs, needs proactive supervision, or must survive interruption/silence without fabricating state. Especially use for: (1) 3+ sequential API/exec steps, (2) multi-stage image/video/content generation, (3) tasks with partial-completion risk that need durable progress tracking, resume, and reconciliation.
 ---
 
 # Long Task Control
+
+## Quickstart
+
+### Good fit
+
+用 LTC 處理這些任務：
+- 3+ sequential API calls / exec commands / workflow stages
+- multi-stage image / video / content generation
+- external async/provider job 需要等待、輪詢、下載、reconcile
+- 任務會跨多 turn，不能只靠 session memory 記住狀態
+- partial completion 風險高，需要 durable progress tracking / resume / monitor
+
+### Bad fit
+
+不要把這些任務硬塞進 LTC：
+- 單次查資料、一次性問答、短 summarization
+- 短 research / scouting / brainstorming
+- 1-2 步就能完成的小修補
+- 沒有可觀察 progress signal 的模糊工作
+- 其實只需要一般 agent turn，不需要 durable execution ownership 的任務
+
+### Canonical flow
+
+大多數任務沿著這條路徑走：
+
+1. `init` 建立 task
+2. 開始做事時寫 `STEP_PROGRESS`
+3. 某一步真的完成時寫 `STEP_COMPLETED`
+4. 整個任務真的完成時寫 `TASK_COMPLETED`
+5. 有 external/provider job 時寫 `external-job`
+6. 有 artifact/download 真正落地時寫 `download-observed`
+7. owner 有觀察/回覆時寫 `owner-reply`
+8. monitor 用 `monitor_nudge.py --apply-supervision` 做 supervision，不直接腦補 task truth
+
+### Do not do this
+
+- 不要手改 `derived.*`
+- 不要把 `STEP_PROGRESS` 當成 `STEP_COMPLETED`
+- 不要沒有 observed truth 就宣告 success / completed
+- 不要把 monitor/control state 當 ground truth
+- 不要把 owner guess / optimistic assumption 寫成 observed fact
+- 不要為了讓 monitor 安靜而補假 state
 
 這版的重點不是多一個 monitor，而是把 architecture 拆乾淨：
 
