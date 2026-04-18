@@ -1,133 +1,131 @@
 ---
 name: long-task-control
-description: Take ownership of a long-running or multi-stage task as one durable execution workflow: decompose it, execute what is concretely executable, persist evidence, resume after interruption, and reconcile the user-facing result from actual outputs. Use when work spans multiple turns or async waits and must survive silence without relying on memory-only status. Explicit trigger patterns: (1) any batch job with 3 or more sequential API calls or exec commands, (2) multi-step image/video generation across multiple prompts or apps, (3) any task that risks partial completion and needs durable progress tracking. If outputs exist even though execution/cleanup was interrupted, prefer success/partial-success reconciliation over surfacing raw control-plane blocker noise first.
+description: Standardize long-running task control with a strict truth/control split. Use when work spans multiple turns, depends on external async jobs, needs proactive supervision, or must survive owner silence without fabricating state.
 ---
 
 # Long Task Control
 
-Treat this skill as one user-facing product behavior:
+這版的重點不是多一個 monitor，而是把 architecture 拆乾淨：
 
-- accept the long task
-- bootstrap durable state
-- start execution immediately
-- keep reporting grounded in observed truth
-- persist outputs/evidence on disk
-- resume from disk
-- reconcile the user-facing result from actual deliverables
-- mention interruption/cleanup issues honestly, but do not lead with them when useful outputs already exist
+1. **Observed Truth**：owner / executor / external observation 回填真相
+2. **Derived State**：script 從 truth 做 deterministic projection
+3. **Control Actions**：monitor / owner / user-facing delivery 根據 derived state 執行動作
 
-Do not expose internal architecture unless debugging requires it.
+## Root rule
 
-## Canonical path
+- 沒有 observed truth，就不要判 `OK`
+- `STEP_PROGRESS` 不等於 `STEP_COMPLETED`
+- `TASK_COMPLETED` 只能由 completion truth 驅動
+- monitor 不能用矛盾欄位腦補「agent 還在做 / external pending」
+
+## Event model
+
+使用這些事件，不再混用 `CHECKPOINT`：
+
+- `STARTED`
+- `STEP_PROGRESS`
+- `STEP_COMPLETED`
+- `TASK_COMPLETED`
+- `BLOCKED_CONFIRMED`
+- `OWNER_RESUMED`
+- `OWNER_REPLY_RECORDED`
+- `EXTERNAL_OBSERVED`
+- `DOWNLOAD_OBSERVED`
+- `HEARTBEAT`
+
+## Architecture summary
+
+### Observed truth
+
+由 owner / executor / external observation 回填：
+- `observations[]`
+- `observed.steps.*`
+- `observed.task_completion`
+- `observed.block`
+- `observed.owner`
+- `observed.external_jobs`
+- `observed.downloads`
+
+### Derived state
+
+由 `task_ledger.py project_task()` / `monitor_nudge.py` 推導：
+- `derived.workflow`
+- `derived.current_step`
+- `derived.step_states`
+- `derived.pending_external`
+- `derived.truth_state`
+- `derived.inconsistencies`
+
+### Control actions
+
+- `TRUTH_INCONSISTENT`
+- `OWNER_RECONCILE`
+- `NUDGE_MAIN_AGENT`
+- `BLOCKED_ESCALATE`
+- `STOP_AND_DELETE`
+
+## Monitor precedence
+
+1. terminal → `STOP_AND_DELETE`
+2. truth inconsistent / suspicious external claim → `TRUTH_INCONSISTENT` or `OWNER_RECONCILE`
+3. blocked confirmed → retry-first check → `BLOCKED_ESCALATE`
+4. no material progress delta / heartbeat → `NUDGE_MAIN_AGENT` / `STALE_PROGRESS` / `HEARTBEAT_DUE`
+5. only then `OK`
+
+## Progress-based supervision contract
+
+- LTC **不是** wall-clock task TTL；不是「20 分鐘到就停任務」
+- monitor 只在 **長時間沒有實質 progress delta** 時介入
+- progress delta 可來自：
+  - 新的 `STEP_PROGRESS` / `STEP_COMPLETED` / `TASK_COMPLETED`
+  - 新 artifact / download observation
+  - external/provider job status 變化
+  - executor health 的成功心跳（例如 `executor_health.last_success_at`）
+- 只要長任務仍持續產生這些 progress signal，就算跑幾小時也不應被當成 stop-loss 目標
+- `timeout_sec` / `nudge_after_sec` 在這版語義上代表 **progress idle threshold**，不是 hard kill deadline
+
+## Owner-resume contract
+
+monitor 用 `sessions_send` 要 owner 做的是：
+- 先觀察
+- 補真實資料
+- 再 resume / 完成 / blocked
+
+不要直接寫半成品 state 去和 deterministic projection 打架。
+
+## Retry-first contract
+
+`DOWNLOAD_TIMEOUT` / `DOWNLOAD_INCOMPLETE` / `TRANSIENT_NETWORK` / `EXECUTION_ERROR` / `EXTERNAL_WAIT`
+必須先來自 observed truth，之後 monitor 才能用 retry counter 決定 retry 或 escalate。
+
+## Primary commands
 
 ```bash
-python3 scripts/openclaw_ops.py --ledger state/long-task-ledger.json bootstrap-task <task_id> \
-  --goal "<one sentence goal>" \
-  --requester-channel <channel> \
-  --workflow "Step 1 title :: shell=<command> :: expect=<artifact>" \
-  --workflow "Step 2 title :: shell=<command> :: expect=<artifact>" \
-  --workflow "Step 3 title :: shell=<command> :: expect=<artifact>" \
-  --next-action "Start step-01"
+python3 scripts/task_ledger.py --ledger state/long-task-ledger.json init <task_id> ...
+python3 scripts/task_ledger.py --ledger state/long-task-ledger.json checkpoint <task_id> --event-type STEP_PROGRESS ...
+python3 scripts/task_ledger.py --ledger state/long-task-ledger.json checkpoint <task_id> --event-type STEP_COMPLETED ...
+python3 scripts/task_ledger.py --ledger state/long-task-ledger.json checkpoint <task_id> --event-type TASK_COMPLETED ...
+python3 scripts/task_ledger.py --ledger state/long-task-ledger.json block <task_id> ...
+python3 scripts/task_ledger.py --ledger state/long-task-ledger.json external-job <task_id> ...
+python3 scripts/task_ledger.py --ledger state/long-task-ledger.json download-observed <task_id> ...
+python3 scripts/task_ledger.py --ledger state/long-task-ledger.json owner-reply <task_id> --reply <A|B|C|D|E> ...
+python3 scripts/monitor_nudge.py --ledger state/long-task-ledger.json --apply-supervision
 ```
 
-`bootstrap-task` is the single entrypoint. It:
-- creates the ledger task
-- installs monitor supervision
-- derives the execution job
-- starts the owned runner loop and keeps driving it until terminal completion or an honest blocked state
+## References
 
-If a retry/correction needs a clean slate, start a fresh run:
+- `references/task-ledger-spec.md`
+- `references/monitor-action-spec.md`
+- `scripts/task_ledger.py`
+- `scripts/monitor_nudge.py`
+- `scripts/openclaw_ops.py`
 
-```bash
-python3 scripts/openclaw_ops.py --ledger state/long-task-ledger.json rerun-task <task_id> \
-  --reason "<what changed>" \
-  --summary "fresh run after correction" \
-  --current-checkpoint step-01 \
-  --next-action "Resume execution"
-```
+## Why this version exists
 
-## User-facing state model
+因為舊版把 deterministic script 與 agent judgement 混在一起，導致：
+- `CHECKPOINT` 同時表示 progress / completed
+- monitor 用半套 truth 判 OK
+- external pending claim 沒證據也被當真
+- owner resume 後寫的狀態和 script projection 打架
 
-Keep two layers separate:
-
-1. **control-plane state**
-   - `RUNNING`, `BLOCKED`, `COMPLETED`, etc.
-2. **user-facing outcome state** under `derived.user_facing`
-   - `IN_PROGRESS`
-   - `SUCCESS`
-   - `PARTIAL_SUCCESS`
-   - `BLOCKED`
-   - `FAILED`
-
-Rule: when useful outputs already exist, reconcile/report that outcome first. Do not surface raw interruption or cleanup noise as the main story unless there is no meaningful result yet.
-
-## Generic executor contract
-
-The default adapter is `generic_manual`.
-
-What it can do now:
-- execute `shell=...` steps
-- verify expected artifacts via `expect=` / `artifacts=`
-- persist item/job state
-- bridge step/task truth into the ledger automatically
-
-What it must not do:
-- invent automation for vague steps
-- auto-complete unsupported work
-- report success with no evidence
-
-If a step has no executable semantics, the generic path must block honestly.
-
-## Step syntax for the generic path
-
-Each workflow entry can stay plain text, or embed a concrete execution contract using `:: key=value` parts.
-
-Supported keys in the first redesign slice:
-- `shell=<command>`
-- `expect=<path>`
-- `artifacts=<path1>|<path2>`
-- `cwd=<dir>`
-- `timeout=<sec>`
-- `next_action=<text>`
-- `batch_result=<path-to-json-summary>`
-- `batch_min_success=<n>`
-- `auto_action=deliver_artifacts`
-- `deliver_artifacts=<path1>|<path2>`
-- `deliver_caption=<user-facing delivery text>`
-
-Example:
-
-```bash
---workflow "Build draft :: shell=python3 build.py --out /tmp/draft.txt :: expect=/tmp/draft.txt"
---workflow "Deliver review pack :: auto_action=deliver_artifacts :: deliver_artifacts=/tmp/draft.txt :: deliver_caption=Here is the generated draft for review"
-```
-
-If no `shell=` is present, the step is usually treated as a human gate and will block unless a specialized adapter owns it.
-
-Exception: config-like Discord target normalize / repair / self-heal steps are auto-promoted into a deterministic local repair path (`auto_action=repair_requester_channel`) so they execute directly instead of surfacing fake `BLOCKED` / `OWNER_ACTION_REQUIRED` escalations.
-
-## Monitor role
-
-The monitor is supervision only. It exists to:
-- ensure progress is still happening
-- flush pending updates
-- request reconciliation when outputs/evidence and control-plane state diverge
-- escalate blockers when there is no better user-correct explanation
-- stop/delete itself on terminal tasks
-
-If outputs exist but execution was interrupted, monitor should prefer reconciliation before blocker escalation.
-
-## Truth rules
-
-- Only observed execution results, artifacts, owner observations, or external evidence count as truth.
-- `STEP_PROGRESS` is not `STEP_COMPLETED`.
-- `TASK_COMPLETED` requires completion evidence.
-- `BLOCKED` does not automatically mean the user got nothing.
-- Monitor never fabricates task truth.
-
-## Main references
-
-Read these when needed:
-- `references/redesign-spec.md` — user-facing state model and outcome-first reconciliation
-- `references/openclaw-native-runbook.md` — operational flow
-- `references/live-acceptance-test.md` — acceptance procedure
+這版是直接把根因拆開重做，不再 patch 舊混線模型。

@@ -10,9 +10,11 @@ from task_ledger import PENDING_EXTERNAL_STATES, PROVIDER_EVIDENCE_KEYS, project
 TERMINAL_STATUSES = {"COMPLETED", "FAILED", "ABANDONED"}
 STATE_PRIORITY = [
     "STOP_AND_DELETE",
+    "BLOCKED_ESCALATE",
+    "EXECUTOR_UNHEALTHY",
+    "FINALIZATION_STALLED",
     "TRUTH_INCONSISTENT",
     "OWNER_RECONCILE",
-    "BLOCKED_ESCALATE",
     "NUDGE_MAIN_AGENT",
     "STALE_PROGRESS",
     "HEARTBEAT_DUE",
@@ -47,6 +49,7 @@ SUPERVISION_ALLOWED_PATHS = {
     "status",
     "current_checkpoint",
     "last_checkpoint_at",
+    "workflow_projection",
     "heartbeat.last_progress_at",
     "heartbeat.last_observed_progress_at",
 }
@@ -95,13 +98,14 @@ def monitoring_config(task):
     hb = task.get("heartbeat", {})
     raw = task.get("monitoring", {})
     expected_interval = hb.get("expected_interval_sec", 300)
-    timeout_sec = hb.get("timeout_sec", 1800)
+    progress_idle_threshold_sec = hb.get("progress_idle_threshold_sec") or hb.get("timeout_sec", 1800)
     return {
-        "nudge_after_sec": raw.get("nudge_after_sec") or timeout_sec,
+        "progress_idle_threshold_sec": progress_idle_threshold_sec,
+        "nudge_after_sec": raw.get("nudge_after_sec") or progress_idle_threshold_sec,
         "renotify_interval_sec": raw.get("renotify_interval_sec") or expected_interval,
         "max_nudges": int(raw.get("max_nudges", 3) or 3),
         "escalate_after_nudges": int(raw.get("escalate_after_nudges", 2) or 2),
-        "blocked_escalate_after_sec": raw.get("blocked_escalate_after_sec") or max(timeout_sec, expected_interval),
+        "blocked_escalate_after_sec": raw.get("blocked_escalate_after_sec") or max(progress_idle_threshold_sec, expected_interval),
     }
 
 
@@ -117,7 +121,7 @@ def build_action_payload(task, chosen, now_iso_value):
     channel = task.get("channel")
     derived = task.get("derived", {})
     step = derived.get("current_step") or task.get("current_checkpoint")
-    if chosen["state"] in {"NUDGE_MAIN_AGENT", "OWNER_RECONCILE", "TRUTH_INCONSISTENT"}:
+    if chosen["state"] in {"NUDGE_MAIN_AGENT", "OWNER_RECONCILE", "TRUTH_INCONSISTENT", "EXECUTOR_UNHEALTHY", "FINALIZATION_STALLED"}:
         resume_token = build_resume_token(task, chosen, now_iso_value)
         message = chosen.get("message") or chosen["reason"]
         return {
@@ -136,13 +140,6 @@ def build_action_payload(task, chosen, now_iso_value):
                 "inconsistencies": derived.get("inconsistencies", []),
                 "suspicious_external_jobs": derived.get("suspicious_external_jobs", []),
                 "required_provider_evidence": sorted(PROVIDER_EVIDENCE_KEYS),
-                "branches": {
-                    "A_IN_PROGRESS_FORGOT_LEDGER": "還在做，只是忘了補 ledger；請立刻補真實 checkpoint",
-                    "B_BLOCKED": "已確認卡住；請寫 BLOCKED truth 與具體 unblock need",
-                    "C_COMPLETED": "其實已完成；請補 TASK_COMPLETED truth 與 validation evidence",
-                    "D_NO_REPLY": "目前無法確認；先找外部 evidence，不要猜測 task truth",
-                    "E_FORGOT_OR_NOT_DOING": "承認沒做或忘了做；請立刻 resume 並補做",
-                },
             },
             "resume_token": resume_token,
             "created_at": now_iso_value,
@@ -189,7 +186,7 @@ def apply_supervision_update(task, report, now_iso_value):
     if report["state"] == "NUDGE_MAIN_AGENT":
         monitoring["nudge_count"] = int(monitoring.get("nudge_count", 0) or 0) + 1
         monitoring["last_nudge_at"] = now_iso_value
-    if report["state"] in {"OWNER_RECONCILE", "TRUTH_INCONSISTENT"}:
+    if report["state"] in {"OWNER_RECONCILE", "TRUTH_INCONSISTENT", "EXECUTOR_UNHEALTHY", "FINALIZATION_STALLED"}:
         monitoring["owner_query_at"] = now_iso_value
         monitoring["last_reconcile_at"] = now_iso_value
         monitoring["reconcile_count"] = int(monitoring.get("reconcile_count", 0) or 0) + 1
@@ -198,7 +195,7 @@ def apply_supervision_update(task, report, now_iso_value):
         monitoring["cron_state"] = "DELETE_REQUESTED"
     if report["state"] == "STOP_AND_DELETE":
         monitoring["cron_state"] = "DELETE_REQUESTED"
-    if report["state"] in {"NUDGE_MAIN_AGENT", "OWNER_RECONCILE", "TRUTH_INCONSISTENT"}:
+    if report["state"] in {"NUDGE_MAIN_AGENT", "OWNER_RECONCILE", "TRUTH_INCONSISTENT", "EXECUTOR_UNHEALTHY", "FINALIZATION_STALLED"}:
         payload = report.get("action_payload") or {}
         token = payload.get("resume_token")
         if token:
@@ -260,20 +257,35 @@ def evaluate_task(task, now):
     cfg = monitoring_config(task)
     status = task.get("status")
     current_step = derived.get("current_step") or task.get("current_checkpoint") or "unknown"
-    last_progress_age = age_seconds(now, first_non_null(task.get("last_checkpoint_at"), derived.get("last_observed_progress_at"), hb.get("last_progress_at")))
+    last_progress_age = age_seconds(now, first_non_null(derived.get("last_progress_signal_at"), derived.get("last_observed_progress_at"), hb.get("last_progress_at"), task.get("last_checkpoint_at")))
     last_heartbeat_age = age_seconds(now, hb.get("last_heartbeat_at"))
     last_nudge_age = age_seconds(now, monitoring.get("last_nudge_at"))
     should_renotify = last_nudge_age is None or last_nudge_age >= cfg["renotify_interval_sec"]
     nudge_count = int(monitoring.get("nudge_count", 0) or 0)
+    executor_health = monitoring.get("executor_health", {}) or {}
+    consecutive_executor_errors = int(executor_health.get("consecutive_errors", 0) or 0)
+    executor_last_success_age = age_seconds(now, executor_health.get("last_success_at"))
+    delivery_stalled = bool(task.get("artifacts")) and current_step and str(current_step).startswith("step-") and status == "RUNNING" and consecutive_executor_errors > 0
     candidates = []
 
+    if consecutive_executor_errors >= 3:
+        candidates.append({
+            "state": "EXECUTOR_UNHEALTHY",
+            "reason": f"executor health degraded: consecutive_errors={consecutive_executor_errors}, last_success_age_sec={executor_last_success_age}",
+            "action": "request_owner_executor_reconcile",
+            "message": "Executor is unhealthy / timing out repeatedly. Stop treating this as benign external wait; reconcile executor/runtime health first.",
+        })
+
+    if delivery_stalled and executor_last_success_age is not None and executor_last_success_age >= cfg["renotify_interval_sec"]:
+        candidates.append({
+            "state": "FINALIZATION_STALLED",
+            "reason": f"artifacts exist but task still not converged; current_step={current_step}",
+            "action": "request_owner_finalization_reconcile",
+            "message": "Useful artifacts already exist but LTC did not converge. Reconcile the remaining delivery/finalization step immediately.",
+        })
 
     if status == "BLOCKED" and monitoring.get("last_escalated_at"):
         candidates.append({"state": "STOP_AND_DELETE", "reason": "blocked escalation already delivered", "action": "delete_monitor_cron"})
-
-    user_facing = derived.get("user_facing") or {}
-    outcome_status = user_facing.get("outcome_status")
-    outcome_artifacts = user_facing.get("artifacts") or []
 
     if derived.get("truth_state") == "INCONSISTENT":
         candidates.append({
@@ -283,14 +295,6 @@ def evaluate_task(task, now):
             "message": "Observed truth is inconsistent. First observe the real world and backfill truth; do not guess pending/OK from partial data.",
         })
 
-    if outcome_status == "PARTIAL_SUCCESS":
-        candidates.append({
-            "state": "OWNER_RECONCILE",
-            "reason": "outputs already exist, so reconcile to a user-facing partial-success/success result before surfacing control-plane interruption noise",
-            "action": "request_result_reconcile",
-            "message": "Useful outputs already exist. Reconcile the task from the user/result point of view first: report partial success or success with the produced artifacts, then mention any interruption/cleanup issue honestly.",
-        })
-
     if status in TERMINAL_STATUSES:
         inconsistencies = derived.get("inconsistencies", [])
         # "completed_but_steps_not_done" is an informational marker (steps were skipped),
@@ -298,8 +302,10 @@ def evaluate_task(task, now):
         # tasks with only this inconsistency as clean terminal → STOP_AND_DELETE.
         non_step_inconsistencies = [i for i in inconsistencies if i != "task:completed_but_steps_not_done" and not i.startswith("task:completed")]
         if non_step_inconsistencies or derived.get("truth_state") == "INCONSISTENT":
+            # Real inconsistencies (or unresolved truth) must be reconciled before DELETE
             candidates.append({"state": "TRUTH_INCONSISTENT", "reason": f"task status is terminal ({status}) but has unresolved inconsistencies", "action": "request_owner_reconcile_then_delete"})
         else:
+            # Clean terminal: all observed truth is consistent → stop monitor
             candidates.append({"state": "STOP_AND_DELETE", "reason": f"task status is terminal ({status})", "action": "delete_monitor_cron"})
 
     if derived.get("suspicious_external_jobs"):
@@ -330,14 +336,14 @@ def evaluate_task(task, now):
         candidates.append({"state": "OK", "reason": "observed external truth shows legitimate pending external work", "action": "noop_external_wait"})
 
     expected_interval = hb.get("expected_interval_sec", 300)
-    timeout_sec = hb.get("timeout_sec", 1800)
-    if status == "RUNNING" and last_progress_age is not None and last_progress_age > timeout_sec and not derived.get("pending_external") and derived.get("truth_state") == "CONSISTENT":
+    progress_idle_threshold_sec = cfg["progress_idle_threshold_sec"]
+    if status == "RUNNING" and last_progress_age is not None and last_progress_age > progress_idle_threshold_sec and not derived.get("pending_external") and derived.get("truth_state") == "CONSISTENT":
         if nudge_count >= cfg["escalate_after_nudges"] and should_renotify:
-            candidates.append({"state": "OWNER_RECONCILE", "reason": f"no observed progress truth for {last_progress_age}s after prior nudges", "action": "query_owner_for_truth"})
+            candidates.append({"state": "OWNER_RECONCILE", "reason": f"no material progress delta for {last_progress_age}s after prior nudges", "action": "query_owner_for_truth"})
         elif should_renotify:
-            candidates.append({"state": "NUDGE_MAIN_AGENT", "reason": f"no observed progress truth for {last_progress_age}s; owner must resume and backfill truth", "action": "send_execution_nudge"})
+            candidates.append({"state": "NUDGE_MAIN_AGENT", "reason": f"no material progress delta for {last_progress_age}s; owner must resume and backfill truth", "action": "send_execution_nudge"})
         else:
-            candidates.append({"state": "STALE_PROGRESS", "reason": f"progress truth stale for {last_progress_age}s; waiting for renotify interval", "action": "wait_for_renotify"})
+            candidates.append({"state": "STALE_PROGRESS", "reason": f"material progress idle for {last_progress_age}s; waiting for renotify interval", "action": "wait_for_renotify"})
     elif status == "RUNNING" and last_heartbeat_age is not None and last_heartbeat_age > expected_interval and not derived.get("pending_external") and derived.get("truth_state") == "CONSISTENT":
         candidates.append({"state": "HEARTBEAT_DUE", "reason": f"heartbeat overdue for {last_heartbeat_age}s", "action": "send_light_reminder"})
 
@@ -359,12 +365,12 @@ def evaluate_task(task, now):
         "next_action": task.get("next_action"),
         "current_step": current_step,
         "pending_external": derived.get("pending_external"),
+        "last_progress_signal_at": derived.get("last_progress_signal_at"),
+        "progress_signals": derived.get("progress_signals", []),
         "truth_state": derived.get("truth_state"),
         "inconsistencies": derived.get("inconsistencies", []),
         "suspicious_external_jobs": derived.get("suspicious_external_jobs", []),
         "retry_count": monitoring.get("retry_count", {}),
-        "user_facing": user_facing,
-        "outcome_artifact_count": len(outcome_artifacts),
     }
 
 

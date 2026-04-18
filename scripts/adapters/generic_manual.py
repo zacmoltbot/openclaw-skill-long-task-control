@@ -328,8 +328,35 @@ class GenericManualAdapter:
         ], check=False, text=True, capture_output=True, timeout=60)
         if proc.returncode != 0:
             return {"ok": False, "error": (proc.stderr or proc.stdout).strip(), "returncode": proc.returncode}
-        result = json.loads(proc.stdout)
-        return {"ok": True, "message_ref": result.get("messageId") or result.get("id"), "result": result}
+        # Strip leading plugin-noise / progress lines and find the last line that
+        # parses as valid JSON.  This handles:
+        #   - "[plugins] ..." noise lines at the start of stdout
+        #   - partial / truncated output mid-stream (treat as failure, not exception)
+        #   - truly empty stdout (no valid JSON found)
+        stdout = proc.stdout or ""
+        stdout_lines = [line.strip() for line in stdout.splitlines() if line.strip()]
+        result_json: dict[str, Any] | None = None
+        parse_error: str | None = None
+        for line in reversed(stdout_lines):
+            try:
+                result_json = json.loads(line)
+                break
+            except (json.JSONDecodeError, ValueError):
+                pass
+            else:
+                # Line was parsed but raised something other than JSON decode error
+                parse_error = f"non-JSON output: {line[:100]}"
+                break
+        if result_json is None:
+            # No JSON found anywhere in stdout — treat as a structured delivery failure
+            preview = stdout[:500] if stdout else "(empty)"
+            return {
+                "ok": False,
+                "error": parse_error or "delivery result parse failed: no valid JSON in output",
+                "raw_output_preview": preview,
+                "returncode": proc.returncode,
+            }
+        return {"ok": True, "message_ref": result_json.get("messageId") or result_json.get("id"), "result": result_json}
 
     def _deliver_artifacts(self, item: dict[str, Any], state: dict[str, Any]) -> AdapterResult:
         ledger_path, ledger_payload, task = self._bridge_task_context(state)
@@ -518,6 +545,11 @@ class GenericManualAdapter:
             )
 
         auto_action = self._auto_action_for(item)
+        # NOTE: deliver_artifacts must be checked BEFORE the generic AUTO_REPAIR_MODE
+        # fallback — otherwise mode=AUTO_REPAIR_MODE with auto_action=deliver_artifacts
+        # hits the early-return and never calls _deliver_artifacts.
+        if auto_action == self.DELIVER_ARTIFACTS_ACTION:
+            return self._deliver_artifacts(item, state)
         if mode == self.AUTO_REPAIR_MODE or auto_action == self.REQUESTER_CHANNEL_REPAIR_ACTION:
             return AdapterResult(
                 status="completed",
@@ -530,8 +562,6 @@ class GenericManualAdapter:
                 },
                 next_action=item.get("next_action"),
             )
-        if auto_action == self.DELIVER_ARTIFACTS_ACTION:
-            return self._deliver_artifacts(item, state)
 
         shell_cmd = item.get("shell")
         if shell_cmd:
@@ -595,6 +625,23 @@ class GenericManualAdapter:
                         "artifacts_found": artifacts,
                     },
                     next_action="Verify the command output path or add the right completion evidence before marking the step complete",
+                )
+            # Defensive gate: if expect_artifacts was declared but none exist on disk,
+            # block even if the shell exited 0 — prevents silent artifact-loss where the
+            # job is marked DONE but no file was ever written (e.g. RunningHub task
+            # succeeded at HTTP level but produced no output, or output was cleaned up).
+            expected = self._expected_artifacts(item)
+            if expected and not artifacts:
+                return AdapterResult(
+                    status="blocked",
+                    summary=f"shell step exited 0 but produced zero artifacts: {self._title_for(item)}",
+                    blocked_reason="ZERO_ARTIFACTS_DESPITE_SUCCESS",
+                    facts={
+                        "shell": str(shell_cmd),
+                        "expected_artifacts": expected,
+                        "artifacts_found": artifacts,
+                    },
+                    next_action="Verify the command actually wrote the expected output file; check for early exit or silent failure in the wrapper script",
                 )
             return AdapterResult(
                 status="completed",

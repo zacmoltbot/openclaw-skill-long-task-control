@@ -423,7 +423,24 @@ def cmd_run_next(args):
         handle_failed_item(state=state, item=item, item_index=item_index, store=store, bridge=bridge, failure=failure, summary=submit_result.summary)
         return
 
-    finalize_result = adapter.finalize(prepared, {**adapter_context, "submit": submit_result.facts})
+    try:
+        finalize_result = adapter.finalize(prepared, {**adapter_context, "submit": submit_result.facts})
+    except Exception as exc:
+        # Any adapter exception during finalize must NOT leave the step in phantom RUNNING.
+        # Route through handle_failed_item so retry/budget logic is applied properly.
+        failure = FailureRecord(
+            code="FINALIZE_EXCEPTION",
+            summary=f"finalize raised unhandled exception: {exc}",
+            retryable=True,
+            facts={
+                "exception_type": type(exc).__name__,
+                "exception_msg": str(exc),
+                "phase": "finalize",
+            },
+        )
+        handle_failed_item(state=state, item=item, item_index=item_index, store=store, bridge=bridge, failure=failure, summary=failure.summary)
+        return
+
     if finalize_result.status in {"blocked", "BLOCKED"}:
         failure = FailureRecord(code="BLOCKED_FINALIZE", summary=finalize_result.summary, retryable=False, facts=finalize_result.facts or {})
         item.failures.append(failure)

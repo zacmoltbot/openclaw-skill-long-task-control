@@ -44,12 +44,16 @@ with tempfile.TemporaryDirectory() as td:
 
     task_after_completion = task_from(ledger, task_id)
     assert task_after_completion['status'] == 'COMPLETED', task_after_completion
-    assert task_after_completion['heartbeat']['watchdog_state'] == 'STOP_AND_DELETE', task_after_completion['heartbeat']
-    assert task_after_completion['monitoring']['last_action_state'] == 'STOP_AND_DELETE', task_after_completion['monitoring']
 
+    # preview-tick runs the monitor with --apply-supervision, updating watchdog_state
     preview = run_json('python3', str(OPS), '--ledger', str(ledger), 'preview-tick', task_id)
     assert preview['state'] == 'STOP_AND_DELETE', preview
     assert preview['remove_monitor'] is True, preview
+
+    # Re-read task after monitor has run (preview-tick updates ledger)
+    task_after_monitor = task_from(ledger, task_id)
+    assert task_after_monitor['heartbeat']['watchdog_state'] == 'STOP_AND_DELETE', task_after_monitor['heartbeat']
+    assert task_after_monitor['monitoring']['last_action_state'] == 'STOP_AND_DELETE', task_after_monitor['monitoring']
 
     tick = run_json('python3', str(CRON), '--ledger', str(ledger), '--cron-dir', str(cron_dir), 'run-once', '--task-id', task_id)
     task = task_from(ledger, task_id)

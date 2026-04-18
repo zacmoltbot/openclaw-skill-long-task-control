@@ -314,8 +314,9 @@ def cron_prompt(ledger_path: Path, task_id: str, requester_channel: str, session
     return f"""你是 OpenClaw 的 long-task-control monitor agent（check interval: 5分鐘）。你的唯一職責：讀取 task ledger，對 task `{task_id}` 執行一次低成本 monitor tick，必要時主動提醒 main agent 繼續做，並在 terminal 狀態或 BLOCKED_ESCALATE 時立即移除自己的 cron job。
 
 ⚠️ Smart stale detection 規則（重要）：
-- 若 `progress_at` 仍在更新中（is_progress_updating=true）或外部 task 回傳正在 pending（RunningHub API queue/pending/running），不要判定 STALE_PROGRESS 或 HEARTBEAT_DUE。
-- 只有「沒有 progress」且「沒有 pending external return」時才 nudge。
+- monitor 看的是 material progress delta，不是任務跑多久。
+- 若 progress signal 仍在更新（step/checkpoint、artifact/download、provider/external status、executor health success）或外部 task 回傳正在 pending（RunningHub API queue/pending/running），不要判定 STALE_PROGRESS 或 HEARTBEAT_DUE。
+- 只有「長時間沒有新的 progress delta」且「沒有 pending external return」時才 nudge。
 
 ⚠️ 被動 Delivery Push（重要）：
 每次 tick 必須主動檢查 ledger 中 `reporting.pending_updates[]` 是否有 `delivered=false` 的項目。若有，馬上用 `message.send` 推到 Discord channel `{requester_channel}`，不需要等 main agent 主動來問。成功發送後，更新 ledger (`delivered=true`)。
@@ -509,54 +510,31 @@ def executor_session_key(task_id: str) -> str:
     return f"{EXECUTOR_SESSION_KEY_PREFIX}{task_id}"
 
 
-def executor_prompt(ledger_path: Path, task_id: str):
-    """
-    Generate the executor agent prompt.
+def execution_job_id_for(task: dict[str, Any], task_id: str) -> str:
+    monitoring = task.get("monitoring", {}) if isinstance(task, dict) else {}
+    return str(monitoring.get("execution_job_id") or f"{task_id}-job")
 
-    The executor is an OpenClaw subagent that:
-    1. Reads the task ledger to find the current step
-    2. Executes the next pending workflow step
-    3. Writes STEP_PROGRESS / STEP_COMPLETED truth to the ledger
-    4. Repeats until the workflow is done
-    5. Writes TASK_COMPLETED when finished
 
-    The executor is auto-resuming: it reads the ledger's current_checkpoint
-    and starts from the next pending step. If step-01 is DONE and step-02 is
-    RUNNING, it starts step-02 immediately.
-    """
-    return f"""你是 long-task-control 的 executor agent。你的職責：讀取 task ledger，執行下一個待做的步驟，寫入 checkpoint，重複直到 workflow 完成。
+def executor_prompt(ledger_path: Path, task_id: str, *, jobs_root: Path, job_id: str):
+    preview_cmd = f"python3 {ROOT / 'scripts' / 'openclaw_ops.py'} --ledger {ledger_path} executor-preview {task_id} --jobs-root {jobs_root} --job-id {job_id}"
+    run_cmd = f"python3 {ROOT / 'scripts' / 'executor_engine.py'} --jobs-root {jobs_root} run-next {job_id} --execution-owner executor:{task_id}"
+    status_cmd = f"python3 {ROOT / 'scripts' / 'runner_engine.py'} --jobs-root {jobs_root} status {job_id}"
+    return f"""你是 long-task-control 的 executor agent。不要自行查 --help，不要猜 CLI；直接使用下面這份 canonical contract。
 
-⚠️ 核心原則：
-- 你只執行「下一個可做的步驟」，不是整個 task
-- 每個步驟完成後，馬上寫 checkpoint 再繼續
-- Auto-resume：讀 ledger 的 current_checkpoint，如果 step-01 DONE、step-02 RUNNING，就從 step-02 繼續
-- 任一步驟失敗 → 寫 BLOCKED checkpoint，附上 blocker reason 和 need，馬上停下來等外部修復
+固定參數：
+- ledger={ledger_path}
+- jobs_root={jobs_root}
+- job_id={job_id}
+- task_id={task_id}
 
-執行循環：
-1. exec: python3 {ROOT / 'scripts' / 'executor_engine.py'} --ledger {ledger_path} preview {task_id}
-2. 解析 JSON，看 action 欄位：
-   - "execute_step" → 執行它（見下）
-   - "workflow_complete" → 寫 TASK_COMPLETED truth，輸出 "EXECUTOR_DONE"，结束
-   - "already_completed" / "terminal_state" → 輸出 "EXECUTOR_DONE"，结束
-   - "blocked" → 輸出 "EXECUTOR_BLOCKED"，结束
-3. 執行步驟（"execute_step"）：
-   a. 決定這步要做什麼（從 ledger 的 workflow[] / next_action / goal 推斷）
-   b. 實際執行（shell command / API call / file operation 等）
-   c. 成功後，exec: python3 {ROOT / 'scripts' / 'task_ledger.py'} --ledger {ledger_path} checkpoint {task_id} --event-type STEP_COMPLETED --summary "<描述這步完成了什麼>" --current-checkpoint <step-id> --next-action "<下一步做什麼>"
-   d. 用 --fact 附上關鍵 output evidence（file path、job id、output URL 等）
-   e. 如果有 artifact，用 --artifact 標記
-4. 回到步驟 1（ledger 更新過，current_checkpoint 已前進）
-
-重要：
-- 每次只做一個 step，不要一口氣做很多
-- 每個 step 完成後馬上寫 checkpoint，這樣萬一中斷，下一次啟動會從斷點繼續
-- 如果 external job（RunningHub 等）需要等待，用 external-job command 寫 pending 狀態，不要 block 在那裡等
-- 完成整個 workflow → 寫 TASK_COMPLETED truth，狀態 block 要包含所有 completed steps 和 output artifacts
-- 輸出 "EXECUTOR_DONE" 表示整個 task 完成
-- 如果 task 被 BLOCK → 馬上停止，輸出 "EXECUTOR_BLOCKED"
-
-輸出格式（每輪）：
-  {{"executed": "<step-id>", "summary": "<做了什麼>", "next": "<下一步或 EXECUTOR_DONE/EXECUTOR_BLOCKED>"}}
+每次喚醒只做這個 deterministic loop：
+1. 先 exec：{preview_cmd}
+2. 讀 JSON：
+   - action=execute_item → 立刻 exec：{run_cmd}
+   - action=workflow_complete 且 job_status=COMPLETED → 輸出 EXECUTOR_DONE
+   - action=blocked 或 job_status in [BLOCKED, FAILED] → 先 exec：{status_cmd}，再輸出 EXECUTOR_BLOCKED
+3. 除了上面三條路徑，不要做額外探索；不要讀 startup files、不要查 executor_engine --help、不要重建 task_id/job_id mapping。
+4. 最後只輸出一小段 JSON summary，格式：{{"task_id":"{task_id}","job_id":"{job_id}","preview":"<action>","result":"EXECUTOR_DONE|EXECUTOR_BLOCKED|RUN_NEXT"}}
 """
 
 
@@ -565,9 +543,9 @@ def cmd_executor_preview(args):
     result = run(
         "python3",
         str(ROOT / "scripts" / "executor_engine.py"),
-        "--ledger", str(args.ledger),
+        "--jobs-root", str(args.jobs_root),
         "preview",
-        args.task_id,
+        args.job_id or f"{args.task_id}-job",
         check=True,
     )
     print(result.stdout.strip())
@@ -591,11 +569,12 @@ def parse_workflow_step_contract(step: dict[str, Any]) -> dict[str, Any]:
             item.setdefault("expect_artifacts", []).append(value)
         elif key in {"artifacts", "outputs", "expect", "expect_artifacts"}:
             item.setdefault("expect_artifacts", []).extend([v.strip() for v in value.split("|") if v.strip()])
-        elif key in {"timeout", "timeout_sec"}:
+        elif key in {"timeout", "timeout_sec", "retry_budget", "max_retries"}:
+            field = "retry_budget" if key == "max_retries" else key
             try:
-                item["timeout_sec"] = int(value)
+                item[field] = int(value)
             except ValueError:
-                item["timeout_sec"] = value
+                item[field] = value
         else:
             item[key] = value
     return item
@@ -665,6 +644,9 @@ def cmd_init_execution_job(args):
     job_id = args.job_id or f"{args.task_id}-job"
     jobs_root = Path(args.jobs_root)
     spec = build_generic_job_spec(task, job_id=job_id, adapter=args.adapter)
+    task.setdefault("monitoring", {})["execution_job_id"] = job_id
+    task.setdefault("monitoring", {})["execution_jobs_root"] = str(jobs_root)
+    save_ledger(args.ledger, ledger)
     spec_path = jobs_root / job_id / "job-spec.json"
     spec_path.parent.mkdir(parents=True, exist_ok=True)
     spec_path.write_text(json.dumps(spec, ensure_ascii=False, indent=2) + "\n")
@@ -700,7 +682,7 @@ def cmd_run_executor(args):
     task_id = args.task_id
     name = f"long-task executor {task_id} @ {datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
     session_key = executor_session_key(task_id)
-    prompt = executor_prompt(args.ledger, task_id)
+    prompt = executor_prompt(args.ledger, task_id, jobs_root=args.jobs_root, job_id=execution_job_id_for(task, task_id))
 
     # The executor runs as a cron job with a long timeout that wakes every 5 minutes.
     # Each tick: read ledger → execute next step → write checkpoint → exit.
@@ -718,6 +700,7 @@ def cmd_run_executor(args):
         "--message", prompt,
         "--timeout-seconds", str(args.timeout_seconds),
         "--thinking", args.thinking,
+        "--no-deliver",
     ]
     if args.model:
         add_cmd.extend(["--model", args.model])
@@ -745,6 +728,8 @@ def cmd_run_executor(args):
     monitoring["executor_session_key"] = session_key
     monitoring["executor_state"] = "ACTIVE"
     monitoring["executor_installed_at"] = now_iso()
+    monitoring["execution_job_id"] = execution_job_id_for(task, task_id)
+    monitoring["execution_jobs_root"] = str(args.jobs_root)
     save_ledger(args.ledger, ledger)
 
     print(json.dumps({
@@ -1352,30 +1337,79 @@ def cmd_flush_pending_updates(args):
     }, ensure_ascii=False, indent=2))
 
 
+def _load_executor_progress_tail(task: dict[str, Any], *, limit: int = 8) -> list[dict[str, Any]]:
+    monitoring = task.get("monitoring", {}) if isinstance(task, dict) else {}
+    jobs_root = monitoring.get("execution_jobs_root")
+    job_id = monitoring.get("execution_job_id")
+    if not jobs_root or not job_id:
+        return []
+    progress_path = Path(str(jobs_root)).expanduser() / str(job_id) / "progress.jsonl"
+    if not progress_path.exists():
+        return []
+    rows = []
+    for line in progress_path.read_text().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rows.append(json.loads(line))
+        except json.JSONDecodeError:
+            rows.append({"raw": line})
+    return rows[-limit:]
+
+
 def cmd_preview_tick(args):
     run_json = json.loads(run("python3", str(MONITOR_NUDGE), "--ledger", str(args.ledger), "--apply-supervision").stdout)
     ledger = load_ledger(args.ledger)
     task = find_task(ledger, args.task_id)
     report = next(item for item in run_json["reports"] if item["task_id"] == args.task_id)
-    notify = report["state"] in {"NUDGE_MAIN_AGENT", "OWNER_RECONCILE", "TRUTH_INCONSISTENT", "BLOCKED_ESCALATE"}
+    monitoring = task.setdefault("monitoring", {})
+    user_facing = report.get("user_facing") or task.get("derived", {}).get("user_facing") or {}
+    all_artifacts_ready = bool(user_facing.get("artifacts")) and not user_facing.get("remaining_steps")
+    executor_error_count = int(monitoring.get("executor_consecutive_errors", 0) or 0)
+    executor_timeout_count = int(monitoring.get("executor_consecutive_timeouts", 0) or 0)
+    executor_unhealthy = executor_error_count >= 2 or executor_timeout_count >= 2 or str(monitoring.get("executor_state") or "").upper() in {"ERROR", "TIMEOUT", "UNHEALTHY"}
+    finalization_stalled = all_artifacts_ready and str(report["state"]) == "OK" and str(report.get("current_step") or "").startswith("step-") and monitoring.get("execution_job_id")
+    effective_state = report["state"]
+    effective_reason = report["reason"]
+    if executor_unhealthy:
+        effective_state = "EXECUTOR_UNHEALTHY"
+        effective_reason = f"executor unhealthy: errors={executor_error_count}, timeouts={executor_timeout_count}, state={monitoring.get('executor_state')}"
+    elif finalization_stalled:
+        effective_state = "FINALIZATION_STALLED"
+        effective_reason = "all required artifacts already exist but final delivery/convergence is still pending"
+    notify = effective_state in {"NUDGE_MAIN_AGENT", "OWNER_RECONCILE", "TRUTH_INCONSISTENT", "BLOCKED_ESCALATE", "EXECUTOR_UNHEALTHY", "FINALIZATION_STALLED"}
     reporting = ensure_reporting(task)
     pending = reporting.get("pending_updates", [])
     deliverable = [u for u in pending if not u.get("delivered")]
     print(json.dumps({
         "task_id": args.task_id,
-        "state": report["state"],
-        "reason": report["reason"],
+        "state": effective_state,
+        "reason": effective_reason,
         "notify": notify,
-        "notification": format_notification(task, report),
-        "remove_monitor": report["state"] in {"BLOCKED_ESCALATE", "STOP_AND_DELETE"},
+        "notification": format_notification(task, {**report, "state": effective_state, "reason": effective_reason}),
+        "remove_monitor": effective_state in {"BLOCKED_ESCALATE", "STOP_AND_DELETE"},
         "current_step": report.get("current_step"),
         "retry_count": report.get("retry_count", {}),
         "pending_user_updates": pending,
         "pending_user_updates_deliverable": [u["update_id"] for u in deliverable],
         "pending_user_updates_deliverable_count": len(deliverable),
         "truth_state": report.get("truth_state"),
+        "last_progress_signal_at": report.get("last_progress_signal_at"),
+        "progress_signals": report.get("progress_signals", []),
         "inconsistencies": report.get("inconsistencies", []),
-        "user_facing": report.get("user_facing") or task.get("derived", {}).get("user_facing"),
+        "user_facing": user_facing,
+        "executor_health": {
+            "state": monitoring.get("executor_state"),
+            "consecutive_errors": executor_error_count,
+            "consecutive_timeouts": executor_timeout_count,
+            "health": monitoring.get("executor_health", {}),
+        },
+        "executor_observability": {
+            "last_event": monitoring.get("executor_last_event"),
+            "history": monitoring.get("executor_history", []),
+            "progress_tail": _load_executor_progress_tail(task),
+        },
     }, ensure_ascii=False, indent=2))
 
 
@@ -1631,6 +1665,8 @@ def build_parser():
     # Executor commands
     executor_preview_p = sp.add_parser("executor-preview")
     executor_preview_p.add_argument("task_id")
+    executor_preview_p.add_argument("--jobs-root", type=Path, default=ROOT / "state" / "jobs")
+    executor_preview_p.add_argument("--job-id")
     executor_preview_p.set_defaults(func=cmd_executor_preview)
 
     run_executor_p = sp.add_parser("run-executor")
@@ -1644,6 +1680,7 @@ def build_parser():
     run_executor_p.add_argument("--model")
     run_executor_p.add_argument("--light-context", action="store_true")
     run_executor_p.add_argument("--dry-run", action="store_true")
+    run_executor_p.add_argument("--jobs-root", type=Path, default=ROOT / "state" / "jobs")
     run_executor_p.set_defaults(func=cmd_run_executor)
 
     return p
