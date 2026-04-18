@@ -155,6 +155,11 @@ python3 scripts/openclaw_ops.py --ledger state/long-task-ledger.json bootstrap-t
 - false `SUCCESS` / `COMPLETED` when failed items still existed
 - terminal jobs getting stuck in fake `RUNNING` / `HEARTBEAT_DUE`
 - partial-failure reconcile not mapping cleanly into blocker truth
+- ISSUE-09/ISSUE-10: `normalize_resumable_item()` did not emit `ITEM_BLOCKED` progress + `bridge.sync_item_blocked()` when a RUNNING item exhausted retry budget — monitor fell through to `HEARTBEAT_DUE` instead of `BLOCKED_ESCALATE`
+- delivery subprocess non-JSON stdout (plugin noise / mixed output) caused `JSONDecodeError` → phantom `RUNNING` step — now handled gracefully with structured `{"ok": false}` return
+- shell step exits 0 but declared `expect_artifacts` were never written → `ZERO_ARTIFACTS_DESPITE_SUCCESS` blocked status (zero-artifacts despite success gate)
+- `adapter.finalize()` unhandled exceptions were not caught by executor engine, leaving step in phantom state — now wrapped in `try/except` routing through `handle_failed_item`
+- `deliver_artifacts` action checked after `AUTO_REPAIR_MODE` fallback, causing delivery to be skipped when both flags were set — now checked first
 
 ### Still true conceptually
 
@@ -170,6 +175,10 @@ python3 scripts/monitor_delivery_regression_e2e.py
 python3 scripts/artifact_delivery_e2e.py
 python3 scripts/completion_semantics_regression_e2e.py
 python3 scripts/terminal_closeout_regression_e2e.py
+python3 scripts/delivery_parse_fail_regression_e2e.py
+python3 scripts/issue09_10_terminal_blocked_convergence_regression_e2e.py
+python3 scripts/execution_control_regression_e2e.py
+python3 scripts/p0_hardening_regression_e2e.py
 ```
 
 These cover:
@@ -178,6 +187,10 @@ These cover:
 - explicit artifact delivery
 - no fake success on failed steps
 - terminal auto-closeout into `BLOCKED / PARTIAL_SUCCESS`
+- delivery parse fail-open (non-JSON stdout, plugin noise robustness)
+- terminal blocked convergence (ISSUE-09/ISSUE-10: BLOCKED_ESCALATE path, no pseudo-running)
+- execution control and retry budget handling
+- P0 hardening scenarios
 
 ## References
 
