@@ -160,9 +160,10 @@ def test_adapter_finalize_returns_structured_failure():
     assert not isinstance(result, Exception), \
         f"finalize() must not raise; got {type(result).__name__}: {result}"
 
-    # Must be a structured failed result (not blocked, which would mean missing files)
-    assert result.status == "failed", \
-        f"expected status='failed' (JSON parse error), got status='{result.status}': {result.summary}"
+    # BLOCKED (retriable) is the correct status for parse/network delivery failures.
+    # FAILED is for permanent errors (invalid target, missing files).
+    assert result.status == "blocked", \
+        f"expected status='blocked' (retriable delivery failure), got status='{result.status}': {result.summary}"
 
     # The facts must contain the parse error details
     assert "error" in result.facts or any("parse" in str(v).lower() for v in result.facts.values()), \
@@ -225,7 +226,7 @@ def test_adapter_finalize_failure_includes_parse_details():
     with unittest.mock.patch.object(subprocess, "run", return_value=FakeCompletedProc()):
         result = adapter.finalize(fake_item, fake_state)
 
-    assert result.status == "failed", f"expected failed (JSON parse), got {result.status}: {result.summary}"
+    assert result.status == "blocked", f"expected blocked (retriable), got {result.status}: {result.summary}"
     facts_str = json.dumps(result.facts)
     assert "parse" in facts_str.lower() or "json" in facts_str.lower(), \
         f"facts should mention parse/json error; got: {result.facts}"

@@ -315,48 +315,31 @@ class GenericManualAdapter:
                 existing = json.loads(sink.read_text())
             existing.append(payload)
             sink.write_text(json.dumps(existing, ensure_ascii=False, indent=2) + "\n")
-            return {"ok": True, "message_ref": f"sink:{Path(media_path).name}", "payload": payload}
+            return {"ok": True, "message_ref": f"sink:{Path(media_path).name if media_path else 'msg'}", "payload": payload}
 
-        proc = subprocess.run([
+        cmd = [
             "openclaw", "message", "send",
             "--channel", channel,
             "--target", target,
-            "--media", media_path,
             "--message", message,
             "--silent",
             "--json",
-        ], check=False, text=True, capture_output=True, timeout=60)
-        if proc.returncode != 0:
-            return {"ok": False, "error": (proc.stderr or proc.stdout).strip(), "returncode": proc.returncode}
-        # Strip leading plugin-noise / progress lines and find the last line that
-        # parses as valid JSON.  This handles:
-        #   - "[plugins] ..." noise lines at the start of stdout
-        #   - partial / truncated output mid-stream (treat as failure, not exception)
-        #   - truly empty stdout (no valid JSON found)
-        stdout = proc.stdout or ""
-        stdout_lines = [line.strip() for line in stdout.splitlines() if line.strip()]
-        result_json: dict[str, Any] | None = None
-        parse_error: str | None = None
-        for line in reversed(stdout_lines):
-            try:
-                result_json = json.loads(line)
-                break
-            except (json.JSONDecodeError, ValueError):
-                pass
-            else:
-                # Line was parsed but raised something other than JSON decode error
-                parse_error = f"non-JSON output: {line[:100]}"
-                break
-        if result_json is None:
-            # No JSON found anywhere in stdout — treat as a structured delivery failure
-            preview = stdout[:500] if stdout else "(empty)"
-            return {
-                "ok": False,
-                "error": parse_error or "delivery result parse failed: no valid JSON in output",
-                "raw_output_preview": preview,
-                "returncode": proc.returncode,
-            }
-        return {"ok": True, "message_ref": result_json.get("messageId") or result_json.get("id"), "result": result_json}
+        ]
+        if media_path:
+            cmd.extend(["--media", media_path])
+
+        proc = subprocess.run(cmd, check=False, text=True, capture_output=True, timeout=60)
+
+        # Use shared fail-closed parser that handles:
+        #   - plugin noise prefix on stdout (parses from end seeking valid JSON)
+        #   - nonzero exit with structured stderr (Discord error format)
+        #   - empty stdout → fail (not silent success)
+        #   - missing messageId/id → message_ref=None but still ok=True
+        from openclaw_ops import parse_delivery_result
+        parsed = parse_delivery_result(proc)
+        if not parsed.get("ok"):
+            return {"ok": False, "error": parsed.get("error"), "returncode": proc.returncode, "raw_output_preview": parsed.get("raw_output_preview", "")}
+        return {"ok": True, "message_ref": parsed.get("message_ref"), "result": parsed.get("result")}
 
     def _deliver_artifacts(self, item: dict[str, Any], state: dict[str, Any]) -> AdapterResult:
         ledger_path, ledger_payload, task = self._bridge_task_context(state)
@@ -387,40 +370,115 @@ class GenericManualAdapter:
                 next_action="Generate or resolve artifacts before delivery",
             )
 
+        # ── Resume support: load previously-confirmed deliveries ──────────────
+        # delivery_progress is written to item_state.facts after each successful
+        # per-artifact send and cleaned up when the item completes.
+        # On retry we resume from the next unconfirmed artifact — no duplicates.
+        adapter_context = state.get("adapter_context", {})
+        item_state = adapter_context.get("item_state")
+        progress_raw = (item_state.facts or {}).get("delivery_progress") if item_state else None
+        delivery_progress: dict[str, str] = {}
+        if progress_raw:
+            try:
+                delivery_progress = json.loads(progress_raw) if isinstance(progress_raw, str) else dict(progress_raw)
+            except (json.JSONDecodeError, TypeError):
+                delivery_progress = {}
+
+        # Resume logic: skip confirmed artifacts, but track which were already attempted.
+        # delivery_progress key = artifact path, value = message_ref (or "pending" if attempted but failed)
+        # On retry: skip confirmed (real ref), retry "pending", skip non-existent (never attempted).
         delivered = []
+        delivery_start_idx = 0
+        for idx, media_path in enumerate(paths):
+            media_str = str(Path(media_path).expanduser())
+            prev_ref = delivery_progress.get(media_str, "")
+            if prev_ref and prev_ref != "pending":
+                # Already confirmed delivered — skip and record it
+                delivered.append({
+                    "media": media_str,
+                    "message_ref": prev_ref,
+                })
+                delivery_start_idx = idx + 1
+                continue
+            if prev_ref == "pending":
+                # Previously attempted but failed — retry it (do NOT break here)
+                delivery_start_idx = idx + 1
+                continue
+            # Not in progress at all — this is the first untried artifact; start delivery from here
+            delivery_start_idx = idx + 1
+            break
+
+        # Caption is item-level per-artifact: neutral, shows progress, does NOT
+        # claim task completion. Task completion is reported only via the
+        # terminal summary AFTER all artifacts are confirmed delivered.
+        total = len(paths)
+        caption_base = f"交付項目"
+
         for idx, media_path in enumerate(paths, start=1):
-            caption = item.get("deliver_caption") or item.get("message") or f"LTC 交付：{self._title_for(item)} ({idx}/{len(paths)})"
+            if idx < delivery_start_idx:
+                continue  # already confirmed (or already-pending-but-being-retried) above
+            abs_path = str(Path(media_path).expanduser())
+            caption = f"{caption_base} ({idx}/{total})"
             send_result = self._send_delivery_payload(
                 channel=str(task.get("channel") or "discord"),
                 target=normalized["target"],
-                media_path=str(Path(media_path).expanduser()),
-                message=str(caption),
+                media_path=abs_path,
+                message=caption,
             )
             if not send_result.get("ok"):
                 return AdapterResult(
-                    status="failed",
-                    summary=f"artifact delivery failed: {self._title_for(item)}",
+                    status="blocked",  # BLOCKED (retriable) not failed — parse/network errors are transient
+                    summary=f"artifact delivery blocked: {self._title_for(item)}",
+                    blocked_reason="DELIVERY_TRANSPORT_FAILURE",
                     facts={
                         "auto_action": self.DELIVER_ARTIFACTS_ACTION,
-                        "failed_media": str(media_path),
+                        "failed_media": abs_path,
                         "delivered_count": len(delivered),
+                        "delivery_progress": json.dumps(delivery_progress),
                         "error": send_result.get("error"),
+                        "error_type": "DELIVERY_TRANSPORT_FAILURE",
+                        "retriable": True,
                     },
                     next_action="Retry delivery after fixing message/media send failure",
                 )
-            delivered.append({
-                "media": str(media_path),
-                "message_ref": send_result.get("message_ref"),
-            })
+            msg_ref = send_result.get("message_ref")
+            delivered.append({"media": abs_path, "message_ref": msg_ref})
+            # Persist progress so retry resumes from the next artifact (no duplicates)
+            delivery_progress[abs_path] = msg_ref or "pending"
+            if item_state is not None:
+                item_state.facts = item_state.facts or {}
+                item_state.facts["delivery_progress"] = json.dumps(delivery_progress)
+
+        # ── All artifacts delivered — clean up progress and send summary ─────
+        if item_state is not None:
+            item_state.facts = item_state.facts or {}
+            item_state.facts.pop("delivery_progress", None)
+
+        task_caption = item.get("deliver_caption") or item.get("message")
+        summary_fact_note = ""
+        if task_caption:
+            summary_result = self._send_delivery_payload(
+                channel=str(task.get("channel") or "discord"),
+                target=normalized["target"],
+                media_path="",  # text-only summary
+                message=str(task_caption),
+            )
+            if not summary_result.get("ok"):
+                summary_fact_note = f" (summary send failed: {summary_result.get('error')})"
+            else:
+                summary_fact_note = ""
+        else:
+            summary_fact_note = ""
 
         return AdapterResult(
             status="completed",
-            summary=f"Delivered {len(delivered)} artifact(s) to requester: {self._title_for(item)}",
+            summary=f"Delivered {len(delivered)} artifact(s) to requester: {self._title_for(item)}{summary_fact_note}",
             facts={
                 "auto_action": self.DELIVER_ARTIFACTS_ACTION,
                 "delivery_target": normalized["target"],
                 "delivered_count": len(delivered),
-                "delivery_message_refs": [item.get("message_ref") for item in delivered],
+                "delivery_message_refs": [d.get("message_ref") for d in delivered],
+                "delivery_resumed_from": delivery_start_idx - 1,  # 0-based index of first attempted artifact
                 "completion_evidence": "artifact_delivery_succeeded",
             },
             artifacts=[entry["media"] for entry in delivered],

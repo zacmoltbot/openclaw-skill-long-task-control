@@ -442,12 +442,19 @@ def cmd_run_next(args):
         return
 
     if finalize_result.status in {"blocked", "BLOCKED"}:
-        failure = FailureRecord(code="BLOCKED_FINALIZE", summary=finalize_result.summary, retryable=False, facts=finalize_result.facts or {})
+        # Propagate retriable from adapter facts (e.g., DELIVERY_TRANSPORT_FAILURE is retriable)
+        retriable = bool(finalize_result.facts.get("retriable"))
+        failure = FailureRecord(code="BLOCKED_FINALIZE", summary=finalize_result.summary, retryable=retriable, facts=finalize_result.facts or {})
         item.failures.append(failure)
-        item.status = "BLOCKED"
         item.blocked_reason = finalize_result.blocked_reason or finalize_result.summary
         item.execution_owner = None
         item.execution_claimed_at = None
+        # If blocked+retriable, let handle_failed_item decide RETRY vs BLOCKED based on budget
+        if retriable:
+            handle_failed_item(state=state, item=item, item_index=item_index, store=store, bridge=bridge, failure=failure, summary=failure.summary)
+            return
+        # Non-retriable blocked: terminal BLOCKED
+        item.status = "BLOCKED"
         state.status = "BLOCKED"
         state.blocked_reason = item.blocked_reason
         state.execution["last_terminal_at"] = now_iso()

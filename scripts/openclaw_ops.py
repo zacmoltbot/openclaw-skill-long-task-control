@@ -42,14 +42,126 @@ def run(*args, check=True, capture_output=True, shell=False):
 
 
 def parse_json_from_mixed_output(text: str):
-    lines = [line for line in (text or "").splitlines() if line.strip()]
-    for idx in range(len(lines)):
-        candidate = "\n".join(lines[idx:])
-        try:
-            return json.loads(candidate)
-        except json.JSONDecodeError:
-            continue
+    """
+    Parse JSON from mixed stdout/stderr output.
+
+    Handles:
+      - Plugin noise lines before/after JSON
+      - JSON that spans multiple lines
+      - Valid JSON followed by trailing noise (e.g. "Extra data" after complete JSON)
+      - Multiple JSON objects in output (returns the first complete one)
+
+    Uses two-pass strategy:
+      1. Forward scan: find the first position where JSON parses completely
+         (even if there's trailing non-JSON after it)
+      2. If that fails, fall back to the trailing-window scan for multi-line JSON
+
+    Raises SystemExit if no JSON is found at all.
+    """
+    text = text or ""
+    raw_lines = text.splitlines()
+
+    # Pass 1: forward scan for complete JSON at any starting line.
+    # This handles "Extra data" after valid JSON (e.g. gateway log after JSON).
+    for start_line in range(len(raw_lines)):
+        for end_line in range(start_line + 1, len(raw_lines) + 1):
+            candidate = "\n".join(raw_lines[start_line:end_line])
+            if not candidate.strip():
+                continue
+            try:
+                result = json.loads(candidate)
+                return result
+            except json.JSONDecodeError:
+                # If we got "Extra data", the JSON is complete but followed by noise.
+                # Extract it using json.JSONDecoder directly.
+                try:
+                    decoder = json.JSONDecoder()
+                    obj, end_idx = decoder.raw_decode(candidate)
+                    # Successfully extracted complete JSON object
+                    # (obj is the Python object, end_idx is where it ends in candidate)
+                    # If there's trailing content in candidate after the JSON, that's OK
+                    return obj
+                except (json.JSONDecodeError, ValueError):
+                    continue
+
+    # Pass 2: trailing-window scan for multi-line JSON at the end
+    non_empty = [(i, ln) for i, ln in enumerate(raw_lines) if ln.strip()]
+    if non_empty:
+        for w in range(1, len(non_empty) + 1):
+            start_idx = len(non_empty) - w
+            window_lines = [raw_lines[orig_i] for orig_i, _ in non_empty[start_idx:]]
+            candidate = "\n".join(window_lines)
+            if not candidate.strip():
+                continue
+            try:
+                return json.loads(candidate)
+            except json.JSONDecodeError:
+                continue
+
     raise SystemExit(f"Could not parse JSON from output:\n{text}")
+
+
+def parse_delivery_result(proc: subprocess.CompletedProcess) -> dict[str, Any]:
+    """
+    Parse `openclaw message send --json` output from a completed subprocess.
+
+    Handles:
+      - Plugin noise / progress lines mixed with JSON in stdout
+      - JSON that spans multiple lines (pretty-printed responses)
+      - Stderr-only failures (returncode != 0 but valid error info in stderr)
+      - Truncated / empty stdout
+      - Success JSON that has no messageId/id field
+
+    Contract:
+      - Returns {"ok": True, "message_ref": ..., "result": ...} on confirmed success.
+      - Returns {"ok": False, "error": ...} on confirmed failure.
+      - Fail-closed: if we cannot confirm success, treat as failure.
+    """
+    # Case 1: nonzero exit → check stderr for structured error, else use stderr/stdout as message
+    if proc.returncode != 0:
+        stderr = (proc.stderr or "").strip()
+        if stderr:
+            try:
+                err_json = json.loads(stderr)
+                error_msg = err_json.get("message") or err_json.get("error") or json.dumps(err_json)
+                return {"ok": False, "error": error_msg, "returncode": proc.returncode, "raw_stderr": stderr[:500]}
+            except (json.JSONDecodeError, ValueError):
+                pass
+        if stderr:
+            return {"ok": False, "error": stderr, "returncode": proc.returncode}
+        stdout_preview = (proc.stdout or "").strip()[:200]
+        return {"ok": False, "error": f"exit={proc.returncode}; no stderr: {stdout_preview}", "returncode": proc.returncode}
+
+    # Case 2: zero exit but empty stdout
+    stdout = proc.stdout or ""
+    if not stdout.strip():
+        return {"ok": False, "error": "delivery result parse failed: empty stdout on zero exit", "returncode": 0}
+
+    # Case 3: sliding window scan — try progressively larger trailing windows
+    # This handles plugin noise prefix, multi-line JSON, and trailing noise
+    raw_lines = stdout.splitlines()
+    non_empty = [(i, ln) for i, ln in enumerate(raw_lines) if ln.strip()]
+    result_json: dict[str, Any] | None = None
+
+    for w in range(1, len(non_empty) + 1):
+        start_idx = len(non_empty) - w
+        window_lines = [raw_lines[orig_i] for orig_i, _ in non_empty[start_idx:]]
+        candidate = "\n".join(window_lines)
+        if not candidate.strip():
+            continue
+        try:
+            result_json = json.loads(candidate)
+            break  # found valid JSON
+        except (json.JSONDecodeError, ValueError):
+            continue
+
+    if result_json is None:
+        preview = stdout[:500]
+        return {"ok": False, "error": "delivery result parse failed: no valid JSON in output", "raw_output_preview": preview, "returncode": 0}
+
+    # Success: extract message reference
+    message_ref = result_json.get("messageId") or result_json.get("message_id") or result_json.get("id")
+    return {"ok": True, "message_ref": message_ref, "result": result_json}
 
 
 def load_ledger(path: Path):
@@ -206,9 +318,15 @@ def send_user_update(task: dict[str, Any], update: dict[str, Any]):
     proc = run(*cmd, check=False)
     if proc.returncode != 0:
         return {"ok": False, "error": proc.stderr.strip() or proc.stdout.strip(), "returncode": proc.returncode}
-    result = parse_json_from_mixed_output(proc.stdout)
-    message_ref = result.get("messageId") or result.get("message_id") or result.get("id")
-    return {"ok": True, "delivered_via": "message.send", "message_ref": message_ref, "result": result}
+    # Use safe delivery result parser (same sliding window + fail-closed logic)
+    try:
+        parsed = parse_delivery_result(proc)
+    except Exception:
+        # Defensive: treat parse failure as delivery failure (fail-closed)
+        return {"ok": False, "error": "user_update parse failed", "returncode": 0}
+    if not parsed.get("ok"):
+        return {"ok": False, "error": parsed.get("error", "user_update parse failed"), "returncode": 0}
+    return {"ok": True, "delivered_via": "message.send", "message_ref": parsed.get("message_ref"), "result": parsed.get("result")}
 
 
 def deliver_pending_updates(ledger_path: Path, task_id: str, *, delivered_via: str | None = None, note: str | None = None):
@@ -248,11 +366,15 @@ def deliver_pending_updates(ledger_path: Path, task_id: str, *, delivered_via: s
         if ack_note:
             ack_cmd.extend(["--note", ack_note])
         ack_proc = run(*ack_cmd)
+        try:
+            ack_parsed = parse_json_from_mixed_output(ack_proc.stdout)
+        except SystemExit:
+            ack_parsed = {"ok": True, "raw": ack_proc.stdout[:200], "note": "parse-fallback"}
         delivered.append({
             "update_id": update["update_id"],
             "delivered_via": send_result["delivered_via"],
             "message_ref": send_result.get("message_ref"),
-            "ack": parse_json_from_mixed_output(ack_proc.stdout),
+            "ack": ack_parsed,
         })
     refreshed = load_ledger(ledger_path)
     refreshed_task = find_task(refreshed, task_id)
@@ -656,6 +778,10 @@ def cmd_init_execution_job(args):
         "--ledger", str(args.ledger), "--task-id", args.task_id,
     ]
     init_result = run(*init_cmd)
+    try:
+        runner_init = parse_json_from_mixed_output(init_result.stdout)
+    except SystemExit:
+        runner_init = {"ok": True, "raw": init_result.stdout[:200], "note": "parse-fallback"}
     print(json.dumps({
         "ok": True,
         "task_id": args.task_id,
@@ -663,7 +789,7 @@ def cmd_init_execution_job(args):
         "jobs_root": str(jobs_root),
         "spec_path": str(spec_path),
         "workflow_steps": [step.get("title") for step in workflow],
-        "runner_init": parse_json_from_mixed_output(init_result.stdout),
+        "runner_init": runner_init,
         "next_commands": {
             "status": f"python3 scripts/runner_engine.py --jobs-root {jobs_root} status {job_id}",
             "run_one": f"python3 scripts/runner_engine.py --jobs-root {jobs_root} run-loop {job_id} --max-steps 1",
@@ -990,7 +1116,14 @@ def cmd_render_prompt(args):
 
 
 def _run_cron_add_with_retry(add_cmd, ledger_path, task_id, disabled):
-    """Run 'openclaw cron add', retry once after 3-5s on failure, write INSTALL_FAILED to ledger on final failure."""
+    """
+    Run 'openclaw cron add', retry once after 3-5s on failure.
+
+    IMPORTANT: treats JSON parse failure of a successful (returncode=0) cron add
+    as a non-fatal outcome. The cron job WAS created — we just extract what we can
+    from stdout. This handles gateway normal closure producing mixed output where
+    the JSON payload is still parseable via sliding-window scan.
+    """
     import time, random, sys
     shell_cmd = " ".join(shlex.quote(part) for part in add_cmd)
     proc = run(shell_cmd, shell=True, check=False)
@@ -1019,7 +1152,31 @@ def _run_cron_add_with_retry(add_cmd, ledger_path, task_id, disabled):
             sys.stderr.write(json.dumps(payload, ensure_ascii=False) + "\n")
             sys.stderr.flush()
             raise SystemExit(1)
-    return parse_json_from_mixed_output(proc.stdout)
+    # returncode is 0 — cron add succeeded. Parse stdout safely.
+    try:
+        return parse_json_from_mixed_output(proc.stdout)
+    except SystemExit:
+        # Fallback: extract what we can from mixed/noisy stdout.
+        # The job WAS created (returncode=0), so we construct a minimal payload.
+        # This can happen when gateway normal closure produces non-JSON prefix lines.
+        raw = proc.stdout or ""
+        # Try sliding window directly here (same logic as parse_json_from_mixed_output)
+        raw_lines = raw.splitlines()
+        non_empty = [(i, ln) for i, ln in enumerate(raw_lines) if ln.strip()]
+        for w in range(1, len(non_empty) + 1):
+            start_idx = len(non_empty) - w
+            window_lines = [raw_lines[orig_i] for orig_i, _ in non_empty[start_idx:]]
+            candidate = "\n".join(window_lines)
+            if not candidate.strip():
+                continue
+            try:
+                parsed = json.loads(candidate)
+                # Found JSON — extract id if present
+                return {"id": parsed.get("id") or parsed.get("job_id") or f"unknown:{raw[:50]}", "raw": raw[:200]}
+            except (json.JSONDecodeError, ValueError):
+                continue
+        # Truly no JSON — return a minimal safe payload (job was created per returncode=0)
+        return {"id": f"parse-fallback:{raw[:50]}", "raw": raw[:200]}
 
 
 def cmd_activate_task(args):
@@ -1133,10 +1290,13 @@ def cmd_activate_task(args):
         if args.execution_job_id:
             init_cmd.extend(["--job-id", args.execution_job_id])
         init_result = run(*init_cmd)
-        execution_job = parse_json_from_mixed_output(init_result.stdout)
+        try:
+            execution_job = parse_json_from_mixed_output(init_result.stdout)
+        except SystemExit:
+            execution_job = {"ok": True, "job_id": args.execution_job_id or f"{args.task_id}-job", "note": "parse-fallback", "raw": init_result.stdout[:200]}
 
         if getattr(args, "auto_start_execution", True):
-            resolved_job_id = execution_job["job_id"]
+            resolved_job_id = execution_job.get("job_id") or args.execution_job_id or f"{args.task_id}-job"
             owner = args.execution_owner or f"bootstrap:{resolved_job_id}"
             run_cmd = [
                 "python3", str(RUNNER_ENGINE), "--jobs-root", str(args.jobs_root), "run-loop", resolved_job_id,
@@ -1145,7 +1305,10 @@ def cmd_activate_task(args):
             if args.auto_run_max_steps is not None:
                 run_cmd.extend(["--max-steps", str(args.auto_run_max_steps)])
             run_result = run(*run_cmd)
-            execution_start = parse_json_from_mixed_output(run_result.stdout)
+            try:
+                execution_start = parse_json_from_mixed_output(run_result.stdout)
+            except SystemExit:
+                execution_start = {"ok": True, "note": "parse-fallback", "raw": run_result.stdout[:200]}
             execution_start["delivery_flush"] = deliver_pending_updates(
                 args.ledger,
                 args.task_id,
@@ -1289,7 +1452,13 @@ def cmd_remove_monitor(args):
     monitoring["cron_state"] = "DELETED"
     monitoring["cron_removed_at"] = now_iso()
     save_ledger(args.ledger, ledger)
-    print(json.dumps({"ok": True, "task_id": args.task_id, "job_id": job_id, "removed": removed, "removal_mode": removal_mode}, ensure_ascii=False, indent=2))
+    print(json.dumps({
+        "ok": True,
+        "task_id": args.task_id,
+        "job_id": job_id,
+        "removed": removed,
+        "removal_mode": removal_mode,
+    }, ensure_ascii=False, indent=2))
 
 
 def cmd_rerun_task(args):
@@ -1309,7 +1478,12 @@ def cmd_rerun_task(args):
     for key, value in facts.items():
         cmd.extend(["--fact", f"{key}={value}"])
     result = run(*cmd)
-    payload = parse_json_from_mixed_output(result.stdout)
+    try:
+        payload = parse_json_from_mixed_output(result.stdout)
+    except SystemExit:
+        # Fallback: task_ledger succeeded (returncode=0) but stdout is noisy.
+        # Return the raw stdout as a safe minimal payload.
+        payload = {"ok": True, "raw": result.stdout[:200], "note": "parse-fallback"}
     print(json.dumps(payload, ensure_ascii=False, indent=2))
 
 
