@@ -38,6 +38,15 @@ description: Standardize long-running durable task execution with a strict truth
 7. owner 有觀察/回覆時寫 `owner-reply`
 8. monitor 用 `monitor_nudge.py --apply-supervision` 做 supervision，不直接腦補 task truth
 
+### External-owned workflow rule
+
+如果真正執行是在 LTC 外面進行（例如你自己逐步呼叫 RunningHub、別的 skill、外部 provider workflow），把 LTC 當成 **tracking / truth / delivery layer**，不是假裝它自己執行：
+
+- 用 `generic_manual_mode=external_observed` 表示這一步是 owner-driven external work
+- **不要**再塞 `shell=echo ...`、`shell=true`、`shell=touch ...` 這類 placeholder/no-op shell 來 bootstrap
+- external step 的完成要來自真正的 `external-job` / `download-observed` / `STEP_COMPLETED` / `TASK_COMPLETED` observed truth
+- 這類 step 會自動停用 canonical executor auto-start，避免 placeholder execution 把 task 提前收斂成 `COMPLETED`
+
 ### Do not do this
 
 - 不要手改 `derived.*`
@@ -46,6 +55,7 @@ description: Standardize long-running durable task execution with a strict truth
 - 不要把 monitor/control state 當 ground truth
 - 不要把 owner guess / optimistic assumption 寫成 observed fact
 - 不要為了讓 monitor 安靜而補假 state
+- 不要用 placeholder / no-op shell（例如 `echo ...` / `true` / `touch ...`）假裝 external-owned workflow 已掛進 canonical execution
 
 這版的重點不是多一個 monitor，而是把 architecture 拆乾淨：
 

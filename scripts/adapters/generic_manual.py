@@ -20,6 +20,7 @@ class GenericManualAdapter:
     name = "generic_manual"
     EXPLICIT_DEMO_MODE = "synthetic_demo"
     AUTO_REPAIR_MODE = "auto_repair"
+    EXTERNAL_OBSERVED_MODE = "external_observed"
     REQUESTER_CHANNEL_REPAIR_ACTION = "repair_requester_channel"
     DELIVER_ARTIFACTS_ACTION = "deliver_artifacts"
 
@@ -507,6 +508,19 @@ class GenericManualAdapter:
             )
 
         auto_action = self._auto_action_for(item)
+        if mode == self.EXTERNAL_OBSERVED_MODE:
+            return AdapterResult(
+                status="blocked",
+                summary=f"external-observed step is owner-driven and cannot be auto-executed: {self._title_for(item)}",
+                blocked_reason="OWNER_DRIVEN_EXTERNAL_STEP",
+                facts={
+                    "item": item,
+                    "generic_manual_mode": mode,
+                    "owner_action_required": True,
+                    "reason": "external_observed_owner_driven",
+                },
+                next_action="Run the real external workflow outside generic_manual, then write EXTERNAL_OBSERVED / STEP_PROGRESS / STEP_COMPLETED truth from actual evidence",
+            )
         if mode == self.AUTO_REPAIR_MODE or auto_action == self.REQUESTER_CHANNEL_REPAIR_ACTION:
             return self._repair_requester_channel(item, state)
         if auto_action == self.DELIVER_ARTIFACTS_ACTION:
@@ -603,6 +617,19 @@ class GenericManualAdapter:
             )
 
         auto_action = self._auto_action_for(item)
+        if mode == self.EXTERNAL_OBSERVED_MODE:
+            return AdapterResult(
+                status="blocked",
+                summary=f"external-observed step requires real owner/external evidence before completion: {self._title_for(item)}",
+                blocked_reason="OWNER_DRIVEN_EXTERNAL_STEP",
+                facts={
+                    "item": item,
+                    "generic_manual_mode": mode,
+                    "owner_action_required": True,
+                    "reason": "external_observed_no_auto_finalize",
+                },
+                next_action="Do not finalize from placeholder shell success; record real external/download/completion truth only after actual work is observed",
+            )
         # NOTE: deliver_artifacts must be checked BEFORE the generic AUTO_REPAIR_MODE
         # fallback — otherwise mode=AUTO_REPAIR_MODE with auto_action=deliver_artifacts
         # hits the early-return and never calls _deliver_artifacts.

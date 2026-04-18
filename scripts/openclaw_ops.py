@@ -2,6 +2,7 @@
 import argparse
 import json
 import os
+import re
 import shlex
 import subprocess
 from datetime import datetime, timezone
@@ -702,6 +703,37 @@ def parse_workflow_step_contract(step: dict[str, Any]) -> dict[str, Any]:
     return item
 
 
+def _looks_like_placeholder_shell(shell_cmd: str | None) -> bool:
+    if not shell_cmd:
+        return False
+    normalized = " ".join(str(shell_cmd).strip().split()).lower()
+    return bool(re.match(r"^(bash\s+-lc\s+)?['\"]?echo\b", normalized))
+
+
+def validate_generic_step_contract(task: dict[str, Any], step: dict[str, Any], parsed: dict[str, Any]) -> None:
+    mode = str(parsed.get("generic_manual_mode") or "").strip().lower()
+    shell_cmd = parsed.get("shell")
+    expect_artifacts = parsed.get("expect_artifacts") or []
+    haystack = " ".join([
+        str(task.get("task_id") or ""),
+        str(task.get("goal") or ""),
+        str(step.get("id") or ""),
+        str(step.get("title") or ""),
+        str(parsed.get("title") or ""),
+    ]).lower()
+    owner_driven_hints = ("external", "outside ltc", "owner-driven", "owner driven", "manual", "observe", "runninghub", "provider")
+    if mode == "external_observed" and shell_cmd:
+        raise SystemExit(
+            f"Workflow rejected: external_observed step must not declare shell execution: {parsed.get('title') or step.get('title')}. "
+            "Use generic_manual_mode=external_observed without shell=..., then write real observed truth as the external work progresses."
+        )
+    if _looks_like_placeholder_shell(shell_cmd) and expect_artifacts and any(token in haystack for token in owner_driven_hints):
+        raise SystemExit(
+            f"Workflow rejected: placeholder shell cannot stand in for owner-driven external work: {parsed.get('title') or step.get('title')}. "
+            "Replace the fake shell with generic_manual_mode=external_observed and keep completion driven by real observed truth."
+        )
+
+
 def infer_generic_auto_action(task: dict[str, Any], step: dict[str, Any], parsed: dict[str, Any]) -> dict[str, Any]:
     if parsed.get("shell") or parsed.get("generic_manual_mode"):
         return {}
@@ -728,10 +760,14 @@ def infer_generic_auto_action(task: dict[str, Any], step: dict[str, Any], parsed
 def build_generic_job_spec(task: dict[str, Any], *, job_id: str, adapter: str):
     workflow = task.get("workflow") or []
     items = []
+    owner_driven_tracking = False
     for idx, step in enumerate(workflow, start=1):
         step_id = step.get("id") or f"step-{idx:02d}"
         parsed = parse_workflow_step_contract(step)
+        validate_generic_step_contract(task, step, parsed)
         inferred = infer_generic_auto_action(task, step, parsed)
+        if str(parsed.get("generic_manual_mode") or inferred.get("generic_manual_mode") or "").strip().lower() == "external_observed":
+            owner_driven_tracking = True
         items.append({
             "item_id": step_id,
             "title": parsed.get("title") or step.get("title") or step_id,
@@ -751,6 +787,7 @@ def build_generic_job_spec(task: dict[str, Any], *, job_id: str, adapter: str):
             "ledger": str(task.get("_ledger_path")) if task.get("_ledger_path") else None,
             "task_id": task.get("task_id"),
         },
+        "owner_driven_tracking": owner_driven_tracking,
         "items": items,
     }
 
@@ -789,6 +826,7 @@ def cmd_init_execution_job(args):
         "jobs_root": str(jobs_root),
         "spec_path": str(spec_path),
         "workflow_steps": [step.get("title") for step in workflow],
+        "owner_driven_tracking": bool(spec.get("owner_driven_tracking")),
         "runner_init": runner_init,
         "next_commands": {
             "status": f"python3 scripts/runner_engine.py --jobs-root {jobs_root} status {job_id}",
@@ -1275,13 +1313,6 @@ def cmd_activate_task(args):
     execution_job = None
     execution_start = None
     if getattr(args, "auto_execution", True):
-        init_exec_ns = argparse.Namespace(
-            ledger=args.ledger,
-            task_id=args.task_id,
-            jobs_root=args.jobs_root,
-            job_id=args.execution_job_id,
-            adapter=args.execution_adapter,
-        )
         init_cmd = [
             "python3", str(ROOT / "scripts" / "openclaw_ops.py"), "--ledger", str(args.ledger), "init-execution-job", args.task_id,
             "--jobs-root", str(args.jobs_root),
@@ -1289,13 +1320,25 @@ def cmd_activate_task(args):
         ]
         if args.execution_job_id:
             init_cmd.extend(["--job-id", args.execution_job_id])
-        init_result = run(*init_cmd)
+        try:
+            init_result = run(*init_cmd)
+        except subprocess.CalledProcessError as exc:
+            detail = (exc.stderr or exc.stdout or "").strip()
+            raise SystemExit(detail or f"init-execution-job failed for {args.task_id}")
         try:
             execution_job = parse_json_from_mixed_output(init_result.stdout)
         except SystemExit:
             execution_job = {"ok": True, "job_id": args.execution_job_id or f"{args.task_id}-job", "note": "parse-fallback", "raw": init_result.stdout[:200]}
 
-        if getattr(args, "auto_start_execution", True):
+        owner_driven_tracking = bool((execution_job or {}).get("owner_driven_tracking"))
+        if owner_driven_tracking:
+            execution_start = {
+                "ok": True,
+                "status": "SKIPPED_AUTO_START",
+                "reason": "owner_driven_tracking",
+                "summary": "Detected external/owner-driven workflow; canonical executor auto-start is disabled to prevent false completion.",
+            }
+        elif getattr(args, "auto_start_execution", True):
             resolved_job_id = execution_job.get("job_id") or args.execution_job_id or f"{args.task_id}-job"
             owner = args.execution_owner or f"bootstrap:{resolved_job_id}"
             run_cmd = [
