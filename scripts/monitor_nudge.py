@@ -54,6 +54,8 @@ SUPERVISION_ALLOWED_PATHS = {
     "heartbeat.last_observed_progress_at",
 }
 OBSERVED_TRANSIENT_FAILURES = {"TIMEOUT", "DOWNLOAD_TIMEOUT", "DOWNLOAD_INCOMPLETE", "TRANSIENT_NETWORK", "EXECUTION_ERROR", "EXTERNAL_WAIT"}
+TERMINAL_BLOCKED_EVENT_STATUSES = {"BLOCKED", "FAILED"}
+TERMINAL_BLOCKED_PROGRESS_KINDS = {"ITEM_BLOCKED", "ITEM_FAILED"}
 
 
 def now_iso():
@@ -249,6 +251,50 @@ def assert_only_supervision_changes(before_task, after_task):
         raise RuntimeError(f"Monitor wrote non-supervision fields: {sorted(disallowed)}")
 
 
+def has_terminal_blocked_executor_truth(task):
+    monitoring = task.get("monitoring", {}) or {}
+    event = monitoring.get("executor_last_event") or {}
+    if str(event.get("status") or "").upper() in TERMINAL_BLOCKED_EVENT_STATUSES:
+        return True, {
+            "source": "executor_last_event",
+            "status": event.get("status"),
+            "phase": event.get("phase"),
+            "summary": event.get("summary"),
+            "at": event.get("at"),
+        }
+
+    history = monitoring.get("executor_history") or []
+    for item in reversed(history):
+        if str(item.get("status") or "").upper() in TERMINAL_BLOCKED_EVENT_STATUSES:
+            return True, {
+                "source": "executor_history",
+                "status": item.get("status"),
+                "phase": item.get("phase"),
+                "summary": item.get("summary"),
+                "at": item.get("at"),
+            }
+
+    tail = monitoring.get("executor_progress_tail") or []
+    for item in reversed(tail):
+        if str(item.get("kind") or "").upper() in TERMINAL_BLOCKED_PROGRESS_KINDS:
+            return True, {
+                "source": "executor_progress_tail",
+                "kind": item.get("kind"),
+                "summary": item.get("summary"),
+                "at": item.get("at"),
+            }
+
+    if str(monitoring.get("executor_last_job_status") or "").upper() in TERMINAL_BLOCKED_EVENT_STATUSES:
+        return True, {
+            "source": "executor_last_job_status",
+            "status": monitoring.get("executor_last_job_status"),
+            "summary": monitoring.get("executor_last_summary"),
+            "at": monitoring.get("executor_last_event_at"),
+        }
+
+    return False, None
+
+
 def evaluate_task(task, now):
     project_task(task)
     derived = task.get("derived", {})
@@ -266,6 +312,7 @@ def evaluate_task(task, now):
     consecutive_executor_errors = int(executor_health.get("consecutive_errors", 0) or 0)
     executor_last_success_age = age_seconds(now, executor_health.get("last_success_at"))
     delivery_stalled = bool(task.get("artifacts")) and current_step and str(current_step).startswith("step-") and status == "RUNNING" and consecutive_executor_errors > 0
+    terminal_blocked_truth, terminal_blocked_detail = has_terminal_blocked_executor_truth(task)
     candidates = []
 
     if consecutive_executor_errors >= 3:
@@ -286,6 +333,14 @@ def evaluate_task(task, now):
 
     if status == "BLOCKED" and monitoring.get("last_escalated_at"):
         candidates.append({"state": "STOP_AND_DELETE", "reason": "blocked escalation already delivered", "action": "delete_monitor_cron"})
+
+    if terminal_blocked_truth and not monitoring.get("last_escalated_at") and not task.get("observed", {}).get("task_completion"):
+        candidates.append({
+            "state": "BLOCKED_ESCALATE",
+            "reason": f"terminal blocked executor truth observed via {terminal_blocked_detail.get('source')}; notify user even if ledger/projection still needs reconcile",
+            "action": "send_blocked_escalation_then_delete_cron",
+            "message": terminal_blocked_detail.get("summary") or "Executor reached a terminal blocked state and needs user-visible escalation.",
+        })
 
     if derived.get("truth_state") == "INCONSISTENT":
         candidates.append({
