@@ -144,7 +144,7 @@ def main():
         assert pending_c2["event_type"] == "WORKFLOW_SWITCH"
         ack(ledger, task_c, pending_c2["update_id"], "Delivered switch update")
 
-        # D) install failure -> durable truth + structured signal + user-visible failure path.
+        # D) install failure -> durable infra signal, but not a task-level blocker.
         task_d = "case-d-install-failure"
         failed = run(
             "python3", str(OPS), "--ledger", str(ledger), "bootstrap-task", task_d,
@@ -159,7 +159,7 @@ def main():
         install_signal = json.loads(failed.stderr.strip().splitlines()[-1])
         assert install_signal["signal"] == "INSTALL_FAILED"
         preview_d = run_json("python3", str(OPS), "--ledger", str(ledger), "preview-tick", task_d)
-        assert preview_d["state"] == "BLOCKED_ESCALATE"
+        assert preview_d["state"] == "OK"
 
         # E) blocked escalate -> stop/delete cron + one-shot full report.
         task_e = "case-e-blocked"
@@ -225,6 +225,35 @@ def main():
         miss = [f for f in compliance["findings"] if f["code"] == "missing_user_visible_update" and task_g in f["message"]]
         assert miss, compliance
 
+        # H) partial success / skipped closeout should still converge to terminal cleanup.
+        task_h = "case-h-partial-success-closeout"
+        run_json(
+            "python3", str(OPS), "--ledger", str(ledger), "init-task", task_h,
+            "--goal", "Verify partial-success closeout still removes monitor",
+            "--requester-channel", "1484432523781083197",
+            "--workflow", "Step 1",
+            "--workflow", "Step 2",
+            "--next-action", "Run step 1",
+        )
+        run("python3", str(CRON), "--ledger", str(ledger), "--cron-dir", str(cron_dir), "install", task_h)
+        run_json(
+            "python3", str(OPS), "--ledger", str(ledger), "record-update", "STEP_COMPLETED", task_h,
+            "--summary", "Completed step 1",
+            "--current-checkpoint", "step-01", "--next-action", "Skip directly to closeout",
+        )
+        run_json(
+            "python3", str(OPS), "--ledger", str(ledger), "record-update", "TASK_COMPLETED", task_h,
+            "--summary", "Task completed with useful artifacts despite skipped closeout step",
+            "--current-checkpoint", "step-01", "--output", str(artifact),
+        )
+        preview_h = run_json("python3", str(OPS), "--ledger", str(ledger), "preview-tick", task_h)
+        assert preview_h["truth_state"] == "INCONSISTENT", preview_h
+        assert any(item.startswith("task:completed_but_steps_not_done:") for item in preview_h["inconsistencies"]), preview_h
+        assert preview_h["state"] == "STOP_AND_DELETE", preview_h
+        tick_h = run_json("python3", str(CRON), "--ledger", str(ledger), "--cron-dir", str(cron_dir), "run-once", "--task-id", task_h)
+        assert tick_h["cron_removed"] is True
+        assert task_from(ledger, task_h)["monitoring"]["cron_state"] == "DELETED"
+
         print(json.dumps({
             "ok": True,
             "ledger": str(ledger),
@@ -232,10 +261,11 @@ def main():
                 "A": step_a["pending_user_update"]["event_type"],
                 "B": preview_b1["state"],
                 "C": [pending_c1["event_type"], pending_c2["event_type"]],
-                "D": install_signal,
+                "D": {"signal": install_signal["signal"], "preview_state": preview_d["state"]},
                 "E": tick_e["report"]["state"],
                 "F": tick_f["report"]["state"],
                 "G": miss[0],
+                "H": tick_h["report"]["state"],
             },
         }, ensure_ascii=False, indent=2))
 

@@ -108,6 +108,7 @@ def monitoring_config(task):
         "max_nudges": int(raw.get("max_nudges", 3) or 3),
         "escalate_after_nudges": int(raw.get("escalate_after_nudges", 2) or 2),
         "blocked_escalate_after_sec": raw.get("blocked_escalate_after_sec") or max(progress_idle_threshold_sec, expected_interval),
+        "terminal_cleanup_guard_sec": int(raw.get("terminal_cleanup_guard_sec", 3600) or 3600),
     }
 
 
@@ -295,6 +296,29 @@ def has_terminal_blocked_executor_truth(task):
     return False, None
 
 
+def _closeout_only_inconsistencies(task):
+    inconsistencies = task.get("derived", {}).get("inconsistencies", []) or []
+    if not inconsistencies:
+        return False
+    allowed_prefixes = (
+        "task:completed_but_steps_not_done:",
+    )
+    return all(any(item.startswith(prefix) for prefix in allowed_prefixes) for item in inconsistencies)
+
+
+def _has_completion_evidence(task):
+    derived = task.get("derived", {}) or {}
+    progress = derived.get("progress_signals", []) or []
+    if any((item or {}).get("kind") == "task_completed" for item in progress):
+        return True
+    if task.get("artifacts"):
+        return True
+    observed = task.get("observed", {}) or {}
+    if observed.get("task_completion"):
+        return True
+    return False
+
+
 def evaluate_task(task, now):
     project_task(task)
     derived = task.get("derived", {})
@@ -306,6 +330,10 @@ def evaluate_task(task, now):
     last_progress_age = age_seconds(now, first_non_null(derived.get("last_progress_signal_at"), derived.get("last_observed_progress_at"), hb.get("last_progress_at"), task.get("last_checkpoint_at")))
     last_heartbeat_age = age_seconds(now, hb.get("last_heartbeat_at"))
     last_nudge_age = age_seconds(now, monitoring.get("last_nudge_at"))
+    monitor_age = age_seconds(now, first_non_null(monitoring.get("cron_installed_at"), monitoring.get("created_at"), task.get("created_at")))
+    closeout_only_inconsistencies = _closeout_only_inconsistencies(task)
+    completion_evidence_present = _has_completion_evidence(task)
+    terminal_closeout_ready = status in TERMINAL_STATUSES or (completion_evidence_present and closeout_only_inconsistencies)
     should_renotify = last_nudge_age is None or last_nudge_age >= cfg["renotify_interval_sec"]
     nudge_count = int(monitoring.get("nudge_count", 0) or 0)
     executor_health = monitoring.get("executor_health", {}) or {}
@@ -342,7 +370,7 @@ def evaluate_task(task, now):
             "message": terminal_blocked_detail.get("summary") or "Executor reached a terminal blocked state and needs user-visible escalation.",
         })
 
-    if derived.get("truth_state") == "INCONSISTENT":
+    if derived.get("truth_state") == "INCONSISTENT" and not (closeout_only_inconsistencies and completion_evidence_present):
         candidates.append({
             "state": "TRUTH_INCONSISTENT",
             "reason": "observed truth is incomplete or contradictory; reconcile owner/external observations before any OK/pending judgement",
@@ -350,18 +378,17 @@ def evaluate_task(task, now):
             "message": "Observed truth is inconsistent. First observe the real world and backfill truth; do not guess pending/OK from partial data.",
         })
 
-    if status in TERMINAL_STATUSES:
+    if terminal_closeout_ready:
         inconsistencies = derived.get("inconsistencies", [])
-        # "completed_but_steps_not_done" is an informational marker (steps were skipped),
-        # not a real recoverable inconsistency. For monitoring purposes, treat terminal
-        # tasks with only this inconsistency as clean terminal → STOP_AND_DELETE.
-        non_step_inconsistencies = [i for i in inconsistencies if i != "task:completed_but_steps_not_done" and not i.startswith("task:completed")]
-        if non_step_inconsistencies or derived.get("truth_state") == "INCONSISTENT":
-            # Real inconsistencies (or unresolved truth) must be reconciled before DELETE
-            candidates.append({"state": "TRUTH_INCONSISTENT", "reason": f"task status is terminal ({status}) but has unresolved inconsistencies", "action": "request_owner_reconcile_then_delete"})
+        non_closeout_inconsistencies = [
+            i for i in inconsistencies
+            if not i.startswith("task:completed_but_steps_not_done:")
+        ]
+        if non_closeout_inconsistencies:
+            candidates.append({"state": "TRUTH_INCONSISTENT", "reason": f"task status is terminal-like but has unresolved inconsistencies: {', '.join(non_closeout_inconsistencies[:3])}", "action": "request_owner_reconcile_then_delete"})
         else:
-            # Clean terminal: all observed truth is consistent → stop monitor
-            candidates.append({"state": "STOP_AND_DELETE", "reason": f"task status is terminal ({status})", "action": "delete_monitor_cron"})
+            stop_reason = f"task status is terminal ({status})" if status in TERMINAL_STATUSES else "completion evidence exists and only informational closeout gaps remain"
+            candidates.append({"state": "STOP_AND_DELETE", "reason": stop_reason, "action": "delete_monitor_cron"})
 
     if derived.get("suspicious_external_jobs"):
         candidates.append({
@@ -389,6 +416,19 @@ def evaluate_task(task, now):
 
     if status == "RUNNING" and derived.get("pending_external"):
         candidates.append({"state": "OK", "reason": "observed external truth shows legitimate pending external work", "action": "noop_external_wait"})
+
+    if (
+        monitor_age is not None
+        and monitor_age >= cfg["terminal_cleanup_guard_sec"]
+        and completion_evidence_present
+        and not derived.get("pending_external")
+        and closeout_only_inconsistencies
+    ):
+        candidates.append({
+            "state": "STOP_AND_DELETE",
+            "reason": f"terminal cleanup guard fired after {monitor_age}s; completion evidence exists and only informational closeout gaps remain",
+            "action": "delete_monitor_cron",
+        })
 
     expected_interval = hb.get("expected_interval_sec", 300)
     progress_idle_threshold_sec = cfg["progress_idle_threshold_sec"]
